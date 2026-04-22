@@ -1,0 +1,13 @@
+[project]
+name = "cfi-synthgen"
+version = "0.1.0"
+requires-python = "==3.11.*"
+dependencies = [
+    "bpy==4.2.0",
+    "numpy",
+    "pillow",
+    "pycocotools",
+]
+
+[tool.uv]
+package = false
