@@ -9,6 +9,7 @@ Steps:
 """
 
 import argparse
+import json
 import math
 import os
 import pathlib
@@ -26,7 +27,7 @@ from coco_writer import COCODataset
 # Scene reset & Compositor Setup
 # ─────────────────────────────────────────────────────────────────────────
 
-def reset_scene():
+def reset_scene(hdri_path: str | None = None):
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
     scene.render.engine = "CYCLES"
@@ -42,14 +43,22 @@ def reset_scene():
 
     world = bpy.data.worlds.new("SynthWorld")
     world.use_nodes = True
-    bg = world.node_tree.nodes["Background"]
-    bg.inputs["Color"].default_value = (0.02, 0.02, 0.02, 1.0)
-    bg.inputs["Strength"].default_value = 0.1
-    scene.world = world
+    nodes = world.node_tree.nodes
+    links = world.node_tree.links
+    bg = nodes["Background"]
 
+    if hdri_path:
+        env = nodes.new("ShaderNodeTexEnvironment")
+        env.image = bpy.data.images.load(hdri_path, check_existing=True)
+        links.new(env.outputs["Color"], bg.inputs["Color"])
+        bg.inputs["Strength"].default_value = 1.0
+    else:
+        bg.inputs["Color"].default_value = (0.55, 0.58, 0.62, 1.0)
+        bg.inputs["Strength"].default_value = 0.5
+
+    scene.world = world
     scene.view_settings.view_transform = "Filmic"
-    scene.view_settings.look = "Medium High Contrast"
-    scene.view_settings.exposure = -1.0
+    scene.view_settings.look = "None"
 
     # Enable Object Index pass for perfect Ground Truth masks
     bpy.context.view_layer.use_pass_object_index = True
@@ -89,8 +98,8 @@ def reset_scene():
 # Environment
 # ─────────────────────────────────────────────────────────────────────────
 
-def build_environment() -> bpy.types.Object:
-    bpy.ops.mesh.primitive_plane_add(size=10.0, location=(0, 0, 0))
+def build_environment(use_hdri: bool = False) -> bpy.types.Object:
+    bpy.ops.mesh.primitive_plane_add(size=20.0, location=(0, 0, 0))
     ground = bpy.context.active_object
     ground.name = "Ground"
     bpy.ops.rigidbody.object_add(type="PASSIVE")
@@ -100,31 +109,26 @@ def build_environment() -> bpy.types.Object:
     mat = bpy.data.materials.new(name="GroundMat")
     mat.use_nodes = True
     bsdf = mat.node_tree.nodes.get("Principled BSDF")
-    
     if bsdf:
-        tex_checker = mat.node_tree.nodes.new("ShaderNodeTexChecker")
-        tex_checker.inputs["Color1"].default_value = (0.15, 0.14, 0.13, 1.0)
-        tex_checker.inputs["Color2"].default_value = (0.10, 0.09, 0.08, 1.0)
-        tex_checker.inputs["Scale"].default_value = 25.0
-        mat.node_tree.links.new(tex_checker.outputs["Color"], bsdf.inputs["Base Color"])
-        bsdf.inputs["Roughness"].default_value = 0.85
-        
+        bsdf.inputs["Base Color"].default_value = (0.4, 0.38, 0.36, 1.0)
+        bsdf.inputs["Roughness"].default_value = 0.7
     ground.data.materials.append(mat)
 
-    key = bpy.data.lights.new(name="Key", type="AREA")
-    key.energy = 150
-    key.size = 3.0
-    key_obj = bpy.data.objects.new("Key", key)
-    key_obj.location = (1.5, -1.2, 2.5)
-    key_obj.rotation_euler = (math.radians(45), 0, math.radians(30))
-    bpy.context.scene.collection.objects.link(key_obj)
+    if not use_hdri:
+        key = bpy.data.lights.new(name="Key", type="AREA")
+        key.energy = 150
+        key.size = 3.0
+        key_obj = bpy.data.objects.new("Key", key)
+        key_obj.location = (1.5, -1.2, 2.5)
+        key_obj.rotation_euler = (math.radians(45), 0, math.radians(30))
+        bpy.context.scene.collection.objects.link(key_obj)
 
-    fill = bpy.data.lights.new(name="Fill", type="AREA")
-    fill.energy = 60
-    fill.size = 3.0
-    fill_obj = bpy.data.objects.new("Fill", fill)
-    fill_obj.location = (-1.5, 1.2, 2.0)
-    bpy.context.scene.collection.objects.link(fill_obj)
+        fill = bpy.data.lights.new(name="Fill", type="AREA")
+        fill.energy = 60
+        fill.size = 3.0
+        fill_obj = bpy.data.objects.new("Fill", fill)
+        fill_obj.location = (-1.5, 1.2, 2.0)
+        bpy.context.scene.collection.objects.link(fill_obj)
 
     return ground
 
@@ -139,7 +143,6 @@ def flatten_metals(obj: bpy.types.Object):
             bsdf = mat.node_tree.nodes.get("Principled BSDF")
             if bsdf and "Metallic" in bsdf.inputs:
                 bsdf.inputs["Metallic"].default_value = 0.0
-
 
 def import_glb_with_physics(glb_path: str, position: tuple, rotation_euler: tuple) -> bpy.types.Object:
     bpy.ops.import_scene.gltf(filepath=glb_path)
@@ -217,8 +220,11 @@ def sample_camera_pose(center: Vector, radius: float) -> tuple[Vector, Euler]:
     euler = rot_quat.to_euler()
     return location, euler
 
+def look_at_rotation(location: Vector, target: Vector) -> Euler:
+    direction = (target - location).normalized()
+    return direction.to_track_quat("-Z", "Y").to_euler()
 
-def set_camera(location: Vector, rotation_euler: Euler):
+def set_camera(location: Vector, rotation_euler: Euler, fov_deg: float | None = None):
     cam_data = bpy.data.cameras.get("SynthCam")
     if cam_data is None:
         cam_data = bpy.data.cameras.new("SynthCam")
@@ -226,6 +232,9 @@ def set_camera(location: Vector, rotation_euler: Euler):
     if cam_obj is None:
         cam_obj = bpy.data.objects.new("SynthCamObj", cam_data)
         bpy.context.scene.collection.objects.link(cam_obj)
+    if fov_deg is not None:
+        cam_data.lens_unit = "FOV"
+        cam_data.angle = math.radians(fov_deg)
     cam_obj.location = location
     cam_obj.rotation_euler = rotation_euler
     bpy.context.scene.camera = cam_obj
@@ -283,10 +292,11 @@ def render_mask_pass(output_name: str, resolution: int) -> np.ndarray:
 # Scene loop
 # ─────────────────────────────────────────────────────────────────────────
 
-def generate_scene(glb_paths: list[str], scene_idx: int, cameras_per_scene: int,
-                   resolution: int, out_dir: str, dataset: COCODataset):
-    reset_scene()
-    ground = build_environment()
+def generate_scene(glb_paths: list[str], scene_idx: int, cameras: list,
+                   resolution: int, out_dir: str, dataset: COCODataset,
+                   hdri_path: str | None = None):
+    reset_scene(hdri_path=hdri_path)
+    ground = build_environment(use_hdri=bool(hdri_path))
 
     objs = []
     for i, glb_path in enumerate(glb_paths):
@@ -319,9 +329,20 @@ def generate_scene(glb_paths: list[str], scene_idx: int, cameras_per_scene: int,
         stem = pathlib.Path(glb_path).parent.name
         category_ids.append(dataset.category_id(stem))
 
-    for c in range(cameras_per_scene):
-        loc, rot = sample_camera_pose(center, radius)
-        set_camera(loc, rot)
+    for c, cam_spec in enumerate(cameras):
+        if cam_spec is None:
+            loc, rot = sample_camera_pose(center, radius)
+            fov_deg = None
+        else:
+            loc = Vector(cam_spec["location"])
+            if "look_at" in cam_spec:
+                rot = look_at_rotation(loc, Vector(cam_spec["look_at"]))
+            elif "rotation_euler_deg" in cam_spec:
+                rot = Euler([math.radians(d) for d in cam_spec["rotation_euler_deg"]])
+            else:
+                raise ValueError("camera spec needs 'look_at' or 'rotation_euler_deg'")
+            fov_deg = cam_spec.get("fov_deg")
+        set_camera(loc, rot, fov_deg)
 
         # 1. Render Photorealistic Image
         rgb_rel = f"images/{scene_idx:04d}_{c:02d}.png"
@@ -370,13 +391,15 @@ if __name__ == "__main__":
     parser.add_argument("--cameras-per-scene", type=int, default=6)
     parser.add_argument("--resolution", type=int, default=640)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--hdri", default=None, help="Path to .exr HDRI for environment lighting")
+    parser.add_argument("--cameras-json", default=None, help="Path to JSON file with camera specs (overrides --cameras-per-scene)")
     args = parser.parse_args()
 
     random.seed(args.seed)
     np.random.seed(args.seed)
 
     glb_dir = pathlib.Path(args.glbs)
-    glb_files = sorted(glb_dir.glob("*/*.glb"))
+    glb_files = sorted(glb_dir.rglob("*.glb"))
     if not glb_files:
         print(f"No .glb files found in {glb_dir}")
         raise SystemExit(1)
@@ -388,6 +411,12 @@ if __name__ == "__main__":
 
     dataset = COCODataset(category_names)
 
+    if args.cameras_json:
+        with open(args.cameras_json) as f:
+            fixed_cameras = json.load(f)
+    else:
+        fixed_cameras = None
+
     for scene_idx in range(args.scenes):
         k = args.products_per_scene
         pool = list(glb_files)
@@ -396,8 +425,13 @@ if __name__ == "__main__":
         else:
             chosen = random.choices(pool, k=k)
         glb_paths = [str(p) for p in chosen]
-        generate_scene(glb_paths, scene_idx, args.cameras_per_scene,
-                       args.resolution, args.out, dataset)
+        if fixed_cameras is not None:
+            cameras = fixed_cameras
+        else:
+            cameras = [None] * args.cameras_per_scene
+        generate_scene(glb_paths, scene_idx, cameras,
+                       args.resolution, args.out, dataset,
+                       hdri_path=args.hdri)
         print(f"Scene {scene_idx + 1}/{args.scenes} done")
 
     ann_path = os.path.join(args.out, "annotations.json")
