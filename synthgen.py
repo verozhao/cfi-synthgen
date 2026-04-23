@@ -316,7 +316,7 @@ def generate_scene(glb_paths: list[str], scene_idx: int, cameras_per_scene: int,
 
     category_ids = []
     for glb_path in glb_paths:
-        stem = pathlib.Path(glb_path).stem
+        stem = pathlib.Path(glb_path).parent.name
         category_ids.append(dataset.category_id(stem))
 
     for c in range(cameras_per_scene):
@@ -376,12 +376,12 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
 
     glb_dir = pathlib.Path(args.glbs)
-    glb_files = sorted(glb_dir.glob("*.glb"))
+    glb_files = sorted(glb_dir.glob("*/*.glb"))
     if not glb_files:
         print(f"No .glb files found in {glb_dir}")
         raise SystemExit(1)
 
-    category_names = sorted(p.stem for p in glb_files)
+    category_names = sorted({p.parent.name for p in glb_files})
     glb_by_name = {p.stem: str(p) for p in glb_files}
 
     os.makedirs(os.path.join(args.out, "images"), exist_ok=True)
