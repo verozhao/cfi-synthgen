@@ -65,9 +65,15 @@ def build_environment() -> bpy.types.Object:
     mat = bpy.data.materials.new(name="GroundMat")
     mat.use_nodes = True
     bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    
     if bsdf:
-        bsdf.inputs["Base Color"].default_value = (0.12, 0.11, 0.10, 1.0)
+        tex_checker = mat.node_tree.nodes.new("ShaderNodeTexChecker")
+        tex_checker.inputs["Color1"].default_value = (0.15, 0.14, 0.13, 1.0)
+        tex_checker.inputs["Color2"].default_value = (0.10, 0.09, 0.08, 1.0)
+        tex_checker.inputs["Scale"].default_value = 25.0
+        mat.node_tree.links.new(tex_checker.outputs["Color"], bsdf.inputs["Base Color"])
         bsdf.inputs["Roughness"].default_value = 0.85
+        
     ground.data.materials.append(mat)
 
     key = bpy.data.lights.new(name="Key", type="AREA")
@@ -204,6 +210,15 @@ def slot_color(i: int) -> tuple[int, int, int]:
 
 def assign_flat_material(obj: bpy.types.Object, rgb: tuple[float, float, float]):
     obj["_orig_mats"] = [slot.material for slot in obj.material_slots]
+    
+    # Restrict visibility so objects don't cast shadows or reflect light onto each other
+    obj["_orig_vis_diffuse"] = obj.visible_diffuse
+    obj["_orig_vis_glossy"] = obj.visible_glossy
+    obj["_orig_vis_shadow"] = obj.visible_shadow
+    obj.visible_diffuse = False
+    obj.visible_glossy = False
+    obj.visible_shadow = False
+
     mat = bpy.data.materials.new(name=f"Flat_{obj.name}")
     mat.use_nodes = True
     nodes = mat.node_tree.nodes
@@ -226,6 +241,13 @@ def restore_materials(obj: bpy.types.Object):
     if "_orig_mats" in obj:
         del obj["_orig_mats"]
 
+    if "_orig_vis_diffuse" in obj:
+        obj.visible_diffuse = obj.pop("_orig_vis_diffuse")
+    if "_orig_vis_glossy" in obj:
+        obj.visible_glossy = obj.pop("_orig_vis_glossy")
+    if "_orig_vis_shadow" in obj:
+        obj.visible_shadow = obj.pop("_orig_vis_shadow")
+
 # ─────────────────────────────────────────────────────────────────────────
 # Rendering
 # ─────────────────────────────────────────────────────────────────────────
@@ -234,6 +256,9 @@ def render_rgb(path: str, resolution: int):
     scene = bpy.context.scene
     scene.cycles.samples = 64
     scene.cycles.filter_width = 1.5
+    scene.cycles.use_denoising = True  # Restore denoising for photorealism
+    scene.cycles.max_bounces = 12      # Restore normal lighting bounces
+    
     scene.render.resolution_x = resolution
     scene.render.resolution_y = resolution
     scene.render.filepath = path
@@ -241,17 +266,25 @@ def render_rgb(path: str, resolution: int):
     bpy.ops.render.render(write_still=True)
 
 
-def render_flat(path: str, resolution: int):
+def render_flat_to_buffer(resolution: int) -> np.ndarray:
     scene = bpy.context.scene
     scene.cycles.samples = 1
     scene.cycles.filter_width = 0.01
+    
+    # Disable denoising and light bounces so the flat emission colors remain mathematically perfect
+    scene.cycles.use_denoising = False
+    scene.cycles.max_bounces = 0
+    
     scene.render.resolution_x = resolution
     scene.render.resolution_y = resolution
-    scene.render.filepath = path
-    scene.render.image_settings.file_format = "PNG"
 
     prev_transform = scene.view_settings.view_transform
+    prev_look = scene.view_settings.look
+    prev_exp = scene.view_settings.exposure
+    
     scene.view_settings.view_transform = "Raw"
+    scene.view_settings.look = "None"
+    scene.view_settings.exposure = 0.0
 
     world = scene.world
     bg = world.node_tree.nodes["Background"]
@@ -260,40 +293,48 @@ def render_flat(path: str, resolution: int):
     bg.inputs["Color"].default_value = (0, 0, 0, 1)
     bg.inputs["Strength"].default_value = 1.0
 
-    bpy.ops.render.render(write_still=True)
+    bpy.ops.render.render()
 
-    scene.view_settings.view_transform = prev_transform
     bg.inputs["Color"].default_value = prev_color
     bg.inputs["Strength"].default_value = prev_strength
+    
+    scene.view_settings.view_transform = prev_transform
+    scene.view_settings.look = prev_look
+    scene.view_settings.exposure = prev_exp
+
+    result = bpy.data.images["Render Result"]
+    w, h = result.size
+    pixels = np.array(result.pixels[:]).reshape(h, w, 4)
+    return np.flipud(pixels)
 
 # ─────────────────────────────────────────────────────────────────────────
 # Mask extraction
 # ─────────────────────────────────────────────────────────────────────────
 
-def extract_modal_masks(flat_png: str, id_to_rgb_255: dict[int, tuple[int, int, int]]) -> dict[int, np.ndarray]:
-    img = np.array(Image.open(flat_png).convert("RGB"))
+def extract_modal_masks(flat_rgba: np.ndarray, id_to_rgb_norm: dict[int, tuple[float, float, float]]) -> dict[int, np.ndarray]:
+    rgb = flat_rgba[:, :, :3]
     masks = {}
-    for obj_id, rgb in id_to_rgb_255.items():
-        diff = np.abs(img.astype(int) - np.array(rgb, dtype=int))
-        masks[obj_id] = np.all(diff <= 5, axis=-1)
+    for obj_id, expected in id_to_rgb_norm.items():
+        diff = np.abs(rgb - np.array(expected))
+        # Increased tolerance slightly to account for floating point precision in linear space
+        masks[obj_id] = np.all(diff < 0.05, axis=-1)
     return masks
 
 
 def render_amodal_mask(obj: bpy.types.Object, other_objs: list[bpy.types.Object],
-                       ground: bpy.types.Object, flat_png_tmp: str,
-                       resolution: int) -> np.ndarray:
+                       ground: bpy.types.Object, resolution: int) -> np.ndarray:
     hidden_states = {}
     for o in other_objs + [ground]:
         hidden_states[o] = o.hide_render
         o.hide_render = True
 
-    render_flat(flat_png_tmp, resolution)
+    flat_rgba = render_flat_to_buffer(resolution)
 
     for o, state in hidden_states.items():
         o.hide_render = state
 
-    img = np.array(Image.open(flat_png_tmp).convert("RGB"))
-    return np.any(img > 5, axis=-1)
+    rgb = flat_rgba[:, :, :3]
+    return np.any(rgb > 0.02, axis=-1)
 
 # ─────────────────────────────────────────────────────────────────────────
 # Scene loop
@@ -331,7 +372,7 @@ def generate_scene(glb_paths: list[str], scene_idx: int, cameras_per_scene: int,
         stem = pathlib.Path(glb_path).stem
         category_ids.append(dataset.category_id(stem))
 
-    tmp_dir = tempfile.mkdtemp()
+    light_objs = [o for o in bpy.data.objects if o.type == "LIGHT"]
 
     for c in range(cameras_per_scene):
         loc, rot = sample_camera_pose(center, radius)
@@ -341,27 +382,28 @@ def generate_scene(glb_paths: list[str], scene_idx: int, cameras_per_scene: int,
         rgb_path = os.path.join(out_dir, rgb_rel)
         render_rgb(rgb_path, resolution)
 
-        id_to_rgb_255 = {}
+        id_to_rgb_norm = {}
         for i, obj in enumerate(objs):
             rgb_255 = slot_color(i)
             rgb_norm = (rgb_255[0] / 255.0, rgb_255[1] / 255.0, rgb_255[2] / 255.0)
             assign_flat_material(obj, rgb_norm)
-            id_to_rgb_255[i] = rgb_255
+            id_to_rgb_norm[i] = rgb_norm
 
         ground.hide_render = True
+        for l in light_objs:
+            l.hide_render = True
 
-        tmp_flat = os.path.join(tmp_dir, f"flat_{scene_idx}_{c}.png")
-        render_flat(tmp_flat, resolution)
-
-        modal_masks = extract_modal_masks(tmp_flat, id_to_rgb_255)
+        flat_rgba = render_flat_to_buffer(resolution)
+        modal_masks = extract_modal_masks(flat_rgba, id_to_rgb_norm)
 
         amodal_masks = {}
         for i, obj in enumerate(objs):
             others = [o for j, o in enumerate(objs) if j != i]
-            tmp_amodal = os.path.join(tmp_dir, f"amodal_{scene_idx}_{c}_{i}.png")
-            amodal_masks[i] = render_amodal_mask(obj, others, ground, tmp_amodal, resolution)
+            amodal_masks[i] = render_amodal_mask(obj, others, ground, resolution)
 
         ground.hide_render = False
+        for l in light_objs:
+            l.hide_render = False
         for obj in objs:
             restore_materials(obj)
 
