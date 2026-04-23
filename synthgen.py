@@ -105,6 +105,8 @@ def build_environment(use_hdri: bool = False) -> bpy.types.Object:
     bpy.ops.rigidbody.object_add(type="PASSIVE")
     ground.rigid_body.collision_shape = "MESH"
     ground.rigid_body.friction = 1.0
+    ground.rigid_body.use_margin = True
+    ground.rigid_body.collision_margin = 0.0
 
     mat = bpy.data.materials.new(name="GroundMat")
     mat.use_nodes = True
@@ -167,6 +169,8 @@ def import_glb_with_physics(glb_path: str, position: tuple, rotation_euler: tupl
         scale_factor = 0.3 / max_dim
         obj.scale *= scale_factor
         bpy.ops.object.transform_apply(scale=True)
+        
+    bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
 
     obj.location = Vector(position)
     obj.rotation_euler = Euler(rotation_euler)
@@ -178,6 +182,8 @@ def import_glb_with_physics(glb_path: str, position: tuple, rotation_euler: tupl
     obj.rigid_body.collision_shape = "CONVEX_HULL"
     obj.rigid_body.mass = 0.1
     obj.rigid_body.friction = 0.8
+    obj.rigid_body.use_margin = True
+    obj.rigid_body.collision_margin = 0.001
 
     return obj
 
@@ -185,21 +191,30 @@ def import_glb_with_physics(glb_path: str, position: tuple, rotation_euler: tupl
 # Physics bake
 # ─────────────────────────────────────────────────────────────────────────
 
-def bake_physics(rigid_objs: list[bpy.types.Object], frames: int = 80):
+def bake_physics(rigid_objs: list[bpy.types.Object], frames: int = 120):
     scene = bpy.context.scene
     scene.frame_start = 1
     scene.frame_end = frames
 
-    for f in range(1, frames + 1):
-        scene.frame_set(f)
+    if scene.rigidbody_world and scene.rigidbody_world.point_cache:
+        scene.rigidbody_world.point_cache.frame_start = 1
+        scene.rigidbody_world.point_cache.frame_end = frames
+
+    bpy.ops.ptcache.bake_all(bake=True)
+    scene.frame_set(frames)
+    bpy.context.view_layer.update()
 
     for obj in rigid_objs:
         mat = obj.matrix_world.copy()
         bpy.context.view_layer.objects.active = obj
         obj.select_set(True)
+        # Remove physics so the objects freeze in place
         bpy.ops.rigidbody.object_remove()
         obj.matrix_world = mat
         obj.select_set(False)
+        
+    # Free the cache memory
+    bpy.ops.ptcache.free_bake_all()
 
 # ─────────────────────────────────────────────────────────────────────────
 # Camera sampling
