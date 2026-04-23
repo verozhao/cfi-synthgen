@@ -98,7 +98,7 @@ def reset_scene(hdri_path: str | None = None):
 # Environment
 # ─────────────────────────────────────────────────────────────────────────
 
-def build_environment(use_hdri: bool = False) -> bpy.types.Object:
+def build_environment(use_hdri: bool = False, bg_image_path: str | None = None) -> bpy.types.Object:
     bpy.ops.mesh.primitive_plane_add(size=20.0, location=(0, 0, 0))
     ground = bpy.context.active_object
     ground.name = "Ground"
@@ -110,10 +110,29 @@ def build_environment(use_hdri: bool = False) -> bpy.types.Object:
 
     mat = bpy.data.materials.new(name="GroundMat")
     mat.use_nodes = True
-    bsdf = mat.node_tree.nodes.get("Principled BSDF")
-    if bsdf:
+    tree = mat.node_tree
+    bsdf = tree.nodes.get("Principled BSDF")
+
+    if bg_image_path and os.path.exists(bg_image_path):
+        tex_node = tree.nodes.new('ShaderNodeTexImage')
+        tex_node.image = bpy.data.images.load(bg_image_path, check_existing=True)
+
+        # Tile the texture 10x10 so it stays high-res on the 20m plane
+        coord_node = tree.nodes.new('ShaderNodeTexCoord')
+        map_node = tree.nodes.new('ShaderNodeMapping')
+        map_node.inputs['Scale'].default_value = (10.0, 10.0, 1.0)
+
+        tree.links.new(coord_node.outputs['UV'], map_node.inputs['Vector'])
+        tree.links.new(map_node.outputs['Vector'], tex_node.inputs['Vector'])
+        tree.links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+        
+        # Give it a slight sheen like a real table
+        if bsdf:
+            bsdf.inputs["Roughness"].default_value = 0.35 
+    elif bsdf:
         bsdf.inputs["Base Color"].default_value = (0.4, 0.38, 0.36, 1.0)
         bsdf.inputs["Roughness"].default_value = 0.7
+        
     ground.data.materials.append(mat)
 
     if not use_hdri:
@@ -184,6 +203,8 @@ def import_glb_with_physics(glb_path: str, position: tuple, rotation_euler: tupl
     obj.rigid_body.friction = 0.8
     obj.rigid_body.use_margin = True
     obj.rigid_body.collision_margin = 0.001
+    obj.rigid_body.linear_damping = 0.5
+    obj.rigid_body.angular_damping = 0.8
 
     return obj
 
@@ -309,9 +330,9 @@ def render_mask_pass(output_name: str, resolution: int) -> np.ndarray:
 
 def generate_scene(glb_paths: list[str], scene_idx: int, cameras: list,
                    resolution: int, out_dir: str, dataset: COCODataset,
-                   hdri_path: str | None = None):
+                   hdri_path: str | None = None, bg_image_path: str | None = None):
     reset_scene(hdri_path=hdri_path)
-    ground = build_environment(use_hdri=bool(hdri_path))
+    ground = build_environment(use_hdri=bool(hdri_path), bg_image_path=bg_image_path)
 
     objs = []
     for i, glb_path in enumerate(glb_paths):
@@ -407,7 +428,8 @@ if __name__ == "__main__":
     parser.add_argument("--resolution", type=int, default=640)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--hdri", default=None, help="Path to .exr HDRI for environment lighting")
-    parser.add_argument("--cameras-json", default=None, help="Path to JSON file with camera specs (overrides --cameras-per-scene)")
+    parser.add_argument("--cameras-json", default=None, help="Path to JSON file with camera specs")
+    parser.add_argument("--backgrounds", default=None, help="Directory containing JPG/PNG table textures")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -432,6 +454,13 @@ if __name__ == "__main__":
     else:
         fixed_cameras = None
 
+    bg_files = []
+    if args.backgrounds:
+        bg_dir = pathlib.Path(args.backgrounds)
+        bg_files = list(bg_dir.glob("*.jpg")) + list(bg_dir.glob("*.png")) + list(bg_dir.glob("*.jpeg"))
+        if not bg_files:
+            print(f"Warning: No images found in {args.backgrounds}")
+
     for scene_idx in range(args.scenes):
         k = args.products_per_scene
         pool = list(glb_files)
@@ -444,9 +473,15 @@ if __name__ == "__main__":
             cameras = fixed_cameras
         else:
             cameras = [None] * args.cameras_per_scene
+            
+        # ---> PICK A RANDOM BACKGROUND FOR THIS SCENE <---
+        chosen_bg = str(random.choice(bg_files)) if bg_files else None
+
+        # ---> PASS IT TO THE RENDERER <---
         generate_scene(glb_paths, scene_idx, cameras,
                        args.resolution, args.out, dataset,
-                       hdri_path=args.hdri)
+                       hdri_path=args.hdri, bg_image_path=chosen_bg)
+        
         print(f"Scene {scene_idx + 1}/{args.scenes} done")
 
     ann_path = os.path.join(args.out, "annotations.json")
