@@ -4,6 +4,6 @@ A synthetic dataset generation pipeline that consumes glb files from CFI-3DGen a
 ## How to generate a dataset (sample commands):
 ```bash
 uv sync
-uv run python synthgen.py --glbs ./glbs --out ./dataset --scenes 100 --products-per-scene 3 --cameras-per-scene 6 --resolution 640 --seed 0
-uv run python synthgen.py --glbs ./glbs --out ./dataset --scenes 1 --products-per-scene 2 --cameras-per-scene 1 --resolution 256 
+uv run python synthgen.py --glbs ./approved_bundle --out ./dataset --scenes 2 --products-per-scene 5 --cameras-per-scene 3 --resolution 512 --hdri hdri/studio.exr --backgrounds ./textures
+
 ```

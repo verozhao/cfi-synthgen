@@ -243,8 +243,8 @@ def bake_physics(rigid_objs: list[bpy.types.Object], frames: int = 120):
 
 def sample_camera_pose(center: Vector, radius: float) -> tuple[Vector, Euler]:
     theta = random.uniform(0, 2 * math.pi)
-    phi = random.uniform(math.radians(15), math.radians(55))
-    r = radius * random.uniform(2.5, 4.0)
+    phi = random.uniform(math.radians(10), math.radians(35))
+    r = radius * random.uniform(1.2, 1.8)
 
     x = center.x + r * math.cos(theta) * math.cos(phi)
     y = center.y + r * math.sin(theta) * math.cos(phi)
@@ -351,7 +351,7 @@ def generate_scene(glb_paths: list[str], scene_idx: int, cameras: list,
     locations = [o.location for o in objs]
     center = sum(locations, Vector((0, 0, 0))) / len(locations)
 
-    max_dist = 0.3
+    max_dist = 0.05
     for o in objs:
         for corner in o.bound_box:
             world_corner = o.matrix_world @ Vector(corner)
