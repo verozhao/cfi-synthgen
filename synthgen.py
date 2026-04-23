@@ -40,37 +40,65 @@ def reset_scene():
         pass
     bpy.ops.rigidbody.world_add()
 
+    world = bpy.data.worlds.new("SynthWorld")
+    world.use_nodes = True
+    bg = world.node_tree.nodes["Background"]
+    bg.inputs["Color"].default_value = (0.02, 0.02, 0.02, 1.0)
+    bg.inputs["Strength"].default_value = 0.1
+    scene.world = world
+    scene.view_settings.view_transform = "Filmic"
+    scene.view_settings.look = "Medium High Contrast"
+    scene.view_settings.exposure = -1.0
+
 # ─────────────────────────────────────────────────────────────────────────
 # Environment
 # ─────────────────────────────────────────────────────────────────────────
 
 def build_environment() -> bpy.types.Object:
-    bpy.ops.mesh.primitive_plane_add(size=2.0, location=(0, 0, 0))
+    bpy.ops.mesh.primitive_plane_add(size=10.0, location=(0, 0, 0))
     ground = bpy.context.active_object
     ground.name = "Ground"
     bpy.ops.rigidbody.object_add(type="PASSIVE")
     ground.rigid_body.collision_shape = "MESH"
     ground.rigid_body.friction = 1.0
 
-    mat = bpy.data.materials.new(name="GroundGrey")
+    mat = bpy.data.materials.new(name="GroundMat")
     mat.use_nodes = True
     bsdf = mat.node_tree.nodes.get("Principled BSDF")
     if bsdf:
-        bsdf.inputs["Base Color"].default_value = (0.3, 0.3, 0.3, 1.0)
+        bsdf.inputs["Base Color"].default_value = (0.12, 0.11, 0.10, 1.0)
+        bsdf.inputs["Roughness"].default_value = 0.85
     ground.data.materials.append(mat)
 
-    light_data = bpy.data.lights.new(name="OverheadArea", type="AREA")
-    light_data.energy = 200
-    light_data.size = 2.0
-    light_obj = bpy.data.objects.new("OverheadArea", light_data)
-    light_obj.location = (0, 0, 2.0)
-    bpy.context.scene.collection.objects.link(light_obj)
+    key = bpy.data.lights.new(name="Key", type="AREA")
+    key.energy = 150
+    key.size = 3.0
+    key_obj = bpy.data.objects.new("Key", key)
+    key_obj.location = (1.5, -1.2, 2.5)
+    key_obj.rotation_euler = (math.radians(45), 0, math.radians(30))
+    bpy.context.scene.collection.objects.link(key_obj)
+
+    fill = bpy.data.lights.new(name="Fill", type="AREA")
+    fill.energy = 60
+    fill.size = 3.0
+    fill_obj = bpy.data.objects.new("Fill", fill)
+    fill_obj.location = (-1.5, 1.2, 2.0)
+    bpy.context.scene.collection.objects.link(fill_obj)
 
     return ground
 
 # ─────────────────────────────────────────────────────────────────────────
 # GLB import + physics
 # ─────────────────────────────────────────────────────────────────────────
+
+def flatten_metals(obj: bpy.types.Object):
+    for slot in obj.material_slots:
+        mat = slot.material
+        if mat and mat.use_nodes:
+            bsdf = mat.node_tree.nodes.get("Principled BSDF")
+            if bsdf and "Metallic" in bsdf.inputs:
+                bsdf.inputs["Metallic"].default_value = 0.0
+
 
 def import_glb_with_physics(glb_path: str, position: tuple, rotation_euler: tuple) -> bpy.types.Object:
     bpy.ops.import_scene.gltf(filepath=glb_path)
@@ -87,6 +115,9 @@ def import_glb_with_physics(glb_path: str, position: tuple, rotation_euler: tupl
         obj = bpy.context.active_object
     else:
         obj = selected[0]
+
+    flatten_metals(obj)
+
     max_dim = max(obj.dimensions)
     if max_dim > 0:
         scale_factor = 0.3 / max_dim
@@ -132,7 +163,7 @@ def bake_physics(rigid_objs: list[bpy.types.Object], frames: int = 80):
 
 def sample_camera_pose(center: Vector, radius: float) -> tuple[Vector, Euler]:
     theta = random.uniform(0, 2 * math.pi)
-    phi = random.uniform(math.radians(15), math.radians(75))
+    phi = random.uniform(math.radians(15), math.radians(55))
     r = radius * random.uniform(2.5, 4.0)
 
     x = center.x + r * math.cos(theta) * math.cos(phi)
@@ -202,6 +233,7 @@ def restore_materials(obj: bpy.types.Object):
 def render_rgb(path: str, resolution: int):
     scene = bpy.context.scene
     scene.cycles.samples = 64
+    scene.cycles.filter_width = 1.5
     scene.render.resolution_x = resolution
     scene.render.resolution_y = resolution
     scene.render.filepath = path
@@ -218,18 +250,21 @@ def render_flat(path: str, resolution: int):
     scene.render.filepath = path
     scene.render.image_settings.file_format = "PNG"
 
+    prev_transform = scene.view_settings.view_transform
     scene.view_settings.view_transform = "Raw"
 
-    world = bpy.context.scene.world
-    if world is None:
-        world = bpy.data.worlds.new("World")
-        bpy.context.scene.world = world
-    world.use_nodes = True
-    bg = world.node_tree.nodes.get("Background")
-    if bg:
-        bg.inputs["Color"].default_value = (0, 0, 0, 1)
+    world = scene.world
+    bg = world.node_tree.nodes["Background"]
+    prev_color = tuple(bg.inputs["Color"].default_value)
+    prev_strength = bg.inputs["Strength"].default_value
+    bg.inputs["Color"].default_value = (0, 0, 0, 1)
+    bg.inputs["Strength"].default_value = 1.0
 
     bpy.ops.render.render(write_still=True)
+
+    scene.view_settings.view_transform = prev_transform
+    bg.inputs["Color"].default_value = prev_color
+    bg.inputs["Strength"].default_value = prev_strength
 
 # ─────────────────────────────────────────────────────────────────────────
 # Mask extraction
@@ -271,13 +306,13 @@ def generate_scene(glb_paths: list[str], scene_idx: int, cameras_per_scene: int,
 
     objs = []
     for i, glb_path in enumerate(glb_paths):
-        pos = (random.uniform(-0.3, 0.3), random.uniform(-0.3, 0.3), 0.5 + i * 0.4)
+        pos = (random.uniform(-0.12, 0.12), random.uniform(-0.12, 0.12), 0.25 + i * 0.15)
         rot = (random.uniform(0, 2 * math.pi),
                random.uniform(0, 2 * math.pi),
                random.uniform(0, 2 * math.pi))
         objs.append(import_glb_with_physics(glb_path, pos, rot))
 
-    bake_physics(objs)
+    bake_physics(objs, frames=120)
 
     locations = [o.location for o in objs]
     center = sum(locations, Vector((0, 0, 0))) / len(locations)
