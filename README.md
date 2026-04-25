@@ -13,6 +13,8 @@ uv run python synthgen.py \
 --resolution 512 \
 --hdri hdri/studio.exr \
 --backgrounds ./textures \
---cameras-json cameras_4cam.json
+--cameras-json cameras_4cam.json # --cameras-json overrides --cameras-per-scene
 
+# To visualize labels
+uv run python visualize.py --dataset ./dataset_hdri
 ```

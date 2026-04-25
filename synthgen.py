@@ -117,7 +117,6 @@ def build_environment(use_hdri: bool = False, bg_image_path: str | None = None) 
         tex_node = tree.nodes.new('ShaderNodeTexImage')
         tex_node.image = bpy.data.images.load(bg_image_path, check_existing=True)
 
-        # Tile the texture 10x10 so it stays high-res on the 20m plane
         coord_node = tree.nodes.new('ShaderNodeTexCoord')
         map_node = tree.nodes.new('ShaderNodeMapping')
         map_node.inputs['Scale'].default_value = (10.0, 10.0, 1.0)
@@ -330,13 +329,19 @@ def render_mask_pass(output_name: str, resolution: int) -> np.ndarray:
 
 def generate_scene(glb_paths: list[str], scene_idx: int, cameras: list,
                    resolution: int, out_dir: str, dataset: COCODataset,
-                   hdri_path: str | None = None, bg_image_path: str | None = None):
+                   hdri_path: str | None = None, bg_image_path: str | None = None,
+                   drop_bounds: tuple | None = None):
     reset_scene(hdri_path=hdri_path)
     ground = build_environment(use_hdri=bool(hdri_path), bg_image_path=bg_image_path)
 
+    if drop_bounds is None:
+        drop_bounds = (-0.12, 0.12, -0.12, 0.12)
+
     objs = []
     for i, glb_path in enumerate(glb_paths):
-        pos = (random.uniform(-0.12, 0.12), random.uniform(-0.12, 0.12), 0.25 + i * 0.15)
+        pos = (random.uniform(drop_bounds[0], drop_bounds[1]),
+               random.uniform(drop_bounds[2], drop_bounds[3]),
+               0.25 + i * 0.15)
         rot = (random.uniform(0, 2 * math.pi),
                random.uniform(0, 2 * math.pi),
                random.uniform(0, 2 * math.pi))
@@ -450,9 +455,17 @@ if __name__ == "__main__":
 
     if args.cameras_json:
         with open(args.cameras_json) as f:
-            fixed_cameras = json.load(f)
+            cam_data = json.load(f)
+        if isinstance(cam_data, dict):
+            fixed_cameras = cam_data["cameras"]
+            dz = cam_data.get("drop_zone", [0.12, 0.12])
+            drop_bounds = (-dz[0], dz[0], -dz[1], dz[1])
+        else:
+            fixed_cameras = cam_data
+            drop_bounds = None
     else:
         fixed_cameras = None
+        drop_bounds = None
 
     bg_files = []
     if args.backgrounds:
@@ -480,7 +493,8 @@ if __name__ == "__main__":
         # ---> PASS IT TO THE RENDERER <---
         generate_scene(glb_paths, scene_idx, cameras,
                        args.resolution, args.out, dataset,
-                       hdri_path=args.hdri, bg_image_path=chosen_bg)
+                       hdri_path=args.hdri, bg_image_path=chosen_bg,
+                       drop_bounds=drop_bounds)
         
         print(f"Scene {scene_idx + 1}/{args.scenes} done")
 
