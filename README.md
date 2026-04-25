@@ -15,7 +15,4 @@ uv run python synthgen.py \
 --backgrounds ./textures \
 --cameras-json cameras_4cam.json
 
-# To visualize labels:
-uv run python visualize.py --dataset ./dataset_hdri
 ```
-Note: ```--cameras-json``` overrides ```--cameras-per-scene```
