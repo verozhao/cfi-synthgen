@@ -1,7 +1,6 @@
-# Use Gemini to estimate a per-product longest-dimension and write it into
-# each manifest_entry.json sidecar as target_size_m_estimated (meters).
 # The file reads (title, shape) from manifest_entry.json, asks Gemini for the typical
-# longest physical dimension of that product, validates the answer, writes back.
+# longest physical dimension of that product, validates the answer, writes back into
+# each manifest_entry.json sidecar as target_size_m_estimated (meters).
 import argparse
 import json
 import os
