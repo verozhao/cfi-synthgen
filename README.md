@@ -10,15 +10,19 @@ uv run python synthgen.py \
 --scenes 2 \
 --products-per-scene 5 \
 --cameras-per-scene 3 \
---resolution 512 \
+--resolution 2048 \
 --hdri hdri/studio.exr \
 --backgrounds ./textures \
 # --cameras-json overrides --cameras-per-scene 
 --cameras-json cameras_4cam.json  \ 
-# options: scatter (products scattered), close_far (3 closeby 1 far away), stacking (boxes stacking together, only effective if the scene contains more than 2 boxes)
+# placement options: 
+# 1. scatter (products spread loose, fills camera frame), 
+# 2. cluster_mid (products at moderate density, gaps between objects), 
+# 3. cluster_tight (products tightly piled, products touching),
+# 4. stacking (box vertical stack + side products)
 --placement stacking 
 --seed 0 # optional
 
 # To visualize labels
-uv run python visualize.py --dataset ./dataset_hdri
+uv run python visualize.py --dataset ./dataset
 ```
