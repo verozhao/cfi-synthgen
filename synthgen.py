@@ -21,6 +21,8 @@ import numpy as np
 from mathutils import Euler, Vector
 from PIL import Image
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from coco_writer import COCODataset
 
 
@@ -37,7 +39,14 @@ FALLBACK_SIZE_RANGE = (0.08, 0.35)
 BOX_SHAPES = {"box", "box_rounded"}
 STACKABLE_SHAPES = {"box"}  # box_rounded (soft squeeze bottles, shampoo) can't be stacked
 
-PLACEMENT_MODES = ("scatter", "close_far", "stacking")
+PLACEMENT_MODES = ("scatter", "cluster_mid", "cluster_tight", "stacking")
+
+DROP_ZONE_SCALE = {
+    "scatter":       6.0,
+    "cluster_mid":   4.0,
+    "cluster_tight": 0.6,
+    "stacking":      1.0,
+}
 
 # CFI-3DGen GLBs are authored Y-up: +Z=front, -Z=back, +Y=top.
 # Blender's glTF importer auto-rotates Y-up to Z-up. World normals come from
@@ -50,6 +59,16 @@ LOCAL_TOP   = Vector((0, 1, 0))
 def random_size(shape):
     lo, hi = DEFAULT_SHAPE_SIZE_RANGES.get(shape, FALLBACK_SIZE_RANGE) if shape else FALLBACK_SIZE_RANGE
     return random.uniform(lo, hi)
+
+
+def size_for_product(glb_path, shape):
+    """Read per-product Gemini size from sidecar; fallback to shape-based random.
+    Adds +/-5% jitter so the same SKU varies slightly across scenes."""
+    entry = load_manifest_entry(glb_path) or {}
+    base = entry.get("target_size_m_estimated")
+    if isinstance(base, (int, float)) and 0.03 <= base <= 1.5:
+        return float(base) * random.uniform(0.95, 1.05)
+    return random_size(shape)
 
 
 def load_manifest_entry(glb_path):
@@ -80,7 +99,7 @@ def aabb_overlap_volume(a_min, a_max, b_min, b_max):
     return dx * dy * dz
 
 
-def any_pair_intersects(objs, tolerance_m3=1e-4, ignore_pairs=None):
+def any_pair_intersects(objs, tolerance_m3=5e-2, ignore_pairs=None):
     if ignore_pairs is None:
         ignore_pairs = set()
     bboxes = [world_aabb(o) for o in objs]
@@ -255,7 +274,7 @@ def _import_and_scale(glb_path, position, rotation_euler, shape, target_size=Non
 
     flatten_metals(obj)
     if target_size is None:
-        target_size = random_size(shape)
+        target_size = size_for_product(glb_path, shape)
     max_dim = max(obj.dimensions)
     if max_dim > 0:
         obj.scale *= target_size / max_dim
@@ -298,16 +317,18 @@ def bake_physics(rigid_objs, frames=120):
     bpy.ops.ptcache.bake_all(bake=True)
     scene.frame_set(frames)
     bpy.context.view_layer.update()
-    for obj in rigid_objs:
-        if obj.rigid_body is None:
-            continue
-        mat = obj.matrix_world.copy()
-        bpy.context.view_layer.objects.active = obj
+    # Snapshot world transforms before mutating selection / removing rigid bodies.
+    snapshots = [(obj, obj.matrix_world.copy()) for obj in rigid_objs if obj.rigid_body is not None]
+    bpy.ops.object.select_all(action="DESELECT")
+    for obj, _ in snapshots:
         obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
         bpy.ops.rigidbody.object_remove()
-        obj.matrix_world = mat
         obj.select_set(False)
     bpy.ops.ptcache.free_bake_all()
+    for obj, mat in snapshots:
+        obj.matrix_world = mat
+    bpy.context.view_layer.update()
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -333,7 +354,7 @@ def place_close_far(glb_paths, drop_bounds, n_close, n_far):
     out = []
     for i, glb_path in enumerate(glb_paths):
         if i < n_close:
-            x, y = _zone_xy(drop_bounds, 0.7, 0.7)
+            x, y = _zone_xy(drop_bounds, 1.0, 1.0)
             z = 0.25 + i * 0.12
         else:
             far_dist = random.uniform(0.30, 0.50)
@@ -544,8 +565,6 @@ def generate_scene(glb_paths, scene_idx, cameras, resolution, out_dir, dataset,
         else:
             stack_specs, side_specs = result
             placements = side_specs
-    elif placement_mode == "close_far":
-        placements = place_close_far(glb_paths, drop_bounds, n_close, n_far)
     else:
         placements = place_scatter(glb_paths, drop_bounds)
 
@@ -690,7 +709,13 @@ if __name__ == "__main__":
                         help="Products near scene center in close_far mode.")
     parser.add_argument("--n-far", type=int, default=1,
                         help="Products offset away in close_far mode.")
-    args = parser.parse_args()
+    import sys as _sys
+    _argv = _sys.argv
+    if "--" in _argv:
+        _argv = _argv[_argv.index("--") + 1:]
+    else:
+        _argv = _argv[1:]
+    args = parser.parse_args(_argv)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -706,11 +731,6 @@ if __name__ == "__main__":
         if box_count < 2:
             print(f"Stacking mode requires >=2 box products in pool; only {box_count} found.")
             raise SystemExit(1)
-
-    if args.placement == "close_far":
-        if args.n_close + args.n_far != args.products_per_scene:
-            args.products_per_scene = args.n_close + args.n_far
-            print(f"close_far: setting products_per_scene = {args.products_per_scene}")
 
     category_names = sorted({resolve_sku_and_shape(p)[0] for p in glb_files})
     n_with_manifest = sum(1 for p in glb_files if (p.parent / "manifest_entry.json").exists())
@@ -735,6 +755,11 @@ if __name__ == "__main__":
     else:
         fixed_cameras = None
         drop_bounds = None
+
+    if drop_bounds is not None:
+        scale = DROP_ZONE_SCALE.get(args.placement, 1.0)
+        drop_bounds = tuple(b * scale for b in drop_bounds)
+        print(f"drop_bounds x{scale} for {args.placement}: {drop_bounds}")
 
     bg_files = []
     if args.backgrounds:

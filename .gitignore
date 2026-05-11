@@ -2,5 +2,6 @@ __pycache__
 uv.lock
 .venv
 approved_bundle
-approved_bundle_v2
-samples_hires
+dataset_1k_05112026
+dataset_1k_05112026.zip
+synthgen.py.bak
