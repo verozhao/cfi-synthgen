@@ -15,7 +15,8 @@ Views:
   "raw" index  : UniTEX-FLUX MVDataset order on disk (render/<uid>/000i_*), Blender cameras.
   "strip" slot : position in the 512 x 3072 FLUX canvas, slot i shows raw FULL_INDEX[i].
   "grid" tile  : UniTEX inference 2x3 grid (mv_ccm.png, mv_normal.png, mv_rgb.png),
-                 export order f r t / b l d, bottom tile NOT rolled.
+                 export order f r t / b l d. The bottom tile is TextureTools' raw "d" view,
+                 which is raw view 5 rotated 180 degrees (see GRID_TILE_TO_RAW).
 """
 
 import numpy as np

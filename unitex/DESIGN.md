@@ -25,7 +25,7 @@ Everything shares the conventions in `unitex/common.py`.
   training_uid.json                      ["cfi/<sku>", ...]
   render/cfi/<sku>/
     0000_rgb.png ... 0005_rgb.png        RGBA, lit render, straight alpha
-    0000_albedo.png ...                  RGB base colour (sRGB), composited on white
+    0000_albedo.png ...                  RGB base colour (sRGB), straight colour, white only where alpha is 0
     0000_nocs.png ...                    RGBA, RGB = (p_blender + 1) / 2 (normalized frame), A = hard mask
     0000_normal.png ...                  RGB, (n_cam + 1) / 2, Blender camera frame (x right, y up, z to viewer)
     0000_bump.png, _metallic, _roughness 1x1 placeholders (required by the UniTEX-FLUX assert)
@@ -33,8 +33,10 @@ Everything shares the conventions in `unitex/common.py`.
     metadata.json                        {"cam2world_matrixs": [6 x 4x4], "res", "ortho_scale", "normalize": {...}, "sku", "shape", "title", "source_glb", "yaw_deg"}
     text.json                            per-view text items (below), written by text_regions.py
   render_random/cfi/<sku>/
-    0000_rgb.png ... 00NN_rgb.png        RGBA lit reference candidates, framed like UniTEX preprocess (tight bbox, 0.95, grey)
-    0000_albedo.png ...                  RGB albedo of the same views
+    0000_rgb.png ... 0019_rgb.png        RGBA lit reference candidates, framed like UniTEX preprocess
+                                         (tight alpha bbox, longer side 0.95 of the canvas), transparent background.
+                                         Keep at least 20: the UniTEX-FLUX loader indexes 0..19.
+    0000_albedo.png ...                  RGB albedo of the same views (straight colour)
     metadata.json                        {"cam2world_matrixs": [...], "fov_deg": [...], "framing": [...]}
   caption/cfi/<sku>/prompt.txt           "[MVFLUX]" (UniTEX inference prompt)
 ```
@@ -82,7 +84,9 @@ as plain files next to `data.mdb`.
   (16 bins along the baseline). `cos` is the mean |n . v| over its visible pixels.
 - `grid` samples the item's own reading frame `(s, t) in [0,1]^2` (`ns` along the baseline,
   `nt` across) and stores where each cell centre lands in the view, `null` if not visible.
-  It lets glyph tokens follow curved and foreshortened surfaces instead of an axis-aligned box.
+  Layout is `xy[it][is]`: `nt` rows across the text (t = 0 at the top of the letters), each
+  holding `ns` cells along the baseline. It lets glyph tokens follow curved and foreshortened
+  surfaces instead of an axis-aligned box.
 
 ## Evaluation (step 1)
 
@@ -117,6 +121,10 @@ text are reported separately.
   under a total glyph-token budget.
 - Staged glyph source: ground-truth crops from the target view, box-size renders, fixed-size
   renders, with the sampling ratio moving towards fixed-size renders over training.
+- Fixed-size renders default to the paper's scale (24 px font, 32 px lines), which makes every
+  line 2 to 3 token rows. Most of our text is 15 to 32 px tall at 512 px per view, so center-mode
+  footprints of small text overlap. `fixed_font_px=12, fixed_line_px=16, fixed_margin_px=0`
+  gives one token row per line. Which works better is an experiment, not a settled choice.
 - Inference layout: OCR the photo, map boxes into the front view (affine fit of the photo's
   foreground bbox onto the mesh's front silhouette), lift through the front CCM onto the
   surface, re-project into all six views with a visibility test (`unitex/anchors.py`).
