@@ -1,0 +1,15 @@
+# SKUs whose textured.glb is rotated 90 degrees (CFI-3DGen uv6_v2 auto_orient put the
+# tallest axis on Y before unwrapping), so the product lies on its side with a scrambled
+# texture wrap. mvgen.py --mode train skips these by default (--exclude).
+# Source: data-audit and cfi3dgen reports, 2026-09-23. One SKU per line, '#' starts a comment.
+009800895007
+022000005120
+027000390054
+037600138727
+050000103867
+051000000118
+051000010216
+051000028280
+051000253019
+078742082752
+646cbbaa24d7
