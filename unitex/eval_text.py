@@ -63,7 +63,8 @@ from unitex import ocr as ocr_mod
 from unitex import text_metrics as tm
 from unitex.common import apply_affine, bbox_of_mask, fit_box_affine, split_grid
 from unitex.ocr import quad_height, quad_length
-from unitex.prepare_eval import load_gt, read_sku_list, ref1024_box_to_photo, unitex_frame_boxes
+from unitex.prepare_eval import (load_gt, read_sku_list, ref1024_box_to_photo, unitex_frame_boxes,
+                                 unitex_reference)
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 STAGES = ("ref1024", "vae1024", "ref512", "vae512", "lit", "delit", "baked", "baseline")
@@ -447,7 +448,13 @@ def evaluate_sku(sku, eval_dir, out_dir, args, ocr_kwargs):
     elif fr.get("ref_box_512"):
         h_aff, h_ref = fit_box_affine(fr["photo_box"], fr["ref_box_512"]), "ref512 framing"
     else:
-        h_aff, h_ref = None, None
+        # no UniTEX run yet: replicate its reference framing locally so heights stay comparable
+        _, _, src, dst = unitex_reference(sku_dir / "ref.png")
+        if src and dst:
+            h_aff = fit_box_affine(ref1024_box_to_photo(src, meta), [v / 2 for v in dst])
+            h_ref = "local ref512 framing"
+        else:
+            h_aff, h_ref = None, None
     gt_rows = []
     for g in gt:
         h512 = quad_height(map_quad(g["quad"], h_aff)) if (g["quad"] is not None and h_aff) else None
