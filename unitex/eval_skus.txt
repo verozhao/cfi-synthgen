@@ -1,0 +1,32 @@
+# UniTEX step 1 text-fidelity eval subset (28 SKUs), from the data audit's section 6.
+# Criteria: catalog front_ref.png exists, no overlay-corrupted geometry, not one of the 11
+# rotated exports, >= 46 OCR characters, one SKU per product family, mixed shapes / fonts / scripts.
+# Format: <sku>  # <shape>  <name>. "(P)" = a real phone photo also exists in selected_frontal.
+611269818994  # can          Red Bull 12oz: rotated text, fine legal text, metallic
+031146270606  # can          Shin Ramyun cup: Hanja, Hangul, Cyrillic, Greek, diacritics, tapered
+072360002031  # can          El Pato: Spanish / English, arched text (P, variant differs)
+078742369594  # can          Great Value Peaches: dense small italic text
+078742371627  # can          Great Value Chicken Noodle: dense condensed text (P, design differs)
+016000459601  # can          Betty Crocker frosting: script plus italic (P)
+051000250346  # can          Campbell's Well Yes! cup: overlay-free Campbell's, 19 lines (P)
+051500241776  # can_jar      Jif: bold wordmark on curved label, small NET WT
+048001213388  # can_jar      Hellmann's 30oz: 151 chars, signature script
+656285201597  # can_jar      Partanna: Italian, ornate glass-jar label
+012000046445  # bottle       Pure Leaf: serif, small text (P)
+016571940331  # bottle       Sparkling ICE: vertical text on clear bottle
+021273100129  # bottle       Gunter's honey bear: tiny label text, 1438x3154 source
+012000064500  # bottle       Dole: small shrink-sleeve text
+041500000251  # box_rounded  French's: squeeze bottle, arched and script text (P)
+603084571239  # box_rounded  Garnier: 126 chars of small text on translucent green
+013409352311  # box_rounded  Sweet Baby Ray's Original: arched ornate text (P)
+024100788958  # box          Cheez-It: heavy display type, on-product "12.4 oz" overlay (P)
+016000263192  # box          Tuna Helper: slab serif plus small text (P)
+025500201887  # box          Folgers: EN / ES bilingual, serif (P)
+078742184197  # box          Great Value Chamomile: 17 lines (P)
+016000233164  # box          Lucky Charms: stylized type on a busy cartoon background
+014100051879  # bag          Goldfish Flavor Blasted: 3D display type plus small text (P)
+017082883896  # bag          Jack Link's: 199 chars, 3.5 px lines (P)
+753656718392  # bag          think! wrapper: 201 chars, flat (P)
+072600079717  # bag          Herr's: script on a pillow bag, 3.5 px lines
+856369004759  # bag          Quinn: green-background catalog image (tests background removal)
+079200049836  # bag          SweeTARTS: italic display type, flat pouch (P)
