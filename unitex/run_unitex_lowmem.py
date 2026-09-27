@@ -54,6 +54,9 @@ def lowmem_build_pipeline(pretrain_models=None, pipeline_name='texture_plus', mo
     # the VAE stays resident: PBRFluxPipeline moves latents to self.vae.device before decoding
     pipeline.vae.to('cuda')
     cpu_offload(pipeline.transformer, execution_device=torch.device('cuda'))
+    # diffusers infers _execution_device from the first component's weights, which are now on
+    # the meta device, so inputs would be sent there. Pin it to the GPU instead.
+    type(pipeline)._execution_device = property(lambda self: torch.device('cuda'))
     print('  [lowmem] FLUX transformer streamed from CPU (bf16, LoRAs loaded), VAE on cuda')
     return pipeline, weights_for_texture, weights_for_delight, adapter_names
 
