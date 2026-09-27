@@ -16,3 +16,7 @@ Order set by the advisor (meeting 2026-09-23). Finish each step before starting 
 
 - [ ] Test EasyText (arXiv 2505.24417, FLUX LoRA, public code) as the glyph plug-in instead of
       reimplementing GlyphAnchor. Compare against the GlyphAnchor integration on the same eval.
+      Verified 2026-09-24: the released EasyText code cannot edit an existing image. It always
+      starts from noise, a custom `latents` init crashes (tuple unpack), and output is fixed at
+      1024x1024 by hardcoded token counts. Reuse its position-mapping mechanism inside the UniTEX
+      trainer, or modify its pipeline (SDEdit init or masked blending) before a per-view test.
