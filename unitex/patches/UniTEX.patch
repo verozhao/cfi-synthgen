@@ -1,0 +1,405 @@
+diff --git a/LTM/rgb_field.py b/LTM/rgb_field.py
+--- a/LTM/rgb_field.py
++++ b/LTM/rgb_field.py
+@@ -46,8 +46,11 @@
+         B, N, C, H, W = albedo_fbrltd.shape
+         pixel_values = torch.cat([albedo_fbrltd, ccm_fbrltd, alpha_fbrltd], dim=2).reshape(B*N, 2*C+1, H, W)
+         if H != 512 or W != 512:
+-            pixel_values[:, :2*C, :, :] = torch.nn.functional.interpolate(pixel_values[:, :2*C, :, :], size=(512, 512))
+-            pixel_values[:, 2*C:, :, :] = torch.nn.functional.interpolate(pixel_values[:, 2*C:, :, :], size=(512, 512), mode='nearest-exact')
++            # CFI: rebuilt, not assigned in place, which cannot change H, W (RuntimeError at view_res 1024)
++            pixel_values = torch.cat([
++                torch.nn.functional.interpolate(pixel_values[:, :2*C, :, :], size=(512, 512)),
++                torch.nn.functional.interpolate(pixel_values[:, 2*C:, :, :], size=(512, 512), mode='nearest-exact'),
++            ], dim=1)
+         H = W = 512
+         pixel_values[:, :2*C, :, :] = pixel_values[:, :2*C, :, :] * 2.0 - 1.0
+         pixel_values = pixel_values.reshape(B, N, 2*C+1, H, W).permute(0, 2, 3, 1, 4).reshape(B, 2*C+1, H, N*W)
+diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipeline.py
+--- a/flux_piplines/texturing/pipeline.py
++++ b/flux_piplines/texturing/pipeline.py
+@@ -266,12 +266,14 @@
+ 
+     @staticmethod
+     def _prepare_latent_image_ids(batch_size, height, width, device, dtype, offset_x=0, offset_y=0, offset_z=0):
++        # Always fp32, whatever `dtype` says: in bf16 ids above 256 collide (257 -> 256), which
++        # breaks 1024 px views (cols up to 447) and fractional glyph ids. Identical values <= 256.
+         latent_image_ids = torch.zeros(height, width, 3)
+         latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(offset_y, offset_y + height)[:, None]
+         latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(offset_x, offset_x + width)[None, :]
+         if offset_z != 0:
+             latent_image_ids[..., 0] = latent_image_ids[..., 0] + offset_z
+-        latent_image_ids = latent_image_ids.reshape(height * width, 3).to(device=device, dtype=dtype)
++        latent_image_ids = latent_image_ids.reshape(height * width, 3).to(device=device, dtype=torch.float32)
+         return latent_image_ids
+ 
+     def prepare_latents_and_image_ids(
+@@ -401,6 +403,50 @@
+             control_latents, control_ids,
+         )
+ 
++    def prepare_glyph_tokens(
++        self,
++        batch_size,
++        dtype,
++        device,
++        glyph_instances=None,
++        glyph_latents=None,
++        glyph_ids=None,
++        glyph_sample_mode="argmax",
++        glyph_generator=None,
++    ):
++        """GlyphAnchor glyph tokens -> (latents [B, Ng, 4C] in dtype, ids [Ng, 3] fp32), or (None, None).
++
++        Either cfi-synthgen unitex.glyph_tokens GlyphInstances (VAE-encoded here with self.vae,
++        posterior mode by default so the shared pipeline generator is not consumed) or already
++        packed glyph_latents [1 | B, Ng, 4C] + glyph_ids [Ng, 3]. Ids live on the glyph plane
++        (axis 0 >= 1) with rows / cols on the target strip token grid.
++        """
++        if glyph_instances is not None:
++            if glyph_latents is not None or glyph_ids is not None:
++                raise ValueError("pass glyph_instances or glyph_latents + glyph_ids, not both")
++            from unitex import glyph_tokens  # cfi-synthgen on PYTHONPATH
++            glyph_latents, glyph_ids = glyph_tokens.encode_glyphs(
++                list(glyph_instances), self.vae, sample_mode=glyph_sample_mode,
++                generator=glyph_generator, device=device, dtype=dtype)
++        if glyph_latents is None and glyph_ids is None:
++            return None, None
++        if glyph_latents is None or glyph_ids is None:
++            raise ValueError("glyph_latents and glyph_ids go together")
++        glyph_ids = torch.as_tensor(glyph_ids).to(device=device, dtype=torch.float32)
++        glyph_latents = torch.as_tensor(glyph_latents).to(device=device, dtype=dtype)
++        if glyph_latents.ndim == 2:
++            glyph_latents = glyph_latents.unsqueeze(0)
++        if glyph_ids.ndim != 2 or glyph_ids.shape[1] != 3 or glyph_latents.shape[1] != glyph_ids.shape[0]:
++            raise ValueError(f"glyph_latents {tuple(glyph_latents.shape)} and glyph_ids {tuple(glyph_ids.shape)} do not match")
++        if glyph_latents.shape[-1] != 4 * self.vae.config.latent_channels:
++            raise ValueError(f"glyph_latents have {glyph_latents.shape[-1]} channels, packed latents have {4 * self.vae.config.latent_channels}")
++        if not torch.isfinite(glyph_ids).all() or (glyph_ids[:, 0] < 1).any():
++            # axis 0 = 0 is the target / condition plane: glyph tokens would take their positions
++            raise ValueError("glyph_ids must be finite with axis 0 >= 1 (the glyph plane)")
++        if glyph_latents.shape[0] == 1 and batch_size > 1:
++            glyph_latents = glyph_latents.repeat(batch_size, 1, 1)
++        return glyph_latents, glyph_ids
++
+     @torch.no_grad()
+     @replace_example_docstring(EXAMPLE_DOC_STRING)
+     def __call__(
+@@ -428,6 +474,11 @@
+         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
+         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+         max_sequence_length: int = 512,
++        glyph_instances=None,
++        glyph_latents: Optional[torch.FloatTensor] = None,
++        glyph_ids: Optional[torch.FloatTensor] = None,
++        glyph_sample_mode: str = "argmax",
++        glyph_generator: Optional[torch.Generator] = None,
+     ):
+         r"""
+         Function invoked when calling the pipeline for generation.
+@@ -490,6 +541,10 @@
+                 will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
+                 `._callback_tensor_inputs` attribute of your pipeline class.
+             max_sequence_length (`int` defaults to 512): Maximum sequence length to use with the `prompt`.
++            glyph_instances / glyph_latents + glyph_ids: GlyphAnchor glyph conditions (see
++                `prepare_glyph_tokens`). Appended after the control and reference tokens, so like them
++                they are re-inserted clean at every step and stripped before decoding. None (default)
++                runs the stock pipeline.
+ 
+         Examples:
+ 
+@@ -577,6 +632,7 @@
+         )
+         latents = noise_latents
+         latent_image_ids = noise_ids
++        n_noise = noise_latents.shape[1]
+         if dual_latents is not None and control_latents is not None:
+             condition_latents = torch.cat([control_latents, dual_latents], dim=1)
+             condition_ids = torch.cat([control_ids, dual_ids], dim=0)
+@@ -589,6 +645,23 @@
+         else:
+             condition_latents = None
+             condition_ids = None
++        glyph_latents, glyph_ids = self.prepare_glyph_tokens(
++            batch_size * num_images_per_prompt,
++            prompt_embeds.dtype,
++            device,
++            glyph_instances=glyph_instances,
++            glyph_latents=glyph_latents,
++            glyph_ids=glyph_ids,
++            glyph_sample_mode=glyph_sample_mode,
++            glyph_generator=glyph_generator,
++        )
++        self._last_n_glyph_tokens = 0 if glyph_latents is None else int(glyph_latents.shape[1])
++        if self._last_n_glyph_tokens > 0:
++            if condition_latents is None:
++                condition_latents, condition_ids = glyph_latents, glyph_ids
++            else:
++                condition_latents = torch.cat([condition_latents, glyph_latents], dim=1)
++                condition_ids = torch.cat([condition_ids, glyph_ids], dim=0)
+ 
+         # 5. Prepare timesteps
+         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+@@ -627,6 +700,7 @@
+         else:
+             prompt_image_embeds = prompt_embeds
+             text_image_ids = text_ids
++        text_image_ids = text_image_ids.to(dtype=torch.float32)     # position ids stay fp32
+         if condition_latents is not None:
+             latents = torch.cat([latents, condition_latents], dim=1)
+             latent_image_ids = torch.cat([latent_image_ids, condition_ids], dim=0)
+@@ -642,7 +716,7 @@
+                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                 if condition_latents is not None:
+-                    latents = torch.cat([latents[:, :-condition_latents.shape[1]], condition_latents], dim=1)
++                    latents = torch.cat([latents[:, :n_noise], condition_latents], dim=1)
+                 noise_pred = self.transformer(
+                     hidden_states=latents,  # vae: [1, 8192, 64], change dim to 3072
+                     timestep=timestep / 1000,
+@@ -681,7 +755,7 @@
+                     xm.mark_step()
+ 
+         if condition_latents is not None:
+-            latents = latents[:, :-condition_latents.shape[1]]
++            latents = latents[:, :n_noise]
+         if output_type == "latent":
+             image = latents
+         else:
+diff --git a/pipeline.py b/pipeline.py
+--- a/pipeline.py
++++ b/pipeline.py
+@@ -1,6 +1,7 @@
+ '''
+ full pipeline for pbr generation (v2)
+ '''
++import json
+ import os
+ import shutil
+ import sys
+@@ -83,6 +84,7 @@
+         quantization_config = None
+         cpu_offload = False
+     else:
++        cpu_offload = True     # was never set on this branch (UnboundLocalError below)
+         quantization_config = BitsAndBytesConfig(
+             load_in_4bit=True,
+             bnb_4bit_quant_type="nf4",
+@@ -137,7 +139,22 @@
+ 
+ 
+ class RGBTextureFullPipelineBase:
+-    def __init__(self, pretrain_models=None, pipeline_name='texture_plus',super_resolutions=False, seed=0, speedup_mode=None,add_lora_path=None, add_lora_weights=None, filt_gradient_points=False,filt_large_angle_points=True, enable_rembg=False):
++    # CFI: view_res / glyph options below (unitex/patches/UniTEX.patch in cfi-synthgen)
++    GLYPH_API = 1
++
++    def __init__(self, pretrain_models=None, pipeline_name='texture_plus',super_resolutions=False, seed=0, speedup_mode=None,add_lora_path=None, add_lora_weights=None, filt_gradient_points=False,filt_large_angle_points=True, enable_rembg=False,
++                 view_res=512, glyph_config=None, glyph_delight=False, glyph_sample_mode='argmax'):
++        # view_res: px per view of the FLUX strip (view_res x 6 view_res) and of the geometry grids.
++        # The released LoRAs were trained at 512. glyph_config: unitex.glyph.GlyphConfig, or a JSON
++        # path / inline JSON for unitex.glyph_tokens.glyph_config (None: GlyphConfig defaults).
++        # Glyphs go to the texture pass only, unless glyph_delight.
++        if int(view_res) % 16:
++            raise ValueError(f'view_res must be a multiple of 16 (one FLUX token), got {view_res}')
++        self.view_res = int(view_res)
++        self.glyph_config = glyph_config
++        self.glyph_delight = bool(glyph_delight)
++        self.glyph_sample_mode = glyph_sample_mode
++        self.last_glyph_info = None
+         pipeline,weights_for_texture,weights_for_delight,adapter_names = build_pipeline(pretrain_models=pretrain_models, pipeline_name=pipeline_name,speedup_mode = speedup_mode, add_lora_path=add_lora_path,add_lora_weights=add_lora_weights, model='rgb')
+         if enable_rembg:
+             rembg_session = build_rembg()
+@@ -184,31 +201,34 @@
+ 
+     @CPUTimer('preprocess_reference_image')
+     def preprocess_reference_image(self, save_dir, input_image_path, scale=0.95, color='grey'):
+-        input_image = Image.open(input_image_path).convert('RGB').resize((1024, 1024))
++        R = getattr(self, 'view_res', 512)
++        S = max(1024, R)
++        input_image = Image.open(input_image_path).convert('RGB').resize((S, S))
+         output_image = preprocess(
+             input_image,
+             alpha=None,
+-            H=1024,
+-            W=1024,
++            H=S,
++            W=S,
+             scale=scale,
+             color=color,
+             return_alpha=False,
+             rembg_session=self.rembg_session,
+         )
+         output_image.save(os.path.join(save_dir, 'rembg_image.png'))
+-        output_image.convert('RGB').resize((512, 512)).save(os.path.join(save_dir, 'processed_image.png'))
++        output_image.convert('RGB').resize((R, R)).save(os.path.join(save_dir, 'processed_image.png'))
+ 
+ 
+     @CPUTimer('render_geometry_images')
+     def render_geometry_images(self, save_dir, input_mesh_path, geometry_scale=0.95, scale=1.0, color='grey', four_or_six=False, flatten=False):
++        R = getattr(self, 'view_res', 512)
+         out = self.video_exporter.export_condition(
+             input_mesh_path,
+             geometry_scale=geometry_scale,
+             n_views=4 if four_or_six else 6,
+             n_rows=1 if flatten else 2,
+             n_cols=(4 if flatten else 2) if four_or_six else (6 if flatten else 3),
+-            H=512,
+-            W=512,
++            H=R,
++            W=R,
+             fov_deg=49.1,
+             scale=scale,
+             perspective=False,
+@@ -231,20 +251,66 @@
+         torch.save(camera_info, os.path.join(save_dir, 'camera_info.pth'))
+ 
+ 
++    def prepare_glyphs(self, save_dir, glyph_text):
++        """text.json (path / dict, photo-lift layout from cfi-synthgen unitex/anchors.py) -> kwargs
++        for PBRFluxPipeline, plus a summary in self.last_glyph_info and <save_dir>/glyph_tokens.json."""
++        from unitex import glyph as gl                 # cfi-synthgen on PYTHONPATH
++        from unitex import glyph_tokens as gt
++        cfg = self.glyph_config
++        if cfg is None:
++            cfg = gl.GlyphConfig()
++        elif not isinstance(cfg, gl.GlyphConfig):
++            cfg = gt.glyph_config(cfg)
++        R = getattr(self, 'view_res', 512)
++        text = gt.load_text(glyph_text)
++        instances = gt.build_infer_glyphs(text, cfg, view_res=R)
++        per_view = {}
++        for inst in instances:
++            per_view[str(inst.raw_view)] = per_view.get(str(inst.raw_view), 0) + int(inst.n_keep)
++        info = {
++            'text_json': glyph_text if isinstance(glyph_text, str) else None,
++            'text_json_res': None if text is None else text.get('res'),
++            'view_res': R,
++            'anchor_mode': cfg.anchor_mode,
++            'infer_kind': cfg.infer_kind,
++            'delight': self.glyph_delight,
++            'sample_mode': self.glyph_sample_mode,
++            'n_items': 0 if text is None else len(text.get('items', [])),
++            'n_instances': len(instances),
++            'n_tokens': int(sum(int(i.n_keep) for i in instances)),
++            'tokens_per_view': per_view,
++            'instances': [{'item_id': int(i.item_id), 'raw_view': int(i.raw_view), 'kind': i.kind, 'mode': i.mode,
++                           'text': i.text, 'token_hw': [int(v) for v in i.token_hw], 'n_tokens': int(i.n_keep),
++                           'bbox': [round(float(v), 2) for v in i.bbox]} for i in instances],
++            'config': gt.glyph_config_dict(cfg),
++        }
++        self.last_glyph_info = info
++        with open(os.path.join(save_dir, 'glyph_tokens.json'), 'w') as f:
++            json.dump(info, f, indent=1)
++        return dict(glyph_instances=instances, glyph_sample_mode=self.glyph_sample_mode)
++
+     @CPUTimer('infer_mv')
+-    def infer_mv(self, save_dir, input_image_path, input_mv_image_path, add_input_mv_image_path):
++    def infer_mv(self, save_dir, input_image_path, input_mv_image_path, add_input_mv_image_path, glyph_text=None):
+         reference_image = Image.open(input_image_path).convert('RGB')
+         control_image = Image.open(input_mv_image_path).convert('RGB')
+         control_image_add = Image.open(add_input_mv_image_path).convert('RGB')
+         num_inference_steps = getattr(self.pipeline, '_num_inference_steps', 28)
++        R = getattr(self, 'view_res', 512)
++        for im, name in ((control_image, input_mv_image_path), (control_image_add, add_input_mv_image_path)):
++            if im.size != (3 * R, 2 * R):
++                raise ValueError(f'{name} is {im.size}, expected a 2x3 grid of {R} px views (view_res {R})')
++        if reference_image.size != (R, R):
++            raise ValueError(f'{input_image_path} is {reference_image.size}, expected ({R}, {R})')
++        self.last_glyph_info = None
++        glyph_kwargs = self.prepare_glyphs(save_dir, glyph_text) if glyph_text is not None else {}
+         if self.pipeline_name == 'texture_plus':
+             # NOTE: frtbld -> frbltd
+-            img_temp = np.array(control_image).reshape(2, 512, 3, 512, -1)
+-            img_temp_add = np.array(control_image_add).reshape(2, 512, 3, 512, -1)
++            img_temp = np.array(control_image).reshape(2, R, 3, R, -1)
++            img_temp_add = np.array(control_image_add).reshape(2, R, 3, R, -1)
+             img_temp = 0.5*img_temp + 0.5*img_temp_add
+             img_temp = img_temp.astype(np.uint8)
+             img_temp[1,:,2] = img_temp[1,::-1,2,::-1]
+-            control_image = Image.fromarray(img_temp.transpose(0, 2, 1, 3, 4).reshape(2*3, 512, 512, -1)[[0, 4,  1, 3, 2, 5]].transpose(1, 0, 2, 3).reshape(512, 2*3*512, -1))
++            control_image = Image.fromarray(img_temp.transpose(0, 2, 1, 3, 4).reshape(2*3, R, R, -1)[[0, 4,  1, 3, 2, 5]].transpose(1, 0, 2, 3).reshape(R, 2*3*R, -1))
+             self.pipeline.set_adapters(adapter_names=self.adapter_names, adapter_weights=self.weights_for_texture)
+             out = self.pipeline(
+                 prompt='[MVFLUX]',
+@@ -252,15 +318,20 @@
+                 dual_image=reference_image,
+                 prompt_embeds=None,
+                 pooled_prompt_embeds=None,
+-                height=512,
+-                width=3072,
++                height=R,
++                width=6*R,
+                 n_rows=1,
+                 n_cols=6,
+                 num_inference_steps=num_inference_steps,
+                 guidance_scale=3.5,
+                 max_sequence_length=512,
+                 generator=self.generator,
++                **glyph_kwargs,
+             )
++            if glyph_kwargs:
++                n_enc = getattr(self.pipeline, '_last_n_glyph_tokens', None)
++                if n_enc != self.last_glyph_info['n_tokens']:
++                    raise RuntimeError(f"glyph tokens: built {self.last_glyph_info['n_tokens']}, encoded {n_enc}")
+             out_image = out.images[0]
+             out_image.save(os.path.join(save_dir, 'mv_rgb_w_light.png'))
+             self.pipeline.set_adapters(adapter_names=self.adapter_names, adapter_weights=self.weights_for_delight)
+@@ -270,19 +341,20 @@
+                 control_image=out_image,
+                 prompt_embeds=None,
+                 pooled_prompt_embeds=None,
+-                height=512,
+-                width=3072,
++                height=R,
++                width=6*R,
+                 n_rows=1,
+                 n_cols=6,
+                 num_inference_steps=num_inference_steps,
+                 guidance_scale=3.5,
+                 max_sequence_length=512,
+                 generator=self.generator,
++                **(glyph_kwargs if self.glyph_delight else {}),
+             )
+             out_delighted_image = out.images[0]
+-            img_temp = np.array(out_delighted_image).reshape(512, 6, 512, -1)
++            img_temp = np.array(out_delighted_image).reshape(R, 6, R, -1)
+             img_temp[:,5] = img_temp[::-1,5,::-1]
+-            mv_rgb = Image.fromarray(img_temp.transpose(1, 0, 2, 3)[[0, 2, 4, 3, 1, 5]].reshape(2, 3, 512, 512, -1).transpose(0, 2, 1, 3, 4).reshape(2*512, 3*512, -1))
++            mv_rgb = Image.fromarray(img_temp.transpose(1, 0, 2, 3)[[0, 2, 4, 3, 1, 5]].reshape(2, 3, R, R, -1).transpose(0, 2, 1, 3, 4).reshape(2*R, 3*R, -1))
+             
+             if self.super_resolutions:
+                 mv_rgb.save(os.path.join(save_dir, 'mv_rgb_lr.png'))
+@@ -576,13 +648,13 @@
+ 
+ 
+ class RGBTextureFullPipeline(RGBTextureFullPipelineBase):
+-    def step_1_1(self, cache_dir:str, input_image_path:str, input_mesh_path:str, clear_cache=False,super_resolutions=False, seed=0, *args, **kwargs):
++    def step_1_1(self, cache_dir:str, input_image_path:str, input_mesh_path:str, clear_cache=False,super_resolutions=False, seed=0, *args, glyph_text=None, **kwargs):
+         print(f"step_1_1: {input_image_path}, {input_mesh_path}")
+         self.preprocess_blank_mesh(cache_dir, input_mesh_path)
+         self.preprocess_reference_image(cache_dir, input_image_path)
+         self.render_geometry_images(cache_dir, input_mesh_path)
+         #self.infer_mv(cache_dir, os.path.join(cache_dir, 'processed_image.png'), os.path.join(cache_dir, 'mv_normal.png'))
+-        self.infer_mv(cache_dir, os.path.join(cache_dir, 'processed_image.png'), os.path.join(cache_dir, 'mv_normal.png'), os.path.join(cache_dir, 'mv_ccm.png'))
++        self.infer_mv(cache_dir, os.path.join(cache_dir, 'processed_image.png'), os.path.join(cache_dir, 'mv_normal.png'), os.path.join(cache_dir, 'mv_ccm.png'), glyph_text=glyph_text)
+ 
+     def step_2_1(self, cache_dir:str, input_image_path:str, input_mesh_path:str, clear_cache=False, *args, **kwargs):
+         self.reproject_and_query_field(cache_dir, os.path.join(cache_dir, 'processed_mesh.obj'), os.path.join(cache_dir, 'mv_rgb.png'), os.path.join(cache_dir, 'camera_info.pth'), inpainting=False)
+@@ -607,7 +679,9 @@
+         input_image_path:str, 
+         input_mesh_path:str, 
+         clear_cache=False,
++        glyph_text=None,
+     ) -> Tuple[str, str]:
++        # glyph_text: GlyphAnchor text.json (path or dict) for this asset, None runs stock UniTEX
+         os.makedirs(save_dir, exist_ok=True)
+         cache_dir = os.path.join(os.path.abspath(save_dir), 'cache')
+         os.makedirs(cache_dir, exist_ok=True)
+@@ -616,6 +690,7 @@
+             input_image_path=input_image_path, 
+             input_mesh_path=input_mesh_path, 
+             clear_cache=clear_cache,
++            glyph_text=glyph_text,
+         )
+         for step in self.step_seq:
+             getattr(self, step)(**kwargs)

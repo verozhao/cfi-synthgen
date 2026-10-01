@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 # UniTEX step 1 text-fidelity evaluation, end to end:
 #
-#   prepare -> [GPU] run_unitex -> vae_ceiling -> renders -> eval_text -> report
+#   prepare -> [anchors] -> [GPU] run_unitex -> vae_ceiling -> renders -> eval_text -> report
 #
 # Usage (from anywhere):
 #   unitex/run_eval.sh                          # all steps
 #   STEPS="eval report" unitex/run_eval.sh      # only some steps
 #   DRY_RUN=1 unitex/run_eval.sh                # fake UniTEX outputs, no GPU (plumbing test)
+#
+# GlyphAnchor (step 2, needs UniTEX with unitex/patches/UniTEX.patch, see unitex/setup_unitex.sh).
+# "anchors" is not in the default STEPS. It lifts the photo OCR onto the six views with
+# unitex.anchors and writes <eval>/<sku>/$ANCHOR_JSON. ANCHOR_GEOMETRY=unitex (default) reads the
+# geometry grids of an existing UniTEX run ($ANCHOR_RUN, the stock run), mvgen renders the mesh
+# with $BPY first. Then GLYPH=1 passes the per-SKU text.json to run_unitex:
+#   RUN=unitex_s63 unitex/run_eval.sh                                     # stock run first
+#   GLYPH=1 RUN=glyph_center_s63 STEPS="anchors unitex vae render eval report" unitex/run_eval.sh
+#   GLYPH=1 GLYPH_MODE=warp GLYPH_SET="token_budget=3072" RUN=glyph_warp_s63 ... unitex/run_eval.sh
 #
 # Environments. Three pythons can be involved, set them to what the machine has:
 #   PY         numpy + pillow (+ rapidfuzz), the OCR engine (paddleocr on the server, Apple Vision
@@ -46,6 +55,21 @@ EXTRA_LORA="${EXTRA_LORA:-}"                                    # "path1 path2" 
 EXTRA_LORA_WEIGHTS="${EXTRA_LORA_WEIGHTS:-}"                    # "1.0 1.0"
 DRY_RUN="${DRY_RUN:-}"
 STEPS="${STEPS:-prepare unitex vae render eval report}"
+# anchors step (python -m unitex.anchors)
+ANCHOR_GEOMETRY="${ANCHOR_GEOMETRY:-unitex}"                    # unitex | mvgen
+ANCHOR_RUN="${ANCHOR_RUN:-unitex_s63}"                          # UniTEX run whose cache/ gives the geometry
+ANCHOR_JSON="${ANCHOR_JSON:-text.json}"                         # written to <eval>/<sku>/
+ANCHOR_ARGS="${ANCHOR_ARGS:-}"                                  # extra unitex.anchors flags, e.g. "--text-source ocr"
+# glyph passthrough to run_unitex (all empty: stock UniTEX)
+GLYPH="${GLYPH:-}"                                              # 1: glyphs on, from <eval>/<sku>/$GLYPH_JSON
+GLYPH_JSON="${GLYPH_JSON:-$ANCHOR_JSON}"
+GLYPH_MODE="${GLYPH_MODE:-}"                                    # center | stretch | warp
+GLYPH_KIND="${GLYPH_KIND:-}"                                    # fixed | box
+GLYPH_CONFIG="${GLYPH_CONFIG:-}"                                # GlyphConfig JSON
+GLYPH_SET="${GLYPH_SET:-}"                                      # "key=value key=value"
+GLYPH_DELIGHT="${GLYPH_DELIGHT:-}"                              # 1: glyphs in the delight pass too
+VIEW_RES="${VIEW_RES:-}"                                        # px per view (empty: 512)
+TEXTURE_LORA="${TEXTURE_LORA:-}"                                # our texture LoRA, replaces the released one (texture pass)
 
 has_step() { [[ " $STEPS " == *" $1 "* ]]; }
 cd "$REPO"
@@ -58,14 +82,58 @@ if has_step prepare; then
   echo "   review and correct $EVAL_DIR/<sku>/gt_text.txt, then set '# status: manual'"
 fi
 
-# ── 2. [GPU] stock UniTEX over every SKU (resumable, per-SKU errors are logged) ─────────────
+# ── 1b. [optional] photo OCR -> per-view text.json for GlyphAnchor (unitex.anchors) ─────────
+if has_step anchors; then
+  echo "== anchors ($ANCHOR_GEOMETRY geometry -> <sku>/$ANCHOR_JSON)"
+  ev="$(cd "$EVAL_DIR" && pwd)"
+  anchor_args=(--eval-dir "$ev" --geometry "$ANCHOR_GEOMETRY")
+  if [[ "$ANCHOR_GEOMETRY" == unitex ]]; then
+    anchor_args+=(--run-name "$ANCHOR_RUN")
+  else
+    # six-view nocs / normal / alpha renders of the untextured mesh (UniTEX frame, yaw policy none)
+    while read -r sku; do
+      d="$ev/$sku"
+      [[ -f "$d/mesh.glb" && ! -f "$d/mesh_views/view_00_nocs.png" ]] || continue
+      "$BPY" "$REPO/mvgen.py" --mode views --glb "$d/mesh.glb" --views 0,1,2,3,4,5 --with-geometry \
+        --albedo-samples 1 --out "$d/mesh_views" </dev/null
+    done < "$ev/skus.txt"
+    # the photo mask still comes from the stock run's rmbg_mask_1024.png when it exists
+    if [[ -n "$ANCHOR_RUN" ]]; then anchor_args+=(--run-name "$ANCHOR_RUN"); fi
+  fi
+  # shellcheck disable=SC2206
+  if [[ -n "$ANCHOR_ARGS" ]]; then anchor_args+=($ANCHOR_ARGS); fi
+  # one SKU per call: --out names the file, so several layouts can live side by side
+  n_fail=0
+  while read -r sku; do
+    [[ -d "$ev/$sku" ]] || continue
+    "$PY" -m unitex.anchors "${anchor_args[@]}" --sku "$sku" --out "$ev/$sku/$ANCHOR_JSON" \
+      --debug-png "$ev/$sku/${ANCHOR_JSON%.json}_debug.png" </dev/null || n_fail=$((n_fail + 1))
+  done < "$ev/skus.txt"
+  [[ $n_fail -eq 0 ]] || echo "   WARNING: anchors failed for $n_fail SKUs (run_unitex logs them as missing_input)"
+fi
+
+# ── 2. [GPU] UniTEX over every SKU (resumable, per-SKU errors are logged) ──────────────────
 if has_step unitex; then
-  echo "== run_unitex ($RUN, seed $SEED${DRY_RUN:+, dry run})"
+  echo "== run_unitex ($RUN, seed $SEED${DRY_RUN:+, dry run}${GLYPH:+, glyphs from $GLYPH_JSON})"
   args=(--eval-dir "$(cd "$EVAL_DIR" && pwd)" --run-name "$RUN" --seed "$SEED" --resume)
   [[ -n "$DRY_RUN" ]] && args+=(--dry-run)
   if [[ -n "$EXTRA_LORA" ]]; then
     # shellcheck disable=SC2206
     args+=(--add-lora-path $EXTRA_LORA --add-lora-weights $EXTRA_LORA_WEIGHTS)
+  fi
+  if [[ -n "$VIEW_RES" ]]; then args+=(--view-res "$VIEW_RES"); fi
+  if [[ -n "$TEXTURE_LORA" ]]; then args+=(--texture-lora "$(cd "$(dirname "$TEXTURE_LORA")" && pwd)/$(basename "$TEXTURE_LORA")"); fi
+  if [[ -n "$GLYPH" ]]; then
+    args+=(--glyph-json-name "$GLYPH_JSON")
+    if [[ -n "$GLYPH_MODE" ]]; then args+=(--glyph-mode "$GLYPH_MODE"); fi
+    if [[ -n "$GLYPH_KIND" ]]; then args+=(--glyph-kind "$GLYPH_KIND"); fi
+    if [[ -n "$GLYPH_CONFIG" ]]; then
+      # a file path is made absolute here: the real run starts in $UNITEX_ROOT, not $REPO
+      if [[ -f "$GLYPH_CONFIG" ]]; then GLYPH_CONFIG="$(cd "$(dirname "$GLYPH_CONFIG")" && pwd)/$(basename "$GLYPH_CONFIG")"; fi
+      args+=(--glyph-config "$GLYPH_CONFIG")
+    fi
+    if [[ -n "$GLYPH_DELIGHT" ]]; then args+=(--glyph-delight); fi
+    for kv in $GLYPH_SET; do args+=(--glyph-set "$kv"); done
   fi
   if [[ -n "$DRY_RUN" ]]; then
     "$UNITEX_PY" "$HERE/run_unitex.py" "${args[@]}"
