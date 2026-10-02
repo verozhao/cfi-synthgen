@@ -295,7 +295,8 @@ class PaddleBackend:
 
     name = "paddle"
 
-    def __init__(self, lang="en", det_limit_side_len=None, device=None, **extra):
+    def __init__(self, lang="en", det_limit_side_len=None, device=None,
+                 rec_model_name="PP-OCRv5_mobile_rec", **extra):
         import paddleocr
         from paddleocr import PaddleOCR
         ver = str(getattr(paddleocr, "__version__", "2"))
@@ -303,6 +304,10 @@ class PaddleBackend:
         self.major = int(ver.split(".")[0]) if ver.split(".")[0].isdigit() else 2
         self.lang = lang
         self.det_limit_side_len = det_limit_side_len
+        # recogniser for recognize_lines(); PaddleOCR(lang="en") 3.0 loads this same model
+        self.rec_model_name = rec_model_name
+        self.extra_device = device
+        self._rec = None
         if self.major >= 3:
             kw = dict(lang=lang, use_doc_orientation_classify=False, use_doc_unwarping=False,
                       use_textline_orientation=True)
@@ -331,6 +336,32 @@ class PaddleBackend:
                 out.append(parse_paddle3(self.engine.predict(bgr)))
             else:
                 out.append(parse_paddle2(self.engine.ocr(bgr, cls=True)))
+        return out
+
+    def recognize_lines(self, images):
+        """Recognition only (no detection) of single-line crops -> [(text, conf)], or None when
+        this PaddleOCR has no standalone recogniser (2.x).
+
+        Paddle's detector fragments or misses text in small, tightly framed crops (verified on
+        mvgen renders: "HEINZ" read as the neighbouring "EST 1869", "TOMATO" as "-"), while the
+        recogniser alone reads the same text band correctly.
+        """
+        if self.major < 3:
+            return None
+        if getattr(self, "_rec", None) is None:
+            from paddleocr import TextRecognition
+            kw = {"model_name": self.rec_model_name}
+            if self.extra_device:
+                kw["device"] = self.extra_device
+            self._rec = TextRecognition(**kw)
+        out = []
+        for im in images:
+            bgr = np.ascontiguousarray(np.asarray(im.convert("RGB"))[:, :, ::-1])
+            res = self._rec.predict(bgr)
+            r = res[0] if res else None
+            text = (_res_get(r, "rec_text") if r is not None else None) or ""
+            score = _res_get(r, "rec_score") if r is not None else None
+            out.append((str(text), float(score) if score is not None else 0.0))
         return out
 
 

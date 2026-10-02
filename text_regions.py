@@ -771,7 +771,20 @@ def verify_items(items, albedos, backend, backend_kwargs=None, key_prefix="", ca
             keys.append(f"{key_prefix}{it['id']}_v{k}")
     if not crops:
         return 0
-    results = ocr_mod.ocr_images(crops, backend, rotations=(0,), keys=keys, cache_dir=cache_dir,
+    be = backend if hasattr(backend, "signature") else ocr_mod.get_backend(backend, **(backend_kwargs or {}))
+    lines = None
+    if hasattr(be, "recognize_lines"):
+        # recognition only on the unpadded text band: Paddle's detector misses small tight crops
+        bands = [c.crop((0, max(0, int(np.floor(y0))), c.width, min(c.height, int(np.ceil(y1)))))
+                 for c, (_, _, (y0, y1)) in zip(crops, jobs)]
+        lines = be.recognize_lines(bands)
+    if lines is not None:
+        for (it, k, _), (text, _conf) in zip(jobs, lines):
+            text = " ".join(str(text).split())
+            it["views"][k]["view_ocr_text"] = text
+            it["views"][k]["view_ocr_ned"] = round(ned(normalize(it["text"]), normalize(text)), 4)
+        return len(crops)
+    results = ocr_mod.ocr_images(crops, be, rotations=(0,), keys=keys, cache_dir=cache_dir,
                                  backend_kwargs=backend_kwargs)
     for (it, k, (y0, y1)), found in zip(jobs, results):
         # lines centred outside the text band are neighbours that the margin let in
@@ -911,6 +924,28 @@ def process_sku(render_dir, cfg):
     }
 
 
+def reverify_sku(render_dir, cfg):
+    """Redo only the view-OCR check of an existing text.json in place. Returns 1."""
+    render_dir = pathlib.Path(render_dir)
+    out = render_dir / "text.json"
+    with open(out) as f:
+        doc = json.load(f)
+    albedos = [load_view(render_dir, i)[3] for i in range(6)]
+    for it in doc["items"]:
+        for v in it["views"].values():
+            v.pop("view_ocr_text", None)
+            v.pop("view_ocr_ned", None)
+    verify_items(doc["items"], albedos, cfg.backend, cfg.backend_kwargs,
+                 key_prefix=f"{doc.get('sku', render_dir.name)}_", cache_dir=cfg.cache_dir)
+    doc["ocr"]["verify_view_ocr"] = True
+    doc["stats"] = summarize(doc["items"], doc["stats"].get("items_per_view"))
+    write_json_atomic(out, dumps_text_json(doc))
+    st = doc["stats"]
+    print(f"  [{render_dir.name}] re-verified {st['n_verified']} views, front ned {st['median_view_ocr_ned_front']}"
+          f" (usable {st['median_view_ocr_ned_front_usable']})")
+    return 1
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Debug drawing
 # ────────────────────────────────────────────────────────────────────────────
@@ -1022,6 +1057,8 @@ def main(argv=None):
     p.add_argument("--ocr-cache", default=None, help="cache OCR results here (keyed by image and options)")
     p.add_argument("--debug-dir", default=None, help="write <sku>_views.png and <sku>_texture.png here")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--reverify", action="store_true",
+                   help="only redo the view-OCR check on existing text.json files (no texture OCR)")
     p.add_argument("--limit", type=int, default=0)
     args = p.parse_args(argv)
 
@@ -1042,6 +1079,21 @@ def main(argv=None):
           f"verify {cfg.verify}, bundle-v2 {args.bundle_v2}")
     n_ok = n_skip = n_fail = 0
     t_run = time.time()
+    if args.reverify:
+        for sku in skus:
+            out = base / sku / "text.json"
+            if not out.exists():
+                n_skip += 1
+                continue
+            try:
+                n_ok += reverify_sku(base / sku, cfg)
+            except Exception:
+                n_fail += 1
+                log_error(root, sku, traceback.format_exc())
+                print(f"  [{sku}] FAILED reverify (see text_regions_errors.log)")
+        print(f"text_regions --reverify: {n_ok} re-verified, {n_skip} without text.json, {n_fail} failed, "
+              f"{time.time() - t_run:.1f} s")
+        return 1 if n_fail else 0
     for sku in skus:
         d = base / sku
         out = d / "text.json"

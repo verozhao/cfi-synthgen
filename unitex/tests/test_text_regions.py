@@ -706,3 +706,36 @@ def test_vision_downward_and_upside_down_text(tmp_path):
     # the flat view map is a shear close to identity, so view orientation = texture orientation
     assert gl._view_orientation(by["NOODLES"]["views"]["0"]) == 90
     assert gl._view_orientation(by["SAUCE"]["views"]["0"]) == 180
+
+
+def test_verify_items_uses_recognize_lines_on_text_band():
+    """A backend with recognize_lines (Paddle 3.x) gets one unpadded text-band crop per view and
+    its strings set view_ocr_text / view_ocr_ned; the detector path is not called."""
+
+    class FakeRec:
+        name = "fake"
+
+        def __init__(self):
+            self.sizes = []
+
+        def signature(self):
+            return {"backend": "fake"}
+
+        def recognize_lines(self, images):
+            self.sizes = [im.size for im in images]
+            return [("HELPER", 0.99), ("WRONG", 0.9)]
+
+        def recognize_batch(self, images):
+            raise AssertionError("detector path must not run when recognize_lines exists")
+
+    alb = np.full((512, 512, 3), 255, np.uint8)
+    q = [[100.0, 100.0], [300.0, 100.0], [300.0, 140.0], [100.0, 140.0]]
+    items = [{"id": 0, "text": "HELPER", "views": {"0": {"quad": q, "height_px": 40.0}}},
+             {"id": 1, "text": "TUNA", "views": {"0": {"quad": q, "height_px": 40.0}}}]
+    be = FakeRec()
+    assert tr.verify_items(items, [alb] + [None] * 5, be) == 2
+    assert items[0]["views"]["0"]["view_ocr_text"] == "HELPER"
+    assert items[0]["views"]["0"]["view_ocr_ned"] == 1.0
+    assert items[1]["views"]["0"]["view_ocr_ned"] < 0.5
+    full, _ = tr.verify_crop(alb, items[0]["views"]["0"])
+    assert be.sizes[0][1] < full.size[1]          # the band excludes the vertical margin
