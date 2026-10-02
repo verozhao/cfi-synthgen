@@ -454,6 +454,10 @@ class GlyphConfig:
     min_coverage: float = 0.6
     min_cos: float = 0.3
     min_conf: float = 0.0
+    # training: drop a view whose rendered crop does not read back as the label (text_regions
+    # --verify-view-ocr). A glyph whose string disagrees with the pixels teaches wrong text.
+    # Views without the field (photo-lift layouts at inference) always pass.
+    min_view_ocr_ned: float = 0.0
     drop_flags: tuple = ("template_leak", "low_conf")
     use_generated: bool = False
     token_budget: int = 1536           # 1.5 views' worth of tokens on top of the 7168 conditions
@@ -691,6 +695,8 @@ def expand_candidates(items, cfg):
             if _num(view, "coverage", 1.0) < cfg.min_coverage:
                 continue
             if _num(view, "cos", 1.0) < cfg.min_cos:
+                continue
+            if _num(view, "view_ocr_ned", 1.0) < cfg.min_view_ocr_ned:
                 continue
             out.append(Candidate(item=item, item_id=int(item["id"]),
                                  raw_view=int(k), view=view, kind=cfg.infer_kind))

@@ -53,12 +53,19 @@ def lowmem_build_pipeline(pretrain_models=None, pipeline_name='texture_plus', mo
     pipeline._num_inference_steps = 28
     # the VAE stays resident: PBRFluxPipeline moves latents to self.vae.device before decoding
     pipeline.vae.to('cuda')
-    cpu_offload(pipeline.transformer, execution_device=torch.device('cuda'))
-    # diffusers infers _execution_device from the first component's weights, which are now on
-    # the meta device, so inputs would be sent there. Pin it to the GPU instead.
+    # diffusers infers _execution_device from the first component's weights, which are on the CPU
+    # now and on the meta device once streamed, so inputs would be sent there. Pin it to the GPU.
     type(pipeline)._execution_device = property(lambda self: torch.device('cuda'))
-    print('  [lowmem] FLUX transformer streamed from CPU (bf16, LoRAs loaded), VAE on cuda')
+    # The transformer stays on the CPU here. Streaming is attached in build_pipeline below, after
+    # run_unitex has loaded any extra adapter (--texture-lora), so its LoRA layers are streamed too.
     return pipeline, weights_for_texture, weights_for_delight, adapter_names
+
+
+def stream_transformer(pipe):
+    import torch
+    from accelerate import cpu_offload
+    cpu_offload(pipe.pipeline.transformer, execution_device=torch.device('cuda'))
+    print('  [lowmem] FLUX transformer streamed from CPU (bf16, all LoRAs loaded), VAE on cuda')
 
 
 _orig_build = run_unitex.build_pipeline
@@ -73,7 +80,9 @@ def build_pipeline(args):
         sys.path.insert(0, root)
     unitex_pipeline = importlib.import_module('pipeline')
     unitex_pipeline.build_pipeline = lowmem_build_pipeline
-    return _orig_build(args)
+    pipe = _orig_build(args)
+    stream_transformer(pipe)
+    return pipe
 
 
 run_unitex.build_pipeline = build_pipeline
