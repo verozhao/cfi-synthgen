@@ -350,6 +350,7 @@ def test_c_view_res_1024_ids_unique_in_fp32(pipes, tiny, eval2):
 # ────────────────────────────────────────────────────────────────────────────
 
 CLASSES = ("RGBTextureFullPipelineBase", "RGBTextureFullPipeline", "CustomRGBTextureFullPipeline")
+HELPERS = ("add_detail",)          # module-level functions the patch adds (numpy / PIL only)
 
 
 class FakeExporter:
@@ -405,8 +406,9 @@ def unitex_classes(src_dir, flux=None):
     """The three pipeline classes from <src_dir>/pipeline.py with every heavy dependency stubbed."""
     path = os.path.join(src_dir, "pipeline.py")
     tree = ast.parse(open(path).read(), path)
-    body = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name in CLASSES]
-    assert [n.name for n in body] == list(CLASSES)
+    body = [n for n in tree.body if (isinstance(n, ast.ClassDef) and n.name in CLASSES)
+            or (isinstance(n, ast.FunctionDef) and n.name in HELPERS)]
+    assert [n.name for n in body if isinstance(n, ast.ClassDef)] == list(CLASSES)
 
     def fake_preprocess(image, alpha=None, H=1024, W=1024, **kw):
         # TextureTools preprocess stand-in: an RGBA of the requested size
@@ -473,6 +475,28 @@ def test_shift_mu_reaches_both_passes_only_when_set(repos, tmp_path, shift_mu):
         assert all("mu" not in kw for kw in kws)
     else:
         assert [kw["mu"] for kw in kws] == [shift_mu, shift_mu]
+
+
+def test_delight_res_runs_delight_smaller_and_restores_detail(repos, tmp_path):
+    """Delight at 32 inside a 64 run: texture call at 64, delight call at 32 without mu / pos_scale,
+    and with a pass-through FLUX the restored grid equals the full-resolution run's."""
+    C = unitex_classes(repos["patched"])
+    grids = {}
+    for name, extra in (("full", {}), ("low", {"delight_res": 32})):
+        d = tmp_path / name
+        d.mkdir()
+        pipe = C.CustomRGBTextureFullPipeline(seed=0, view_res=64, shift_mu=2.0, pos_scale=0.5, **extra)
+        pipe.infer_mv(str(d), *_grids(str(d), 64))
+        kws = [c[1] for c in pipe.pipeline.calls if c[0] == "call"]
+        assert [(kw["height"], kw["width"]) for kw in kws] == ([(64, 384), (64, 384)] if name == "full" else
+                                                              [(64, 384), (32, 192)])
+        assert kws[0]["mu"] == 2.0 and kws[0]["pos_scale"] == 0.5
+        if name == "low":
+            assert "mu" not in kws[1] and "pos_scale" not in kws[1]
+            assert (d / "mv_rgb_delit_32.png").exists()
+        grids[name] = np.asarray(Image.open(d / "mv_rgb.png"))
+    assert grids["low"].shape == grids["full"].shape == (128, 192, 3)
+    assert np.abs(grids["low"].astype(int) - grids["full"].astype(int)).max() <= 1
 
 
 @pytest.mark.parametrize("pos_scale", [None, 0.5])

@@ -217,17 +217,31 @@ diff --git a/pipeline.py b/pipeline.py
          quantization_config = BitsAndBytesConfig(
              load_in_4bit=True,
              bnb_4bit_quant_type="nf4",
-@@ -137,7 +139,28 @@
+@@ -136,8 +138,48 @@
  
  
+ 
++def add_detail(low, high):
++    """CFI: low (PIL) upsampled to high's size, plus high's detail above low's resolution:
++    up(low) + high - up(down(high)). Used when the delight pass runs at a lower resolution than the
++    texture pass: lighting is mostly low frequency, so text and fine print come from the texture
++    pass. With low = down(high) it returns high."""
++    W, H = high.size
++    up = np.asarray(low.convert('RGB').resize((W, H), Image.BICUBIC), dtype=np.float32)
++    hi = np.asarray(high.convert('RGB'), dtype=np.float32)
++    hi_low = np.asarray(high.convert('RGB').resize(low.size, Image.LANCZOS).resize((W, H), Image.BICUBIC),
++                        dtype=np.float32)
++    return Image.fromarray(np.clip(np.rint(up + hi - hi_low), 0, 255).astype(np.uint8))
++
++
  class RGBTextureFullPipelineBase:
 -    def __init__(self, pretrain_models=None, pipeline_name='texture_plus',super_resolutions=False, seed=0, speedup_mode=None,add_lora_path=None, add_lora_weights=None, filt_gradient_points=False,filt_large_angle_points=True, enable_rembg=False):
 +    # CFI: view_res / glyph options below (unitex/patches/UniTEX.patch in cfi-synthgen)
-+    GLYPH_API = 3     # 2: shift_mu, 3: pos_scale
++    GLYPH_API = 4     # 2: shift_mu, 3: pos_scale, 4: delight_res
 +
 +    def __init__(self, pretrain_models=None, pipeline_name='texture_plus',super_resolutions=False, seed=0, speedup_mode=None,add_lora_path=None, add_lora_weights=None, filt_gradient_points=False,filt_large_angle_points=True, enable_rembg=False,
 +                 view_res=512, glyph_config=None, glyph_delight=False, glyph_sample_mode='argmax',
-+                 shift_mu=None, pos_scale=None):
++                 shift_mu=None, pos_scale=None, delight_res=None):
 +        # view_res: px per view of the FLUX strip (view_res x 6 view_res) and of the geometry grids.
 +        # The released LoRAs were trained at 512. glyph_config: unitex.glyph.GlyphConfig, or a JSON
 +        # path / inline JSON for unitex.glyph_tokens.glyph_config (None: GlyphConfig defaults).
@@ -240,6 +254,12 @@ diff --git a/pipeline.py b/pipeline.py
 +        self.shift_mu = None if shift_mu is None else float(shift_mu)
 +        # pos_scale: positional interpolation of the image token ids for both passes (None: 1.0)
 +        self.pos_scale = None if pos_scale is None else float(pos_scale)
++        # delight_res: px per view of the delight pass when it differs from view_res. The released
++        # delight LoRA is a 512 model; the texture pass's detail above that resolution is put back
++        # on top (add_detail), shift_mu / pos_scale / glyphs then apply to the texture pass only.
++        self.delight_res = None if delight_res is None or int(delight_res) == self.view_res else int(delight_res)
++        if self.delight_res is not None and self.delight_res % 16:
++            raise ValueError(f'delight_res must be a multiple of 16, got {delight_res}')
 +        self.glyph_config = glyph_config
 +        self.glyph_delight = bool(glyph_delight)
 +        self.glyph_sample_mode = glyph_sample_mode
@@ -247,7 +267,7 @@ diff --git a/pipeline.py b/pipeline.py
          pipeline,weights_for_texture,weights_for_delight,adapter_names = build_pipeline(pretrain_models=pretrain_models, pipeline_name=pipeline_name,speedup_mode = speedup_mode, add_lora_path=add_lora_path,add_lora_weights=add_lora_weights, model='rgb')
          if enable_rembg:
              rembg_session = build_rembg()
-@@ -184,31 +207,34 @@
+@@ -184,31 +226,34 @@
  
      @CPUTimer('preprocess_reference_image')
      def preprocess_reference_image(self, save_dir, input_image_path, scale=0.95, color='grey'):
@@ -288,7 +308,7 @@ diff --git a/pipeline.py b/pipeline.py
              fov_deg=49.1,
              scale=scale,
              perspective=False,
-@@ -231,20 +257,66 @@
+@@ -231,20 +276,66 @@
          torch.save(camera_info, os.path.join(save_dir, 'camera_info.pth'))
  
  
@@ -359,7 +379,7 @@ diff --git a/pipeline.py b/pipeline.py
              self.pipeline.set_adapters(adapter_names=self.adapter_names, adapter_weights=self.weights_for_texture)
              out = self.pipeline(
                  prompt='[MVFLUX]',
-@@ -252,15 +324,22 @@
+@@ -252,37 +343,51 @@
                  dual_image=reference_image,
                  prompt_embeds=None,
                  pooled_prompt_embeds=None,
@@ -384,26 +404,33 @@ diff --git a/pipeline.py b/pipeline.py
              out_image = out.images[0]
              out_image.save(os.path.join(save_dir, 'mv_rgb_w_light.png'))
              self.pipeline.set_adapters(adapter_names=self.adapter_names, adapter_weights=self.weights_for_delight)
-@@ -270,19 +349,22 @@
-                 control_image=out_image,
++            Rd = getattr(self, 'delight_res', None) or R
+             # NOTE: frbltd -> frtbld
+             out = self.pipeline(
+                 prompt='[MVFLUX]',
+-                control_image=out_image,
++                control_image=out_image if Rd == R else out_image.resize((6 * Rd, Rd), Image.LANCZOS),
                  prompt_embeds=None,
                  pooled_prompt_embeds=None,
 -                height=512,
 -                width=3072,
-+                height=R,
-+                width=6*R,
++                height=Rd,
++                width=6*Rd,
                  n_rows=1,
                  n_cols=6,
                  num_inference_steps=num_inference_steps,
                  guidance_scale=3.5,
                  max_sequence_length=512,
                  generator=self.generator,
-+                **({} if getattr(self, 'shift_mu', None) is None else {'mu': self.shift_mu}),
-+                **({} if getattr(self, 'pos_scale', None) is None else {'pos_scale': self.pos_scale}),
-+                **(glyph_kwargs if self.glyph_delight else {}),
++                **({} if Rd != R or getattr(self, 'shift_mu', None) is None else {'mu': self.shift_mu}),
++                **({} if Rd != R or getattr(self, 'pos_scale', None) is None else {'pos_scale': self.pos_scale}),
++                **(glyph_kwargs if self.glyph_delight and Rd == R else {}),
              )
              out_delighted_image = out.images[0]
 -            img_temp = np.array(out_delighted_image).reshape(512, 6, 512, -1)
++            if Rd != R:
++                out_delighted_image.save(os.path.join(save_dir, f'mv_rgb_delit_{Rd}.png'))
++                out_delighted_image = add_detail(out_delighted_image, out_image)
 +            img_temp = np.array(out_delighted_image).reshape(R, 6, R, -1)
              img_temp[:,5] = img_temp[::-1,5,::-1]
 -            mv_rgb = Image.fromarray(img_temp.transpose(1, 0, 2, 3)[[0, 2, 4, 3, 1, 5]].reshape(2, 3, 512, 512, -1).transpose(0, 2, 1, 3, 4).reshape(2*512, 3*512, -1))
@@ -411,7 +438,7 @@ diff --git a/pipeline.py b/pipeline.py
              
              if self.super_resolutions:
                  mv_rgb.save(os.path.join(save_dir, 'mv_rgb_lr.png'))
-@@ -576,13 +658,13 @@
+@@ -576,13 +681,13 @@
  
  
  class RGBTextureFullPipeline(RGBTextureFullPipelineBase):
@@ -427,7 +454,7 @@ diff --git a/pipeline.py b/pipeline.py
  
      def step_2_1(self, cache_dir:str, input_image_path:str, input_mesh_path:str, clear_cache=False, *args, **kwargs):
          self.reproject_and_query_field(cache_dir, os.path.join(cache_dir, 'processed_mesh.obj'), os.path.join(cache_dir, 'mv_rgb.png'), os.path.join(cache_dir, 'camera_info.pth'), inpainting=False)
-@@ -607,7 +689,9 @@
+@@ -607,7 +712,9 @@
          input_image_path:str, 
          input_mesh_path:str, 
          clear_cache=False,
@@ -437,7 +464,7 @@ diff --git a/pipeline.py b/pipeline.py
          os.makedirs(save_dir, exist_ok=True)
          cache_dir = os.path.join(os.path.abspath(save_dir), 'cache')
          os.makedirs(cache_dir, exist_ok=True)
-@@ -616,6 +700,7 @@
+@@ -616,6 +723,7 @@
              input_image_path=input_image_path, 
              input_mesh_path=input_mesh_path, 
              clear_cache=clear_cache,

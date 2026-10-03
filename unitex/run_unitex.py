@@ -54,6 +54,10 @@ unitex/setup_unitex.sh, and this repo importable; all off by default, which runs
                              both passes. The released LoRA at 1024 gives blank grey views because
                              the control image sits 64 token rows below the target instead of the
                              32 it learned; 0.5 puts 1024 on the 512 layout
+  --delight-res R            run the delight pass at R px per view (the released delight LoRA is
+                             a 512 model, blocky at 1024 even with --pos-scale) and add back the
+                             texture pass's detail above R. --shift-mu / --pos-scale / glyphs then
+                             apply to the texture pass only
   --texture-lora PATH        our texture LoRA (pytorch_lora_weights.safetensors of the patched
                              UniTEX-FLUX trainer). It REPLACES the released texture LoRA in the
                              texture pass, the delight pass keeps the released delight LoRA. A
@@ -350,7 +354,8 @@ def build_pipeline(args):
     sys.path.insert(0, root)
     from pipeline import CustomRGBTextureFullPipeline
     extra = {}
-    if args.glyph_json_name or args.view_res != 512 or args.shift_mu is not None or args.pos_scale is not None:
+    if (args.glyph_json_name or args.view_res != 512 or args.shift_mu is not None or args.pos_scale is not None
+            or args.delight_res is not None):
         if getattr(CustomRGBTextureFullPipeline, "GLYPH_API", 0) < 1:
             raise SystemExit(f"{root} is stock UniTEX: --glyph-* / --view-res need unitex/patches/UniTEX.patch "
                              "(unitex/setup_unitex.sh applies it)")
@@ -364,6 +369,10 @@ def build_pipeline(args):
             if getattr(CustomRGBTextureFullPipeline, "GLYPH_API", 0) < 3:
                 raise SystemExit(f"{root} has an older UniTEX.patch without --pos-scale, re-apply the current one")
             extra["pos_scale"] = args.pos_scale
+        if args.delight_res is not None:
+            if getattr(CustomRGBTextureFullPipeline, "GLYPH_API", 0) < 4:
+                raise SystemExit(f"{root} has an older UniTEX.patch without --delight-res, re-apply the current one")
+            extra["delight_res"] = args.delight_res
     pipe = CustomRGBTextureFullPipeline(
         super_resolutions=False,
         filt_gradient_points=False,
@@ -498,6 +507,8 @@ def run(args):
             rec["shift_mu"] = args.shift_mu
         if args.pos_scale is not None:
             rec["pos_scale"] = args.pos_scale
+        if args.delight_res is not None:
+            rec["delight_res"] = args.delight_res
         if glyph_settings:
             gpath = glyph_json_path(args.glyph_json_name, eval_dir, sku)
             rec["glyph"] = {"json": gpath, **glyph_settings}
@@ -587,6 +598,9 @@ def main(argv=None):
     g.add_argument("--pos-scale", type=float, default=None,
                    help="positional interpolation: image token ids times this for both passes (0.5 puts 1024 on "
                         "the 512 layout the released LoRA learned)")
+    g.add_argument("--delight-res", type=int, default=None,
+                   help="px per view of the delight pass (512: the released delight LoRA's), detail above it "
+                        "comes from the texture pass")
     g.add_argument("--glyph-json-name", default=None,
                    help="per-SKU text.json, relative to <eval>/<sku>/ or with {eval} {sku}; turns glyphs on")
     g.add_argument("--glyph-mode", choices=("center", "stretch", "warp"), default=None,
@@ -605,6 +619,8 @@ def main(argv=None):
         p.error("--add-lora-path and --add-lora-weights need the same number of values")
     if args.view_res <= 0 or args.view_res % 16:
         p.error("--view-res must be a positive multiple of 16")
+    if args.delight_res is not None and (args.delight_res <= 0 or args.delight_res % 16):
+        p.error("--delight-res must be a positive multiple of 16")
     glyph_opts = [o for o, v in (("--glyph-mode", args.glyph_mode), ("--glyph-kind", args.glyph_kind),
                                  ("--glyph-config", args.glyph_config), ("--glyph-set", args.glyph_set),
                                  ("--glyph-delight", args.glyph_delight),
