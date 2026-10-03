@@ -110,6 +110,37 @@ def front_weight(mask0, normals0, photo_mask, res, facing=(0.35, 0.7), feather_f
     return w.astype(np.float32), core
 
 
+def local_agreement(gen0, photo, region, res, win_frac=1 / 16, blur_frac=1 / 64, lo=0.5, hi=0.8, flat_std=4.0):
+    """Per-pixel trust in the aligned photo, in [0, 1].
+
+    Local NCC (Gaussian window, sigma = win_frac * res, inside region) between the blurred grey
+    generated view and the blurred grey photo, smoothstepped from lo to hi. The blur (blur_frac *
+    res) hides the letters themselves, which are what differ, the layout around them should agree.
+    A homography fits a box face exactly but not a tub or jar shot from above: Betty Crocker's
+    "16 OZ" badge lands above the generated badge and both would show. Where the generated view
+    is flat (local std under flat_std grey levels) nothing can conflict and the photo is trusted.
+    """
+    import cv2
+    b = max(1.0, res * blur_frac)
+    g = cv2.GaussianBlur(_gray(gen0).astype(np.float32), (0, 0), b)
+    p = cv2.GaussianBlur(_gray(photo).astype(np.float32), (0, 0), b)
+    m = region.astype(np.float32)
+    s = max(1.0, res * win_frac)
+    den = np.maximum(cv2.GaussianBlur(m, (0, 0), s), 1e-6)
+
+    def avg(x):
+        return cv2.GaussianBlur(x * m, (0, 0), s) / den
+
+    mg, mp = avg(g), avg(p)
+    vg = np.maximum(avg(g * g) - mg * mg, 0.0)
+    vp = np.maximum(avg(p * p) - mp * mp, 0.0)
+    ncc = (avg(g * p) - mg * mp) / np.sqrt(vg * vp + 1e-6)
+    t = np.clip((ncc - lo) / (hi - lo), 0.0, 1.0)
+    t = t * t * (3 - 2 * t)
+    trust = np.where(np.sqrt(vg) < flat_std, 1.0, t).astype(np.float32)
+    return cv2.GaussianBlur(trust, (0, 0), s / 2)
+
+
 def blend(gen, photo, w, core, mode="detail", sigma=16.0):
     """gen, photo (res, res, 3) uint8, w (res, res) in [0, 1] -> uint8 view."""
     g = gen.astype(np.float32)
@@ -220,7 +251,8 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
 
 
 def front_from_photo(sku_dir, src_run_dir, cache_dir, mode="detail", sigma_frac=1 / 32,
-                     feather_frac=1 / 128, facing=(0.35, 0.7), register="homography", min_ncc=0.6):
+                     feather_frac=1 / 128, facing=(0.35, 0.7), register="homography", min_ncc=0.6,
+                     trust=(0.5, 0.8)):
     """Blend the photo into view 0 of cache_dir/mv_rgb.png. Returns (new grid, debug panel, info).
 
     The photo is used only when it registers: blurred grey NCC with the generated front view of at
@@ -239,6 +271,9 @@ def front_from_photo(sku_dir, src_run_dir, cache_dir, mode="detail", sigma_frac=
     aff, align = A.fit_photo_to_view0(pmask, fg_box, geo.masks[FRONT])
     ph, pm, reg = register_photo(gen0, geo.masks[FRONT], photo, pmask, aff, res, register)
     w, core = front_weight(geo.masks[FRONT], geo.normals[FRONT], pm, res, facing, feather_frac)
+    trust_ramp = tuple(trust)
+    trust = local_agreement(gen0, ph, core, res, lo=trust_ramp[0], hi=trust_ramp[1])
+    w = w * trust
     skipped = None
     if reg["ncc_final"] < min_ncc:
         skipped = f"photo not registered: NCC {reg['ncc_final']} < {min_ncc}, view 0 kept"
@@ -251,7 +286,8 @@ def front_from_photo(sku_dir, src_run_dir, cache_dir, mode="detail", sigma_frac=
     m0 = geo.masks[FRONT]
     info = {"view_res": res, "mode": mode, "sigma_px": round(sigma, 2), "feather_px": round(max(1.0, res * feather_frac), 2),
             "facing": list(facing), "photo_mask_source": mask_src, "align": align, "register": reg,
-            "min_ncc": min_ncc, "skipped": skipped,
+            "min_ncc": min_ncc, "skipped": skipped, "trust_ramp": list(trust_ramp),
+            "local_trust_mean_on_core": round(float(trust[core].mean()), 4) if core.any() else 0.0,
             "weight_mean_on_silhouette": round(float(w[m0].mean()), 4) if m0.any() else 0.0,
             "replaced_frac_of_silhouette": round(float((w[m0] >= 0.5).mean()), 4) if m0.any() else 0.0}
     return out, panel, info
@@ -312,7 +348,7 @@ def run(args):
                 copy_cache(src / "cache", dst / "cache")
                 grid, panel, info = front_from_photo(sku_dir, src, dst / "cache", args.mode, args.sigma_frac,
                                                      args.feather_frac, tuple(args.facing), args.register,
-                                                     args.min_ncc)
+                                                     args.min_ncc, tuple(args.trust))
                 rec.update(info)
                 shutil.copy(dst / "cache" / "mv_rgb.png", dst / "cache" / "mv_rgb_generated.png")
                 Image.fromarray(grid).save(dst / "cache" / "mv_rgb.png")
@@ -364,6 +400,8 @@ def main(argv=None):
                    help="photo to view 0: bbox affine only, + SIFT homography (default), + optical flow")
     p.add_argument("--min-ncc", type=float, default=0.6,
                    help="use the photo only if it registers this well with the generated front (blurred grey NCC)")
+    p.add_argument("--trust", type=float, nargs=2, default=(0.5, 0.8), metavar=("LO", "HI"),
+                   help="local NCC (blurred grey, photo vs generated) where the photo starts and fully takes over")
     p.add_argument("--sigma-frac", type=float, default=1 / 32,
                    help="detail mode: blur sigma as a fraction of view_res (16 px at 512)")
     p.add_argument("--feather-frac", type=float, default=1 / 128, help="edge feather as a fraction of view_res")

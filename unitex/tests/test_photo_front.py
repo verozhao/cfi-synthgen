@@ -69,3 +69,19 @@ def test_front_weight_follows_silhouette_and_facing():
     assert w[32, 48] == 0.0                          # inside, grazing
     assert w[8, 24] < 0.1 and w[8, 24] < w[10, 24] < w[14, 24]    # feathered inward from the edge
     assert not core[9, 24] and core[10, 24]          # eroded by 2 * feather px (feather 1 at R 64)
+
+
+def test_local_agreement_trusts_matching_layout_and_flat_views_only():
+    R = 128
+    rng = np.random.default_rng(3)
+    base = np.full((R, R, 3), 200, np.uint8)
+    for _ in range(12):                                   # blobs: layout the blur keeps
+        y, x = rng.integers(8, R - 24, 2)
+        base[y:y + 16, x:x + 16] = rng.integers(0, 120, 3)
+    region = np.ones((R, R), bool)
+    same = P.local_agreement(base, base, region, R)
+    assert same.min() > 0.95
+    shifted = np.roll(base, 24, axis=0)                   # misregistered photo
+    assert P.local_agreement(base, shifted, region, R).mean() < 0.5
+    flat = np.full((R, R, 3), 180, np.uint8)              # blank generated label
+    assert P.local_agreement(flat, base, region, R).min() > 0.95
