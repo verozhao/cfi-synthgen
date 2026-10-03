@@ -23,7 +23,7 @@ cd $R/repos/train/UniTEX-FLUX
 CUDA_VISIBLE_DEVICES=$GPUS $R/venv/bin/accelerate launch $MP --num_machines 1 --mixed_precision bf16 --dynamo_backend no \
   launch.py \
   --pretrained_model_name_or_path $FLUX \
-  --dataset_impl cfi --cfi_root $CFI_ROOT --dataset_name_list ${DATA//,/ } \
+  --dataset_impl cfi --cfi_root $CFI_ROOT --cfi_skip_broken --dataset_name_list ${DATA//,/ } \
   --view_resolution 1024 --resolution 1024 6144 --n_rows 1 --n_cols 6 \
   --use_complex_dataset --six_views_or_four_views --dual_image --control_image --both_ccm_normal_condition \
   --mixed_precision bf16 --lora_rank 16 --lora_alpha 16 --optimizer prodigy --learning_rate 1.0 \
