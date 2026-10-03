@@ -475,6 +475,19 @@ def test_shift_mu_reaches_both_passes_only_when_set(repos, tmp_path, shift_mu):
         assert [kw["mu"] for kw in kws] == [shift_mu, shift_mu]
 
 
+@pytest.mark.parametrize("pos_scale", [None, 0.5])
+def test_pos_scale_reaches_both_passes_only_when_set(repos, tmp_path, pos_scale):
+    C = unitex_classes(repos["patched"])
+    pipe = C.CustomRGBTextureFullPipeline(seed=0, view_res=64, pos_scale=pos_scale)
+    pipe.infer_mv(str(tmp_path), *_grids(str(tmp_path), 64))
+    kws = [c[1] for c in pipe.pipeline.calls if c[0] == "call"]
+    assert len(kws) == 2
+    if pos_scale is None:
+        assert all("pos_scale" not in kw for kw in kws)
+    else:
+        assert [kw["pos_scale"] for kw in kws] == [pos_scale, pos_scale]
+
+
 @pytest.mark.parametrize("R", [64, 512, 1024])
 def test_infer_mv_view_res_strip_order_round_trip(repos, tmp_path, R):
     """With a pass-through FLUX the texture strip is f l r b t d (bottom rolled back to raw view 5)
