@@ -85,7 +85,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
      @torch.no_grad()
      @replace_example_docstring(EXAMPLE_DOC_STRING)
      def __call__(
-@@ -428,6 +474,11 @@
+@@ -428,6 +474,12 @@
          callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
          callback_on_step_end_tensor_inputs: List[str] = ["latents"],
          max_sequence_length: int = 512,
@@ -94,10 +94,11 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
 +        glyph_ids: Optional[torch.FloatTensor] = None,
 +        glyph_sample_mode: str = "argmax",
 +        glyph_generator: Optional[torch.Generator] = None,
++        mu: Optional[float] = None,
      ):
          r"""
          Function invoked when calling the pipeline for generation.
-@@ -490,6 +541,10 @@
+@@ -490,6 +542,10 @@
                  will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
                  `._callback_tensor_inputs` attribute of your pipeline class.
              max_sequence_length (`int` defaults to 512): Maximum sequence length to use with the `prompt`.
@@ -108,7 +109,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
  
          Examples:
  
-@@ -577,6 +632,7 @@
+@@ -577,6 +633,7 @@
          )
          latents = noise_latents
          latent_image_ids = noise_ids
@@ -116,7 +117,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
          if dual_latents is not None and control_latents is not None:
              condition_latents = torch.cat([control_latents, dual_latents], dim=1)
              condition_ids = torch.cat([control_ids, dual_ids], dim=0)
-@@ -589,6 +645,23 @@
+@@ -589,17 +646,37 @@
          else:
              condition_latents = None
              condition_ids = None
@@ -140,7 +141,28 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
  
          # 5. Prepare timesteps
          sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-@@ -627,6 +700,7 @@
+         image_seq_len = latents.shape[1]
+-        mu = calculate_shift(
+-            image_seq_len,
+-            self.scheduler.config.base_image_seq_len,
+-            self.scheduler.config.max_image_seq_len,
+-            self.scheduler.config.base_shift,
+-            self.scheduler.config.max_shift,
+-        )
++        if mu is None:
++            # linear in the token count, extrapolated past FLUX's 4096-token calibration
++            mu = calculate_shift(
++                image_seq_len,
++                self.scheduler.config.base_image_seq_len,
++                self.scheduler.config.max_image_seq_len,
++                self.scheduler.config.base_shift,
++                self.scheduler.config.max_shift,
++            )
++        self._mu_log = getattr(self, '_mu_log', []) + [float(mu)]   # CFI: run_unitex.py logs it per pass
+         timesteps, num_inference_steps = retrieve_timesteps(
+             self.scheduler,
+             num_inference_steps,
+@@ -627,6 +704,7 @@
          else:
              prompt_image_embeds = prompt_embeds
              text_image_ids = text_ids
@@ -148,7 +170,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
          if condition_latents is not None:
              latents = torch.cat([latents, condition_latents], dim=1)
              latent_image_ids = torch.cat([latent_image_ids, condition_ids], dim=0)
-@@ -642,7 +716,7 @@
+@@ -642,7 +720,7 @@
                  # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                  timestep = t.expand(latents.shape[0]).to(latents.dtype)
                  if condition_latents is not None:
@@ -157,7 +179,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
                  noise_pred = self.transformer(
                      hidden_states=latents,  # vae: [1, 8192, 64], change dim to 3072
                      timestep=timestep / 1000,
-@@ -681,7 +755,7 @@
+@@ -681,7 +759,7 @@
                      xm.mark_step()
  
          if condition_latents is not None:
@@ -185,16 +207,17 @@ diff --git a/pipeline.py b/pipeline.py
          quantization_config = BitsAndBytesConfig(
              load_in_4bit=True,
              bnb_4bit_quant_type="nf4",
-@@ -137,7 +139,22 @@
+@@ -137,7 +139,26 @@
  
  
  class RGBTextureFullPipelineBase:
 -    def __init__(self, pretrain_models=None, pipeline_name='texture_plus',super_resolutions=False, seed=0, speedup_mode=None,add_lora_path=None, add_lora_weights=None, filt_gradient_points=False,filt_large_angle_points=True, enable_rembg=False):
 +    # CFI: view_res / glyph options below (unitex/patches/UniTEX.patch in cfi-synthgen)
-+    GLYPH_API = 1
++    GLYPH_API = 2     # 2: shift_mu
 +
 +    def __init__(self, pretrain_models=None, pipeline_name='texture_plus',super_resolutions=False, seed=0, speedup_mode=None,add_lora_path=None, add_lora_weights=None, filt_gradient_points=False,filt_large_angle_points=True, enable_rembg=False,
-+                 view_res=512, glyph_config=None, glyph_delight=False, glyph_sample_mode='argmax'):
++                 view_res=512, glyph_config=None, glyph_delight=False, glyph_sample_mode='argmax',
++                 shift_mu=None):
 +        # view_res: px per view of the FLUX strip (view_res x 6 view_res) and of the geometry grids.
 +        # The released LoRAs were trained at 512. glyph_config: unitex.glyph.GlyphConfig, or a JSON
 +        # path / inline JSON for unitex.glyph_tokens.glyph_config (None: GlyphConfig defaults).
@@ -202,6 +225,9 @@ diff --git a/pipeline.py b/pipeline.py
 +        if int(view_res) % 16:
 +            raise ValueError(f'view_res must be a multiple of 16 (one FLUX token), got {view_res}')
 +        self.view_res = int(view_res)
++        # shift_mu: flow-matching schedule shift mu = ln(shift) for both passes. None keeps
++        # calculate_shift of the target token count (1.50 at 512 px per view, 4.62 at 1024).
++        self.shift_mu = None if shift_mu is None else float(shift_mu)
 +        self.glyph_config = glyph_config
 +        self.glyph_delight = bool(glyph_delight)
 +        self.glyph_sample_mode = glyph_sample_mode
@@ -209,7 +235,7 @@ diff --git a/pipeline.py b/pipeline.py
          pipeline,weights_for_texture,weights_for_delight,adapter_names = build_pipeline(pretrain_models=pretrain_models, pipeline_name=pipeline_name,speedup_mode = speedup_mode, add_lora_path=add_lora_path,add_lora_weights=add_lora_weights, model='rgb')
          if enable_rembg:
              rembg_session = build_rembg()
-@@ -184,31 +201,34 @@
+@@ -184,31 +205,34 @@
  
      @CPUTimer('preprocess_reference_image')
      def preprocess_reference_image(self, save_dir, input_image_path, scale=0.95, color='grey'):
@@ -250,7 +276,7 @@ diff --git a/pipeline.py b/pipeline.py
              fov_deg=49.1,
              scale=scale,
              perspective=False,
-@@ -231,20 +251,66 @@
+@@ -231,20 +255,66 @@
          torch.save(camera_info, os.path.join(save_dir, 'camera_info.pth'))
  
  
@@ -321,7 +347,7 @@ diff --git a/pipeline.py b/pipeline.py
              self.pipeline.set_adapters(adapter_names=self.adapter_names, adapter_weights=self.weights_for_texture)
              out = self.pipeline(
                  prompt='[MVFLUX]',
-@@ -252,15 +318,20 @@
+@@ -252,15 +322,21 @@
                  dual_image=reference_image,
                  prompt_embeds=None,
                  pooled_prompt_embeds=None,
@@ -335,6 +361,7 @@ diff --git a/pipeline.py b/pipeline.py
                  guidance_scale=3.5,
                  max_sequence_length=512,
                  generator=self.generator,
++                **({} if getattr(self, 'shift_mu', None) is None else {'mu': self.shift_mu}),
 +                **glyph_kwargs,
              )
 +            if glyph_kwargs:
@@ -344,7 +371,7 @@ diff --git a/pipeline.py b/pipeline.py
              out_image = out.images[0]
              out_image.save(os.path.join(save_dir, 'mv_rgb_w_light.png'))
              self.pipeline.set_adapters(adapter_names=self.adapter_names, adapter_weights=self.weights_for_delight)
-@@ -270,19 +341,20 @@
+@@ -270,19 +346,21 @@
                  control_image=out_image,
                  prompt_embeds=None,
                  pooled_prompt_embeds=None,
@@ -358,6 +385,7 @@ diff --git a/pipeline.py b/pipeline.py
                  guidance_scale=3.5,
                  max_sequence_length=512,
                  generator=self.generator,
++                **({} if getattr(self, 'shift_mu', None) is None else {'mu': self.shift_mu}),
 +                **(glyph_kwargs if self.glyph_delight else {}),
              )
              out_delighted_image = out.images[0]
@@ -369,7 +397,7 @@ diff --git a/pipeline.py b/pipeline.py
              
              if self.super_resolutions:
                  mv_rgb.save(os.path.join(save_dir, 'mv_rgb_lr.png'))
-@@ -576,13 +648,13 @@
+@@ -576,13 +654,13 @@
  
  
  class RGBTextureFullPipeline(RGBTextureFullPipelineBase):
@@ -385,7 +413,7 @@ diff --git a/pipeline.py b/pipeline.py
  
      def step_2_1(self, cache_dir:str, input_image_path:str, input_mesh_path:str, clear_cache=False, *args, **kwargs):
          self.reproject_and_query_field(cache_dir, os.path.join(cache_dir, 'processed_mesh.obj'), os.path.join(cache_dir, 'mv_rgb.png'), os.path.join(cache_dir, 'camera_info.pth'), inpainting=False)
-@@ -607,7 +679,9 @@
+@@ -607,7 +685,9 @@
          input_image_path:str, 
          input_mesh_path:str, 
          clear_cache=False,
@@ -395,7 +423,7 @@ diff --git a/pipeline.py b/pipeline.py
          os.makedirs(save_dir, exist_ok=True)
          cache_dir = os.path.join(os.path.abspath(save_dir), 'cache')
          os.makedirs(cache_dir, exist_ok=True)
-@@ -616,6 +690,7 @@
+@@ -616,6 +696,7 @@
              input_image_path=input_image_path, 
              input_mesh_path=input_mesh_path, 
              clear_cache=clear_cache,

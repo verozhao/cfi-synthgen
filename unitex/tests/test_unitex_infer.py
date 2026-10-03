@@ -462,6 +462,19 @@ def test_infer_mv_512_identical_to_pristine(repos, tmp_path):
     assert ia[0].shape == (512, 3072, 3) and ia[1].shape == (1024, 1536, 3)
 
 
+@pytest.mark.parametrize("shift_mu", [None, 2.2])
+def test_shift_mu_reaches_both_passes_only_when_set(repos, tmp_path, shift_mu):
+    C = unitex_classes(repos["patched"])
+    pipe = C.CustomRGBTextureFullPipeline(seed=0, view_res=64, shift_mu=shift_mu)
+    pipe.infer_mv(str(tmp_path), *_grids(str(tmp_path), 64))
+    kws = [c[1] for c in pipe.pipeline.calls if c[0] == "call"]
+    assert len(kws) == 2
+    if shift_mu is None:
+        assert all("mu" not in kw for kw in kws)
+    else:
+        assert [kw["mu"] for kw in kws] == [shift_mu, shift_mu]
+
+
 @pytest.mark.parametrize("R", [64, 512, 1024])
 def test_infer_mv_view_res_strip_order_round_trip(repos, tmp_path, R):
     """With a pass-through FLUX the texture strip is f l r b t d (bottom rolled back to raw view 5)

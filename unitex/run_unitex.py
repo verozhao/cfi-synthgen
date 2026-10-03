@@ -47,6 +47,9 @@ unitex/setup_unitex.sh, and this repo importable; all off by default, which runs
   --glyph-delight            also feed the glyphs to the delight pass (default: texture pass only)
   --view-res R               px per view (FLUX strip R x 6R, geometry grids 2R x 3R). 512 is what
                              the released LoRAs were trained at; 1024 is an experiment
+  --shift-mu MU              flow-matching schedule shift for both passes, mu = ln(shift). Default:
+                             UniTEX's calculate_shift of the target token count, extrapolated past
+                             FLUX's 4096-token calibration: 1.50 at 512 px per view, 4.62 at 1024
   --texture-lora PATH        our texture LoRA (pytorch_lora_weights.safetensors of the patched
                              UniTEX-FLUX trainer). It REPLACES the released texture LoRA in the
                              texture pass, the delight pass keeps the released delight LoRA. A
@@ -343,12 +346,16 @@ def build_pipeline(args):
     sys.path.insert(0, root)
     from pipeline import CustomRGBTextureFullPipeline
     extra = {}
-    if args.glyph_json_name or args.view_res != 512:
+    if args.glyph_json_name or args.view_res != 512 or args.shift_mu is not None:
         if getattr(CustomRGBTextureFullPipeline, "GLYPH_API", 0) < 1:
             raise SystemExit(f"{root} is stock UniTEX: --glyph-* / --view-res need unitex/patches/UniTEX.patch "
                              "(unitex/setup_unitex.sh applies it)")
         extra = dict(view_res=args.view_res, glyph_config=args.glyph_cfg, glyph_delight=args.glyph_delight,
                      glyph_sample_mode=args.glyph_sample_mode)
+        if args.shift_mu is not None:
+            if getattr(CustomRGBTextureFullPipeline, "GLYPH_API", 0) < 2:
+                raise SystemExit(f"{root} has an older UniTEX.patch without --shift-mu, re-apply the current one")
+            extra["shift_mu"] = args.shift_mu
     pipe = CustomRGBTextureFullPipeline(
         super_resolutions=False,
         filt_gradient_points=False,
@@ -479,6 +486,8 @@ def run(args):
             rec["texture_lora"] = args.texture_lora
         if args.view_res != 512 or glyph_settings:
             rec["view_res"] = args.view_res
+        if args.shift_mu is not None:
+            rec["shift_mu"] = args.shift_mu
         if glyph_settings:
             gpath = glyph_json_path(args.glyph_json_name, eval_dir, sku)
             rec["glyph"] = {"json": gpath, **glyph_settings}
@@ -515,6 +524,10 @@ def run(args):
                 rec.update(status="error", error=f"{type(e).__name__}: {e}", traceback=traceback.format_exc())
                 print(f"  [{sku}] ERROR {rec['error']}")
             rec["wall_s"] = round(time.time() - t0, 1)
+            mus = getattr(getattr(pipe, "pipeline", None), "_mu_log", None)
+            if mus:
+                rec["mu_per_pass"] = [round(m, 4) for m in mus]    # texture, delight
+                mus.clear()
             gi = getattr(pipe, "last_glyph_info", None) if glyph_settings else None
             if gi:
                 rec["glyph"].update({k: gi.get(k) for k in GLYPH_LOG_KEYS})
@@ -558,6 +571,9 @@ def main(argv=None):
     g = p.add_argument_group("GlyphAnchor / resolution (need the UniTEX.patch)")
     g.add_argument("--view-res", type=int, default=512,
                    help="px per view (released LoRAs: 512; 1024 is an experiment, glyphs need a multiple of 512)")
+    g.add_argument("--shift-mu", type=float, default=None,
+                   help="schedule shift mu = ln(shift) for both passes (default: UniTEX's calculate_shift, "
+                        "1.50 at 512, 4.62 at 1024)")
     g.add_argument("--glyph-json-name", default=None,
                    help="per-SKU text.json, relative to <eval>/<sku>/ or with {eval} {sku}; turns glyphs on")
     g.add_argument("--glyph-mode", choices=("center", "stretch", "warp"), default=None,
