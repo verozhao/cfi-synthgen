@@ -139,7 +139,7 @@ def _ncc(a, b, mask):
 
 
 def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", scale=2, ratio=0.75,
-                   min_inliers=25, max_corner_shift=0.15):
+                   min_inliers=12, max_corner_shift=0.5):
     """Photo -> view-0 pixels. Returns (photo (res, res, 3) uint8, photo mask (res, res) float, info).
 
     affine      the anchors.py fit only: photo foreground bbox onto the view-0 silhouette bbox,
@@ -148,8 +148,9 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
     homography  then a RANSAC homography from SIFT matches between the affine-warped photo and the
                 generated front view, which shows the photo's layout rectified to the mesh's front
                 face. Exact for a planar face. Kept only with min_inliers inliers, the silhouette
-                bbox corners moving less than max_corner_shift of its size, and the blurred grey
-                images agreeing at least as well as before (NCC). Otherwise the affine is used.
+                bbox corners moving less than max_corner_shift of its size (a photo from above can
+                need a large move: the bbox fit squeezes the lid in), and the blurred grey images
+                agreeing at least as well as before (NCC). Otherwise the affine is used.
     flow        homography, then a smoothed DIS optical flow (curved labels)
     All work at scale * res and the result is area-downsampled, so small print is not aliased.
     """
@@ -212,14 +213,20 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
             info.update(ncc_flow=round(ncc_f, 4), flow_max_px=round(float(mag.max()) / scale, 2))
             if ncc_f >= info["ncc_homography"] - 0.01:
                 pre, pre_m, info["method"] = warped, warped_m, "flow"
+    info["ncc_final"] = info[f"ncc_{info['method']}"]
     ph = cv2.resize(pre, (res, res), interpolation=cv2.INTER_AREA)
     pm = cv2.resize(pre_m, (res, res), interpolation=cv2.INTER_AREA)
     return ph, pm, info
 
 
 def front_from_photo(sku_dir, src_run_dir, cache_dir, mode="detail", sigma_frac=1 / 32,
-                     feather_frac=1 / 128, facing=(0.35, 0.7), register="homography"):
-    """Blend the photo into view 0 of cache_dir/mv_rgb.png. Returns (new grid, debug panel, info)."""
+                     feather_frac=1 / 128, facing=(0.35, 0.7), register="homography", min_ncc=0.6):
+    """Blend the photo into view 0 of cache_dir/mv_rgb.png. Returns (new grid, debug panel, info).
+
+    The photo is used only when it registers: blurred grey NCC with the generated front view of at
+    least min_ncc after alignment. Below that (Shin Ramyun cup shot from above: 0.04 after the
+    bbox fit) pasting it would put the wrong part of the photo on the front, so view 0 is kept.
+    """
     sku_dir, cache_dir = pathlib.Path(sku_dir), pathlib.Path(cache_dir)
     with open(sku_dir / "ref_meta.json") as f:
         meta = json.load(f)
@@ -232,6 +239,10 @@ def front_from_photo(sku_dir, src_run_dir, cache_dir, mode="detail", sigma_frac=
     aff, align = A.fit_photo_to_view0(pmask, fg_box, geo.masks[FRONT])
     ph, pm, reg = register_photo(gen0, geo.masks[FRONT], photo, pmask, aff, res, register)
     w, core = front_weight(geo.masks[FRONT], geo.normals[FRONT], pm, res, facing, feather_frac)
+    skipped = None
+    if reg["ncc_final"] < min_ncc:
+        skipped = f"photo not registered: NCC {reg['ncc_final']} < {min_ncc}, view 0 kept"
+        w = np.zeros_like(w)
     sigma = max(1.0, res * sigma_frac)
     new0 = blend(gen0, ph, w, core, mode, sigma)
     out = put_view(grid.copy(), FRONT, new0, res)
@@ -240,6 +251,7 @@ def front_from_photo(sku_dir, src_run_dir, cache_dir, mode="detail", sigma_frac=
     m0 = geo.masks[FRONT]
     info = {"view_res": res, "mode": mode, "sigma_px": round(sigma, 2), "feather_px": round(max(1.0, res * feather_frac), 2),
             "facing": list(facing), "photo_mask_source": mask_src, "align": align, "register": reg,
+            "min_ncc": min_ncc, "skipped": skipped,
             "weight_mean_on_silhouette": round(float(w[m0].mean()), 4) if m0.any() else 0.0,
             "replaced_frac_of_silhouette": round(float((w[m0] >= 0.5).mean()), 4) if m0.any() else 0.0}
     return out, panel, info
@@ -299,7 +311,8 @@ def run(args):
                 (dst / "run_info.json").unlink(missing_ok=True)
                 copy_cache(src / "cache", dst / "cache")
                 grid, panel, info = front_from_photo(sku_dir, src, dst / "cache", args.mode, args.sigma_frac,
-                                                     args.feather_frac, tuple(args.facing), args.register)
+                                                     args.feather_frac, tuple(args.facing), args.register,
+                                                     args.min_ncc)
                 rec.update(info)
                 shutil.copy(dst / "cache" / "mv_rgb.png", dst / "cache" / "mv_rgb_generated.png")
                 Image.fromarray(grid).save(dst / "cache" / "mv_rgb.png")
@@ -307,8 +320,9 @@ def run(args):
                 reg = info["register"]
                 print(f"  [{sku}] ({i + 1}/{len(skus)}) aligned by {reg['method']} (IoU {info['align'].get('iou')}, "
                       f"NCC affine {reg['ncc_affine']} homography {reg.get('ncc_homography')} flow {reg.get('ncc_flow')}, "
-                      f"inliers {reg.get('n_inliers')}), {100 * info['replaced_frac_of_silhouette']:.0f}% of the front "
-                      f"silhouette from the photo")
+                      f"inliers {reg.get('n_inliers')}), "
+                      + (info["skipped"] if info["skipped"] else
+                         f"{100 * info['replaced_frac_of_silhouette']:.0f}% of the front silhouette from the photo"))
                 if not args.no_bake:
                     if baker is None:
                         baker = build_baker(args.unitex_root, info["view_res"], args.seed)
@@ -348,6 +362,8 @@ def main(argv=None):
     p.add_argument("--mode", choices=("detail", "full", "none"), default="detail")
     p.add_argument("--register", choices=("affine", "homography", "flow"), default="homography",
                    help="photo to view 0: bbox affine only, + SIFT homography (default), + optical flow")
+    p.add_argument("--min-ncc", type=float, default=0.6,
+                   help="use the photo only if it registers this well with the generated front (blurred grey NCC)")
     p.add_argument("--sigma-frac", type=float, default=1 / 32,
                    help="detail mode: blur sigma as a fraction of view_res (16 px at 512)")
     p.add_argument("--feather-frac", type=float, default=1 / 128, help="edge feather as a fraction of view_res")
