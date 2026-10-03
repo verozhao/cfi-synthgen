@@ -234,3 +234,49 @@ Findings (manual, front views):
 - Both trained LoRAs keep the product look and fix much medium / large text that stock UniTEX
   garbles (Jack Link's, El Pato, GV Peaches, SweeTARTS size, Pure Leaf label restored).
 - Small print and some numbers stay wrong. A vs A+B shows no clear difference in one run.
+
+## 1024 px per view and photo front (thanos6, 2026-10-03)
+
+Scripts: `unitex/runs/orchestrate_1024.sh` (data, training, checkpoint evals, pages, unattended),
+`train_run_1024.sh`, `make_1024_sets.sh`, `photofront_all.sh`, `gpu_ok.sh`.
+
+Resolution is part of training:
+- The released LoRA at 1024 px per view gives flat grey views (pixel std about 0.5 in every tile,
+  25 to 63 at 512), with shift mu 4.62 (UniTEX's default for 24576 target tokens) and with 2.19.
+  The geometry and reference inputs at 1024 are fine.
+- Cause: UniTEX places the control image right below the target in RoPE space, so the LoRA learned
+  a 32-row offset. At 1024 the same tile sits 64 rows below.
+- `--pos-scale 0.5` (positional interpolation, image token ids times 0.5) puts 1024 on the 512
+  layout. The layout comes back, but detail is blocky and the text is unreadable. So 1024 needs
+  training, and the run trains with the same position scale.
+
+Training at 1024:
+- Data: `train_A_1024` and `mv_gso_1024`, the same uids rendered again with
+  `mvgen --res 1024 --ref-res 1024`. The default `--ref-res 512` leaves the reference views at
+  512. The 512 text.json files are copied in and `glyph_tokens` rescales them (boxes checked on a
+  Heinz render).
+- `--offload_activations` keeps the checkpointed block inputs in pinned CPU RAM. 30k tokens peak at
+  15.4 GB on a 4090 (34 s per sample in the benchmark) and 36k tokens at 17.0 GB. Real samples
+  take about 41 s with data loading and the 1024 px VAE encodes.
+- Run `trainAB_1024_pos05`: GPUs 1 to 3 (DDP, one sample per GPU), position scale 0.5, seeded
+  from the 512 A+B LoRA, 2000 steps, checkpoints every 250. GPU 0 evaluates checkpoints 500, 1000
+  and 1500 on six text-heavy products, then all four GPUs evaluate the final LoRA on the 28.
+
+Inference at 1024: `--view-res 1024 --pos-scale 0.5 --shift-mu 2.19 --delight-res 512`. The delight
+LoRA is a 512 model, so the delight pass runs at 512 on the downsampled strip and the texture
+pass's detail above 512 is added back.
+
+Photo front (`unitex/photo_front.py`, inference only, any finished run): the photo is aligned to the
+generated front view (bbox fit, then a SIFT homography), its detail replaces the front view where
+the surface faces the camera and where it agrees locally with the generated layout, then only the
+bake step runs again. The no-change control reproduces the source run (mean texel difference 0.011).
+- Stock UniTEX: 25 of 28 products register. Glyph LoRA A+B: 27 of 28 (Pure Leaf registers because
+  the trained LoRA restored its label). The Shin Ramyun cup photo, taken from above, is refused.
+- Front text the photo shows comes out right where UniTEX garbled it (Lucky Charms 18.6 OZ,
+  SweeTARTS 3.5 OZ, Chicken Noodle Soup NET WT 10.5 OZ). Text the photo does not show (back and
+  sides) is still generated.
+- Tubs and jars shot at an angle align only partly. The local check keeps the generated front
+  there (Betty Crocker keeps its wrong 10 OZ badge instead of showing two badges). Optical flow
+  refinement bent small print, so it stays opt-in.
+- `glyph.items_of` still rejects a text.json saved at 1024 (limitation above). The 1024 path feeds
+  the 512 files, so it is not hit.
