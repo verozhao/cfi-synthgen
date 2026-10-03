@@ -215,3 +215,22 @@ There are no tests at the repo root.
 - Small train/inference differences in coverage counting and in quads for partly visible items.
 - 23 training SKUs have template words (LEFT/RIGHT/BACK...) painted into their textures. Glyphs skip
   those items, but the pixels stay in the training targets. Exclude or repaint those SKUs.
+
+## First real training run (thanos6, 2026-10-02 to 10-03)
+
+Scripts: `unitex/runs/` (`orchestrate_thanos6.sh` ran everything unattended, `train_run.sh` is one
+training run, `make_train_A.sh` builds set A without the eval twins).
+
+- 4-bit FLUX base (`--quantize_base nf4`, fits one 24 GB RTX 4090, about 4.5 s per sample), warm
+  start from the released UniTEX texture LoRA, 1000 steps x 4 samples, glyph filter
+  `min_view_ocr_ned 0.7`.
+- Set A: 32 approved-bundle SKUs (54 minus 22 twins of eval products), front-panel glyphs only.
+  Set A+B: A plus 336 Google Scanned Objects products with readable text.
+- Evaluated on the 28 eval SKUs (4 with largest-component meshes), compared by eye in
+  `UniTEX_glyph_comparison.html`.
+
+Findings (manual, front views):
+- Glyph tokens without training break the output (white canvas with the glyph text pasted on).
+- Both trained LoRAs keep the product look and fix much medium / large text that stock UniTEX
+  garbles (Jack Link's, El Pato, GV Peaches, SweeTARTS size, Pure Leaf label restored).
+- Small print and some numbers stay wrong. A vs A+B shows no clear difference in one run.
