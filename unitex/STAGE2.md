@@ -280,3 +280,23 @@ bake step runs again. The no-change control reproduces the source run (mean texe
   refinement bent small print, so it stays opt-in.
 - `glyph.items_of` still rejects a text.json saved at 1024 (limitation above). The 1024 path feeds
   the 512 files, so it is not hit.
+
+### 1024 results (2026-10-04, judged by eye at full resolution)
+
+`trainAB_1024_pos05` ran 2000 steps in 24 h 7 min on GPUs 1 to 3 (final loss values 0.1 to 0.4,
+noisy per sample). Final LoRA: `runs/trainAB_1024_pos05/pytorch_lora_weights.safetensors`,
+checkpoints every 250 steps next to it. All 28 eval products ran with 0 errors at 1024 (about 20 min
+each with one product per GPU, 35 to 40 min on GPU 0 while training ran on the other three). Pages:
+`compare/UniTEX_1024_final.html` (28 products), `UniTEX_1024_progress.html` (6 products, checkpoints
+500 to 1500), `UniTEX_1024_ckpt250.html`.
+
+- Lucky Charms reads 18.6 OZ from checkpoint 250 on (13.6 at 512). Fixed by 1024 alone, without the
+  photo.
+- Better than the 512 LoRA at the end: Tuna Helper ROTISSERIE CHICKEN (512: ROTREANC CHRESN), Dole
+  LEMONADE (LENONAGE), Chicken Noodle Soup JUST ADD WATER and NET WT 10.5 OZ, El Pato (220 g),
+  Campbell's TOMATO & SWEET BASIL, Jif 7g PROTEIN, Chamomile Herbal Tea, Peaches in Fruit Juice.
+- Worse at the end: French's logo (Tfnnatts) and Red Bull ENERGY DAINK (DRINK at checkpoint 1500).
+  Small print changes from checkpoint to checkpoint, and calorie numbers stay mostly wrong (Chicken
+  Noodle 80 for 60).
+- Photo front on top of the 1024 LoRA corrects the front text it registers on (27 of 28, the Shin
+  cup is refused). Back and side text still comes from the model.
