@@ -9,5 +9,9 @@ dependencies = [
     "pycocotools",
 ]
 
+[project.optional-dependencies]
+# pack_lmdb.py (UniTEX-FLUX LMDB packing): uv sync --extra lmdb
+lmdb = ["lmdb"]
+
 [tool.uv]
 package = false

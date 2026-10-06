@@ -1,0 +1,681 @@
+diff --git a/data/datasets.py b/data/datasets.py
+index d4fa89b..d400e75 100644
+--- a/data/datasets.py
++++ b/data/datasets.py
+@@ -18,6 +18,7 @@ from threading import Thread
+ from time import perf_counter
+ from typing import Dict, List, Optional, Tuple, Union, Any
+ import lmdb
++import zipfile   # referenced in EXCEPTIONS below, NameError on import without CAUGHT_ALL_EXCEPTIONS=1
+ # from datasets import Dataset as HFDataset
+ from matplotlib import pyplot as plt
+ import numpy as np
+diff --git a/launch.py b/launch.py
+index 566ae4f..34f3c27 100644
+--- a/launch.py
++++ b/launch.py
+@@ -32,6 +32,7 @@ from torchvision.transforms.functional import crop
+ from tqdm.auto import tqdm
+ from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
+ import importlib
++import sys
+ import diffusers
+ from diffusers import (
+     AutoencoderKL,
+@@ -800,6 +801,53 @@ def parse_args(input_args=None):
+             " or to a folder containing files that 🤗 Datasets can understand."
+         ),
+     )
++    # ── CFI GlyphAnchor integration (defaults reproduce the original trainer) ──
++    parser.add_argument(
++        "--dataset_impl",
++        type=str,
++        default="unitex",
++        choices=["unitex", "cfi"],
++        help="unitex: data/datasets.py PBRTextureGenerationDataset (as shipped, lacks alphas / native_normals / "
++             "alphas_ip / albedos_ip). cfi: cfi-synthgen unitex.flux_dataset over mvgen output (PNG or LMDB).",
++    )
++    parser.add_argument(
++        "--cfi_root",
++        type=str,
++        default=os.environ.get("CFI_ROOT"),
++        help="cfi-synthgen checkout (for unitex.*), prepended to sys.path. Default $CFI_ROOT.",
++    )
++    parser.add_argument(
++        "--view_resolution",
++        type=int,
++        default=512,
++        help="Pixels per view: the strip is R x 6R, the reference R x R, ids follow. 512 = released LoRA.",
++    )
++    parser.add_argument("--cfi_image_ext", type=str, default="auto", choices=["auto", ".png", ".mdb"])
++    parser.add_argument("--cfi_alpha_source", type=str, default="rgb", choices=["rgb", "mask"],
++                        help="alphas = *_rgb alpha (rgb) or the *_nocs hard mask (mask)")
++    parser.add_argument("--cfi_skip_broken", action="store_true",
++                        help="log a broken sample and use the next uid instead of raising")
++    parser.add_argument("--glyph", action="store_true", help="append GlyphAnchor glyph tokens (needs --dataset_impl cfi)")
++    parser.add_argument("--glyph_config", type=str, default=None,
++                        help="GlyphConfig as a JSON file or an inline JSON object")
++    parser.add_argument("--glyph_set", type=str, nargs="*", default=[],
++                        help="GlyphConfig overrides key=value, e.g. anchor_mode=warp token_budget=1024")
++    parser.add_argument("--quantize_base", type=str, default="none", choices=["none", "nf4"],
++                        help="nf4: load the frozen FLUX transformer in 4-bit (QLoRA) so training fits on a 24 GB GPU")
++    parser.add_argument("--pos_scale", type=float, default=1.0,
++                        help="positional interpolation: spatial axes of the image token ids times this (0.5 trains "
++                             "1024 px views on the 512 layout of the released LoRA; inference needs the same value)")
++    parser.add_argument("--offload_activations", action="store_true",
++                        help="keep what autograd saves in the transformer forward (with --gradient_checkpointing, "
++                             "one [N, 3072] input per block) in pinned CPU RAM: 1024 px views on a 24 GB GPU")
++    parser.add_argument("--zero_text_embeds", action="store_true",
++                        help="zero T5 / CLIP embeddings like UniTEX inference, tokenizers and text encoders are not loaded")
++    parser.add_argument("--train_x_embedder", action="store_true",
++                        help="list x_embedder in modules_to_save (as the original) and make it trainable, "
++                             "which peft 0.15.2 never did. diffusers 0.32.2 drops it at load.")
++    parser.add_argument("--text_keep_boost", type=float, default=0.0,
++                        help="noise drop: target tokens in text boxes are kept with p + boost * (1 - p)")
++
+     if input_args is not None:
+         args = parser.parse_args(input_args)
+     else:
+@@ -835,6 +883,20 @@ def parse_args(input_args=None):
+     assert len(args.multiscale_training_step_range) == 2, \
+         f'multiscale_training error: {args.multiscale_training_step_range}'
+ 
++    if args.view_resolution % 16 or args.view_resolution <= 0:
++        raise ValueError(f"--view_resolution {args.view_resolution} must be a positive multiple of 16")
++    if args.glyph:
++        if args.dataset_impl != "cfi":
++            raise ValueError("--glyph needs --dataset_impl cfi (text_json per sample)")
++        if args.train_batch_size != 1:
++            raise ValueError("--glyph needs --train_batch_size=1 (img_ids are shared across the batch)")
++        if args.view_resolution % 512:
++            raise ValueError("--glyph supports --view_resolution multiples of 512 (glyph geometry is built at 512)")
++    if not 0.0 <= args.text_keep_boost <= 1.0:
++        raise ValueError("--text_keep_boost must be in [0, 1]")
++    if args.text_keep_boost > 0 and args.dataset_impl != "cfi":
++        raise ValueError("--text_keep_boost needs --dataset_impl cfi (text_json per sample)")
++
+     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
+     if env_local_rank != -1 and env_local_rank != args.local_rank:
+         args.local_rank = env_local_rank
+@@ -902,7 +964,19 @@ def main(args):
+         transformers.utils.logging.set_verbosity_error()
+         diffusers.utils.logging.set_verbosity_error()
+     # dataset perparation
+-    if args.dataset_name_list is None:
++    if args.cfi_root:
++        sys.path.insert(0, os.path.abspath(args.cfi_root))
++    if args.dataset_impl == "cfi":
++        from unitex import flux_dataset
++        train_dataset = flux_dataset.build_dataset(
++            args.dataset_name_list or [args.dataset_name],
++            view_res=args.view_resolution,
++            image_ext=args.cfi_image_ext,
++            alpha_source=args.cfi_alpha_source,
++            skip_broken=args.cfi_skip_broken,
++        )
++        logger.info(f"cfi dataset: {len(train_dataset)} uids from {train_dataset.roots}, view_resolution {args.view_resolution}")
++    elif args.dataset_name_list is None:
+         train_dataset = PBRTextureGenerationDataset(
+             args.dataset_name, 
+             MVDatasetConfig(
+@@ -928,6 +1002,7 @@ def main(args):
+                 bump_background_color=args.background_color,
+                 metallic_background_color=args.background_color,
+                 roughness_background_color=args.background_color,
++                target_image_resolution=(args.view_resolution, args.view_resolution),
+                 skip_broken=True,
+             ), 
+             extra_dataset=ReconstructDataset(
+@@ -936,7 +1011,8 @@ def main(args):
+                     image_ext='.mdb',
+                     skip_broken=True,
+                     rgb_background_color=args.background_color,
+-                    cond_image_type = args.cond_image_type
++                    rgb_postfix='_albedo' if args.cond_image_type == 'alb' else '_rgb',
++                    target_image_resolution=(args.view_resolution, args.view_resolution),
+                 ),
+             ),
+         )
+@@ -967,6 +1043,7 @@ def main(args):
+                     bump_background_color=args.background_color,
+                     metallic_background_color=args.background_color,
+                     roughness_background_color=args.background_color,
++                    target_image_resolution=(args.view_resolution, args.view_resolution),
+                     skip_broken=True,
+                 ), 
+                 extra_dataset=ReconstructDataset(
+@@ -974,7 +1051,8 @@ def main(args):
+                     ReconstructDatasetConfig(
+                         image_ext='.mdb',
+                         rgb_background_color=args.background_color,
+-                        cond_image_type = args.cond_image_type,
++                        rgb_postfix='_albedo' if args.cond_image_type == 'alb' else '_rgb',
++                        target_image_resolution=(args.view_resolution, args.view_resolution),
+                         skip_broken=True,
+                     ),
+                 ),
+diff --git a/tasks/delight_mv/pipeline.py b/tasks/delight_mv/pipeline.py
+index c07b0a9..bfada15 100644
+--- a/tasks/delight_mv/pipeline.py
++++ b/tasks/delight_mv/pipeline.py
+@@ -266,12 +266,14 @@ class PBRFluxPipeline(FluxPipeline):
+ 
+     @staticmethod
+     def _prepare_latent_image_ids(batch_size, height, width, device, dtype, offset_x=0, offset_y=0, offset_z=0):
++        # Always fp32, whatever `dtype` says: in bf16 ids above 256 collide (257 -> 256), which
++        # breaks 1024 px views (cols up to 447) and fractional glyph ids. Identical values <= 256.
+         latent_image_ids = torch.zeros(height, width, 3)
+         latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(offset_y, offset_y + height)[:, None]
+         latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(offset_x, offset_x + width)[None, :]
+         if offset_z != 0:
+             latent_image_ids[..., 0] = latent_image_ids[..., 0] + offset_z
+-        latent_image_ids = latent_image_ids.reshape(height * width, 3).to(device=device, dtype=dtype)
++        latent_image_ids = latent_image_ids.reshape(height * width, 3).to(device=device, dtype=torch.float32)
+         return latent_image_ids
+ 
+     def prepare_latents_and_image_ids(
+diff --git a/tasks/texturing/pipeline.py b/tasks/texturing/pipeline.py
+index c07b0a9..bfada15 100644
+--- a/tasks/texturing/pipeline.py
++++ b/tasks/texturing/pipeline.py
+@@ -266,12 +266,14 @@ class PBRFluxPipeline(FluxPipeline):
+ 
+     @staticmethod
+     def _prepare_latent_image_ids(batch_size, height, width, device, dtype, offset_x=0, offset_y=0, offset_z=0):
++        # Always fp32, whatever `dtype` says: in bf16 ids above 256 collide (257 -> 256), which
++        # breaks 1024 px views (cols up to 447) and fractional glyph ids. Identical values <= 256.
+         latent_image_ids = torch.zeros(height, width, 3)
+         latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(offset_y, offset_y + height)[:, None]
+         latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(offset_x, offset_x + width)[None, :]
+         if offset_z != 0:
+             latent_image_ids[..., 0] = latent_image_ids[..., 0] + offset_z
+-        latent_image_ids = latent_image_ids.reshape(height * width, 3).to(device=device, dtype=dtype)
++        latent_image_ids = latent_image_ids.reshape(height * width, 3).to(device=device, dtype=torch.float32)
+         return latent_image_ids
+ 
+     def prepare_latents_and_image_ids(
+diff --git a/tasks/texturing/trainer.py b/tasks/texturing/trainer.py
+index 494a389..efdd77b 100644
+--- a/tasks/texturing/trainer.py
++++ b/tasks/texturing/trainer.py
+@@ -80,6 +80,18 @@ from safetensors.torch import save_file, load_file
+ from pipeline import PBRFluxPipeline, PBRFluxPriorReduxPipeline
+ from attention_processor import NativeFluxAttnProcessor2_0, RandomDropFluxAttnProcessor2_0
+ 
++# CFI GlyphAnchor integration: unitex.glyph_tokens lives in cfi-synthgen (launch.py --cfi_root or
++# PYTHONPATH). Imported lazily so the stock trainer runs without it.
++_glyph_tokens = None
++
++
++def glyph_tokens():
++    global _glyph_tokens
++    if _glyph_tokens is None:
++        from unitex import glyph_tokens as gt
++        _glyph_tokens = gt
++    return _glyph_tokens
++
+ def get_mha_processor(args, device='cuda'):
+     text_tokens = 512
+     if args.six_views_or_four_views:
+@@ -120,6 +132,17 @@ class Trainer(PBRFluxPipeline):
+         dataloader):
+         super().__init__(scheduler, vae, text_encoder, tokenizer, text_encoder_2, tokenizer_2, transformer)
+         self.args = args
++        # read before accelerator.prepare wraps the transformer (a DDP / DeepSpeed wrapper has no .config)
++        self.text_embed_dims = (transformer.config.joint_attention_dim, transformer.config.pooled_projection_dim)
++        self.glyph_cfg = None
++        self.last_n_glyph = 0
++        if getattr(args, "glyph", False):
++            self.glyph_cfg = glyph_tokens().glyph_config(getattr(args, "glyph_config", None),
++                                                         getattr(args, "glyph_set", None) or ())
++            if accelerator.is_main_process and args.output_dir is not None:
++                os.makedirs(args.output_dir, exist_ok=True)
++                with open(os.path.join(args.output_dir, "glyph_config.json"), "w") as f:
++                    json.dump(glyph_tokens().glyph_config_dict(self.glyph_cfg), f, indent=1)
+         # set parameters in all models as false
+         self.set_requires_grad()
+         # set all parameters as half precision
+@@ -140,54 +163,69 @@ class Trainer(PBRFluxPipeline):
+         accelerator, 
+         logger,
+         train_dataloader):
+-        # Load the tokenizers
+-        tokenizer = CLIPTokenizer.from_pretrained(
+-            args.pretrained_model_name_or_path,
+-            subfolder="tokenizer",
+-            revision=args.revision,
+-        )
+-        tokenizer_2 = T5TokenizerFast.from_pretrained(
+-            args.pretrained_model_name_or_path,
+-            subfolder="tokenizer_2",
+-            revision=args.revision,
+-        )
+-
+         # Load scheduler and models
+         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+             args.pretrained_model_name_or_path, subfolder="scheduler"
+         )
+-        nf4_config = BitsAndBytesConfig(
+-            load_in_4bit=True,
+-            bnb_4bit_quant_type="nf4",
+-            bnb_4bit_compute_dtype=torch.bfloat16
+-        )
++        if getattr(args, "zero_text_embeds", False):
++            # UniTEX inference builds the pipeline without text encoders and feeds zero T5 / CLIP
++            # embeddings (UniTEX pipeline.py:91-101, 538-543). Train on the same input, so no
++            # tokenizers, CLIP or NF4 T5 (bitsandbytes) are loaded.
++            tokenizer = tokenizer_2 = text_encoder = text_encoder_2 = None
++        else:
++            # Load the tokenizers
++            tokenizer = CLIPTokenizer.from_pretrained(
++                args.pretrained_model_name_or_path,
++                subfolder="tokenizer",
++                revision=args.revision,
++            )
++            tokenizer_2 = T5TokenizerFast.from_pretrained(
++                args.pretrained_model_name_or_path,
++                subfolder="tokenizer_2",
++                revision=args.revision,
++            )
++            nf4_config = BitsAndBytesConfig(
++                load_in_4bit=True,
++                bnb_4bit_quant_type="nf4",
++                bnb_4bit_compute_dtype=torch.bfloat16
++            )
+ 
+-        # load the text_encoder in flux, "CLIPTextModel" and "T5EncoderModel"
+-        text_encoder = CLIPTextModel.from_pretrained(
+-            args.pretrained_model_name_or_path, 
+-            subfolder="text_encoder", 
+-            revision=args.revision, 
+-            variant=args.variant,
+-            quantization_config=None,
+-            torch_dtype=torch.bfloat16,
+-        )
+-        text_encoder_2 = T5EncoderModel.from_pretrained(
+-            args.pretrained_model_name_or_path, 
+-            subfolder="text_encoder_2", 
+-            revision=args.revision, 
+-            variant=args.variant,
+-            quantization_config=nf4_config,
+-            torch_dtype=torch.bfloat16,
+-        )
++            # load the text_encoder in flux, "CLIPTextModel" and "T5EncoderModel"
++            text_encoder = CLIPTextModel.from_pretrained(
++                args.pretrained_model_name_or_path,
++                subfolder="text_encoder",
++                revision=args.revision,
++                variant=args.variant,
++                quantization_config=None,
++                torch_dtype=torch.bfloat16,
++            )
++            text_encoder_2 = T5EncoderModel.from_pretrained(
++                args.pretrained_model_name_or_path,
++                subfolder="text_encoder_2",
++                revision=args.revision,
++                variant=args.variant,
++                quantization_config=nf4_config,
++                torch_dtype=torch.bfloat16,
++            )
+         vae = AutoencoderKL.from_pretrained(
+             args.pretrained_model_name_or_path,
+             subfolder="vae",
+             revision=args.revision,
+             variant=args.variant,
+         )
+-        transformer = FluxTransformer2DModel.from_pretrained(
+-            args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
+-        )
++        if getattr(args, "quantize_base", "none") == "nf4":
++            # frozen 4-bit base so the LoRA fits on one 24 GB GPU (QLoRA), the LoRA itself is not quantized
++            from diffusers import BitsAndBytesConfig
++            transformer = FluxTransformer2DModel.from_pretrained(
++                args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant,
++                quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
++                                                       bnb_4bit_compute_dtype=torch.bfloat16),
++                torch_dtype=torch.bfloat16,
++            )
++        else:
++            transformer = FluxTransformer2DModel.from_pretrained(
++                args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
++            )
+ 
+ 
+         ## add random drop technique for diffusion training acceleration![paper novelty!]
+@@ -214,8 +252,10 @@ class Trainer(PBRFluxPipeline):
+         # We only train the additional adapter LoRA layers and disable follows:
+         self.transformer.requires_grad_(False)
+         self.vae.requires_grad_(False)
+-        self.text_encoder.requires_grad_(False)
+-        self.text_encoder_2.requires_grad_(False)
++        if self.text_encoder is not None:       # None with --zero_text_embeds
++            self.text_encoder.requires_grad_(False)
++        if self.text_encoder_2 is not None:
++            self.text_encoder_2.requires_grad_(False)
+ 
+     
+     def set_weight_type_and_device(self, accelerator):
+@@ -234,9 +274,12 @@ class Trainer(PBRFluxPipeline):
+             weight_dtype = torch.bfloat16
+         self.weight_dtype = weight_dtype
+         self.vae.to(accelerator.device, dtype=self.weight_dtype)
+-        self.transformer.to(accelerator.device, dtype=self.weight_dtype)
+-        self.text_encoder.to(accelerator.device, dtype=self.weight_dtype)
+-        self.text_encoder_2.to(accelerator.device)
++        if getattr(self.args, "quantize_base", "none") != "nf4":
++            self.transformer.to(accelerator.device, dtype=self.weight_dtype)   # 4-bit weights are placed at load
++        if self.text_encoder is not None:
++            self.text_encoder.to(accelerator.device, dtype=self.weight_dtype)
++        if self.text_encoder_2 is not None:
++            self.text_encoder_2.to(accelerator.device)
+ 
+ 
+     def prepare_training(self, accelerator, logger):
+@@ -295,28 +338,39 @@ class Trainer(PBRFluxPipeline):
+                 "ff_context.net.2",
+             ]
+ 
+-            modules_to_save = [
+-                "x_embedder",
+-                'norm1.norm',
+-                'norm1_context.norm',
+-                'norm2',
+-                'norm2_context',
+-                'norm.norm'
+-            ]
+-            
+-            # NOTE: https://github.com/huggingface/diffusers/pull/10130
+-            # examples/control-lora/train_control_lora_flux.py#L832
+-
+-            # now we will add new LoRA weights the transformer layers
+-            transformer_lora_config = LoraConfig(
+-                r=self.args.lora_rank,
+-                lora_alpha=self.args.lora_alpha,
+-                init_lora_weights="gaussian",
+-                target_modules=target_modules,
+-                modules_to_save = modules_to_save
+-            )
+-            # NOTE: add_adapter changes requires_grad of modules except loras to False
+-            self.transformer.add_adapter(transformer_lora_config)
++        # parameter-free LayerNorms: listing them trains nothing
++        modules_to_save = [
++            'norm1.norm',
++            'norm1_context.norm',
++            'norm2',
++            'norm2_context',
++            'norm.norm'
++        ]
++        # x_embedder is off by default. With the pinned peft 0.15.2, listing it in modules_to_save
++        # saves a copy but never makes it trainable (diffusers add_adapter does not activate the
++        # ModulesToSaveWrapper), which is why the released UniTEX LoRAs carry an x_embedder
++        # bit-identical to base FLUX. diffusers 0.32.2 load_lora_weights drops it anyway.
++        # --train_x_embedder lists it and really trains it (load it by hand at inference).
++        train_x_embedder = getattr(self.args, "train_x_embedder", False)
++        if train_x_embedder:
++            modules_to_save = ["x_embedder"] + modules_to_save
++
++        # NOTE: https://github.com/huggingface/diffusers/pull/10130
++        # examples/control-lora/train_control_lora_flux.py#L832
++
++        # now we will add new LoRA weights the transformer layers
++        # (outside the else: with --lora_layers the original never added an adapter)
++        transformer_lora_config = LoraConfig(
++            r=self.args.lora_rank,
++            lora_alpha=self.args.lora_alpha,
++            init_lora_weights="gaussian",
++            target_modules=target_modules,
++            modules_to_save = modules_to_save
++        )
++        # NOTE: add_adapter changes requires_grad of modules except loras to False
++        self.transformer.add_adapter(transformer_lora_config)
++        if train_x_embedder:
++            self.transformer.x_embedder.modules_to_save.requires_grad_(True)
+ 
+         self.load_LoRA_from_checkpoint(accelerator,logger)
+ 
+@@ -447,7 +501,16 @@ class Trainer(PBRFluxPipeline):
+                 transformer_state_dict = {
+                     f'{k.replace("transformer.", "")}': v for k, v in lora_state_dict.items() if k.startswith("transformer.")
+                 }
+-                
++                if not getattr(self.args, "train_x_embedder", False):
++                    # The released UniTEX LoRAs carry x_embedder (equal to base FLUX). With x_embedder
++                    # outside modules_to_save, peft 0.15.2 would silently copy it over the frozen base
++                    # weight. diffusers 0.32.2 inference ignores it, so keep the base weight here too.
++                    dropped = sorted(k for k in transformer_state_dict if k.startswith("x_embedder."))
++                    for k in dropped:
++                        transformer_state_dict.pop(k)
++                    if dropped:
++                        logger.warning(f"ignoring {dropped} from {path}: x_embedder is not trained (no --train_x_embedder)")
++
+                 incompatible_keys = set_peft_model_state_dict(self.transformer, transformer_state_dict, adapter_name="default")  
+ 
+                 if incompatible_keys is not None:
+@@ -505,8 +568,8 @@ class Trainer(PBRFluxPipeline):
+             pipeline = PBRFluxPipeline.from_pretrained(
+                         self.args.pretrained_model_name_or_path,
+                         vae=self.vae,
+-                        text_encoder=accelerator.unwrap_model(self.text_encoder).eval(),
+-                        text_encoder_2=accelerator.unwrap_model(self.text_encoder_2).eval(),
++                        text_encoder=None if self.text_encoder is None else accelerator.unwrap_model(self.text_encoder).eval(),
++                        text_encoder_2=None if self.text_encoder_2 is None else accelerator.unwrap_model(self.text_encoder_2).eval(),
+                         transformer=accelerator.unwrap_model(self.transformer).eval(),
+                         redux_pipeline=None,
+                         revision=self.args.revision,
+@@ -594,10 +657,11 @@ class Trainer(PBRFluxPipeline):
+                             image = [Image.open(im).convert('RGB') for im in image]
+                             images += [im for im in image]
+                     # NOTE: hardcode here
++                    vr = getattr(args, "view_resolution", 512)
+                     if args.six_views_or_four_views:
+-                        image = Image.fromarray(np.array(image).reshape(2, 512, 3, 512, -1).transpose(1, 0, 2, 3, 4).reshape(512, 2*3*512, -1))
++                        image = Image.fromarray(np.array(image).reshape(2, vr, 3, vr, -1).transpose(1, 0, 2, 3, 4).reshape(vr, 2*3*vr, -1))
+                     else:
+-                        image = Image.fromarray(np.array(image).reshape(2, 512, 2, 512, -1).transpose(1, 0, 2, 3, 4).reshape(512, 2*2*512, -1))
++                        image = Image.fromarray(np.array(image).reshape(2, vr, 2, vr, -1).transpose(1, 0, 2, 3, 4).reshape(vr, 2*2*vr, -1))
+                     pipeline_args["control_image"] = image
+                 if args.redux_image:
+                     image = validation_prompt_item['image']
+@@ -725,9 +789,17 @@ class Trainer(PBRFluxPipeline):
+             num_images_per_prompt: int = 1,
+             text_input_ids_list=None):
+         
+-        with torch.no_grad():  
++        with torch.no_grad():
+ 
+             prompt = [prompt] if isinstance(prompt, str) else prompt
++            if getattr(self.args, "zero_text_embeds", False):
++                # same tensors UniTEX inference feeds: T5 [B, 512, 4096], pooled CLIP [B, 768], zeros
++                t5_dim, clip_dim = self.text_embed_dims
++                n = len(prompt) * num_images_per_prompt
++                prompt_embeds = torch.zeros(n, self.args.max_sequence_length, t5_dim, device=device, dtype=weight_dtype)
++                pooled_prompt_embeds = torch.zeros(n, clip_dim, device=device, dtype=weight_dtype)
++                text_ids = torch.zeros(self.args.max_sequence_length, 3, device=device, dtype=torch.float32)
++                return prompt_embeds, pooled_prompt_embeds, text_ids
+             dtype = self.text_encoder.dtype
+ 
+             pooled_prompt_embeds = self._encode_prompt_with_clip(
+@@ -749,7 +821,7 @@ class Trainer(PBRFluxPipeline):
+ 
+             prompt_embeds = prompt_embeds.to(device, dtype=weight_dtype)
+             pooled_prompt_embeds = pooled_prompt_embeds.to(device, dtype=weight_dtype)
+-            text_ids = text_ids.to(device, dtype=weight_dtype)
++            text_ids = text_ids.to(device, dtype=torch.float32)     # position ids stay fp32
+ 
+         return prompt_embeds, pooled_prompt_embeds, text_ids
+         
+@@ -761,7 +833,44 @@ class Trainer(PBRFluxPipeline):
+ 
+ 
+     def _encode_vae_image():
+-        return 
++        return
++
++    def text_keep_mask(self, batch, n_tokens, view_res):
++        """Target tokens inside text boxes (CPU bool [n_tokens]) for --text_keep_boost."""
++        texts = batch.get("text_json") if isinstance(batch, dict) else None
++        text = texts[0] if texts else ""
++        m = glyph_tokens().text_token_mask(text, view_res)
++        if m.numel() != n_tokens:
++            raise ValueError(f"text mask has {m.numel()} tokens, the target has {n_tokens}")
++        return m
++
++    def activation_offload(self):
++        """--offload_activations: tensors autograd saves during the transformer forward go to pinned
++        CPU RAM and come back for backward. With gradient checkpointing that is one [N, 3072] input
++        per block (57 blocks, 10 GB at 1024 px views), so a 30k-token sample peaks at 15.4 GB on a
++        24 GB RTX 4090 with the nf4 base instead of running out of memory."""
++        if getattr(self.args, "offload_activations", False):
++            return torch.autograd.graph.save_on_cpu(pin_memory=True)
++        return nullcontext()
++
++    def prepare_glyph_tokens(self, batch, training_image, global_step, micro_step, accelerator):
++        """GlyphAnchor tokens for this sample: ([1, Ng, 64] weight_dtype, [Ng, 3] fp32, axis0 = frame).
++
++        Built here, not in the dataset: the stage schedule needs global_step and gt crops must
++        come from the target picked above (rgb or albedo).
++        """
++        if training_image.shape[0] != 1:
++            raise ValueError("--glyph needs --train_batch_size=1: img_ids are shared across the batch")
++        texts = batch.get("text_json") if isinstance(batch, dict) else None
++        if texts is None:
++            raise KeyError("--glyph needs a dataset with a text_json key (launch.py --dataset_impl cfi)")
++        gt = glyph_tokens()
++        rng = gt.glyph_rng(self.args.seed, global_step, micro_step, accelerator.process_index)
++        view_res = training_image.shape[-2]
++        insts = gt.build_train_glyphs(texts[0], training_image[0], global_step, rng, self.glyph_cfg,
++                                      view_res=view_res)
++        return gt.encode_glyphs(insts, self.vae, device=accelerator.device, dtype=self.weight_dtype)
++
+     def train(self, accelerator, logger):
+         # We need to initialize the trackers we use, and also store our configuration.
+         # The trackers initializes automatically on the main process.
+@@ -865,7 +974,8 @@ class Trainer(PBRFluxPipeline):
+ 
+                     # Add noise according to flow matching.
+                     # zt = (1 - texp) * x + texp * z1
+-                    sigmas = self.get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype).to(device=accelerator.device)
++                    # device given: the default cuda:0 breaks CPU runs and puts every rank on GPU 0 first
++                    sigmas = self.get_sigmas(timesteps, n_dim=model_input.ndim, device=accelerator.device, dtype=model_input.dtype).to(device=accelerator.device)
+                     noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
+                     BL, CL, HL, WL = noisy_model_input.shape
+                     latents = self._pack_latents(
+@@ -880,7 +990,7 @@ class Trainer(PBRFluxPipeline):
+                         HL // 2,
+                         WL // 2,
+                         accelerator.device,
+-                        self.weight_dtype,
++                        torch.float32,     # fp32 ids: bf16 rounds 257 -> 256 and fractional glyph ids
+                         offset_x=0,
+                         offset_y=0,
+                         offset_z=0,
+@@ -921,7 +1031,7 @@ class Trainer(PBRFluxPipeline):
+                             HDL // 2, 
+                             WDL // 2, 
+                             accelerator.device,
+-                            self.weight_dtype,
++                            torch.float32,
+                             offset_x=WL // 2,
+                             offset_y=HL // 2,
+                             offset_z=0,
+@@ -964,7 +1074,7 @@ class Trainer(PBRFluxPipeline):
+                             HCL // 2, 
+                             WCL // 2, 
+                             accelerator.device,
+-                            self.weight_dtype,
++                            torch.float32,
+                             offset_x=0,
+                             offset_y=HL // 2,
+                             offset_z=0,
+@@ -996,13 +1106,22 @@ class Trainer(PBRFluxPipeline):
+                     if self.args.random_drop_noise and 0.0 <= self.args.random_drop_noise_probability <= 1.0:
+                         if random.random() < 1.0:
+                             random_drop_noise = True
+-                            mask_noise = (torch.rand(size=(latents.shape[1],), dtype=self.weight_dtype, device=accelerator.device) <= 1.0 - self.args.random_drop_noise_probability)
++                            rand_noise = torch.rand(size=(latents.shape[1],), dtype=self.weight_dtype, device=accelerator.device)
++                            if getattr(self.args, "text_keep_boost", 0.0) > 0:
++                                # text tokens kept with p + boost * (1 - p), the rest with p
++                                text_mask = self.text_keep_mask(batch, latents.shape[1], pixel_values.shape[-2])
++                                keep_prob = glyph_tokens().boosted_keep_prob(
++                                    1.0 - self.args.random_drop_noise_probability, text_mask, self.args.text_keep_boost)
++                                mask_noise = rand_noise <= keep_prob.to(device=rand_noise.device, dtype=rand_noise.dtype)
++                            else:
++                                mask_noise = (rand_noise <= 1.0 - self.args.random_drop_noise_probability)
+                             index_noise = torch.where(mask_noise)[0]
+                             model_pred_zero = torch.zeros_like(latents)
+                             latents = latents[:, index_noise, :]
+                             latent_image_ids = latent_image_ids[index_noise, :]
+                         else:
+                             random_drop_noise = False
++                    n_noise = latents.shape[1]      # target tokens: the only ones the loss sees
+                     if condition_latents is not None:
+                         if self.args.random_drop_condition and 0.0 <= self.args.random_drop_condition_probability <= 1.0:
+                             if random.random() < 1.0:
+@@ -1015,20 +1134,35 @@ class Trainer(PBRFluxPipeline):
+                                 random_drop_condition = False
+                         latents = torch.cat([latents, condition_latents], dim=1)
+                         latent_image_ids = torch.cat([latent_image_ids, condition_ids], dim=0)
++                    # GlyphAnchor: clean glyph tokens on their own axis-0 plane, appended after the
++                    # condition drop so they are never dropped, cut off again before the loss
++                    self.last_n_glyph = 0
++                    if getattr(self.args, "glyph", False):
++                        glyph_latents, glyph_ids = self.prepare_glyph_tokens(batch, training_image, global_step, step, accelerator)
++                        self.last_n_glyph = glyph_latents.shape[1]
++                        if self.last_n_glyph:
++                            latents = torch.cat([latents, glyph_latents.to(latents.dtype)], dim=1)
++                            latent_image_ids = torch.cat([latent_image_ids, glyph_ids.to(latent_image_ids.dtype)], dim=0)
+                     # 4. predict
+-                    model_pred = self.transformer(
+-                    hidden_states=latents,
+-                    timestep=timesteps / 1000,
+-                    guidance=guidance,
+-                    pooled_projections=pooled_prompt_embeds,
+-                    encoder_hidden_states=prompt_image_embeds,
+-                    txt_ids=text_image_ids,
+-                    img_ids=latent_image_ids,
+-                    return_dict=False,
+-                    )[0]
+-
+-                    if condition_latents is not None:
+-                        model_pred = model_pred[:, :-condition_latents.shape[1]]
++                    if getattr(self.args, "pos_scale", 1.0) != 1.0:
++                        # positional interpolation, like UniTEX inference --pos-scale: spatial axes of
++                        # every image token (target, conditions, glyphs), axis 0 (glyph plane) unchanged
++                        latent_image_ids = latent_image_ids.clone()
++                        latent_image_ids[:, 1:] = latent_image_ids[:, 1:] * float(self.args.pos_scale)
++                    with self.activation_offload():
++                        model_pred = self.transformer(
++                        hidden_states=latents,
++                        timestep=timesteps / 1000,
++                        guidance=guidance,
++                        pooled_projections=pooled_prompt_embeds,
++                        encoder_hidden_states=prompt_image_embeds,
++                        txt_ids=text_image_ids,
++                        img_ids=latent_image_ids,
++                        return_dict=False,
++                        )[0]
++
++                    # was model_pred[:, :-condition_latents.shape[1]], which would keep glyph tokens
++                    model_pred = model_pred[:, :n_noise]
+                         
+                     model_pred_mask = torch.ones_like(model_pred)
+                     if self.args.random_drop_noise and 0.0 <= self.args.random_drop_noise_probability <= 1.0:
+@@ -1142,6 +1276,8 @@ class Trainer(PBRFluxPipeline):
+ 
+ 
+                 logs = {"loss": loss.detach().item(), "lr": self.lr_scheduler.get_last_lr()[0]}
++                if getattr(self.args, "glyph", False):
++                    logs["glyph_tokens"] = self.last_n_glyph
+                 progress_bar.set_postfix(**logs)
+                 accelerator.log(logs, step=global_step)
+ 
+@@ -1155,7 +1291,8 @@ class Trainer(PBRFluxPipeline):
+             self.save_lora_layers(accelerator, self.args.output_dir)
+ 
+         # Final inference
+-        if self.args.validation_config and self.args.num_validation_images > 0:
++        # launch.py defines no --validation_config: the original raised AttributeError here
++        if getattr(self.args, "validation_config", None) and self.args.num_validation_images > 0:
+             images = self.inference(steps=global_step, accelerator=accelerator, output_dir=self.args.output_dir, logger = logger)
+ 
+         accelerator.end_training()
