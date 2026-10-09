@@ -81,6 +81,57 @@ def test_save_front_image_takes_the_registered_photo_panel(tmp_path):
         an.save_front_image(tmp_path / "bad.png", tmp_path / "x.png")
 
 
+def test_vae_tokens_rank_the_photo_crop_above_the_renders(tmp_path):
+    """Tiny random VAE: the gt patch (cut from the photo) matches the photo's tokens far better than
+    the black-on-white renders, every value is a cosine, and the latent sheet is written."""
+    pytest.importorskip("diffusers")
+    torch = pytest.importorskip("torch")
+    from diffusers import AutoencoderKL
+    from unitex import vae_tokens as vt
+    torch.manual_seed(0)
+    vae = AutoencoderKL(in_channels=3, out_channels=3, down_block_types=("DownEncoderBlock2D",) * 4,
+                        up_block_types=("UpDecoderBlock2D",) * 4, block_out_channels=(8, 8, 8, 8),
+                        layers_per_block=1, latent_channels=16, norm_num_groups=4, scaling_factor=0.3611,
+                        shift_factor=0.1159, use_quant_conv=False, use_post_quant_conv=False,
+                        mid_block_add_attention=False).eval()
+    im = Image.new("RGB", (1024, 1024), (128, 128, 128))
+    ImageDraw.Draw(im).rectangle([120, 330, 600, 530], fill=INK)              # a flat label around the box
+    im.save(tmp_path / "front_registered.png")
+    json.dump(_text_doc("front_registered.png"), open(tmp_path / "text_reg.json", "w"))
+    res = vt.run(tmp_path / "text_reg.json", vae, 1024, tmp_path / "out")
+    (row,) = res["lines"]
+    assert row["text"] == "GLUTEN FREE" and row["gt"]["tokens"] == 4 * 20
+    for k in vt.KINDS:
+        assert all(-1.0 <= row[k][m] <= 1.0 for m in ("matched", "baseline", "edges_matched"))
+    assert row["gt"]["matched"] > 0.99 and row["gt"]["matched"] > row["box"]["matched"] + 0.05
+    assert list((tmp_path / "out").glob("latents_00_*.png")) and (tmp_path / "out" / "vae_tokens.json").exists()
+
+
+def test_stage4_page_builds_from_a_small_product(tmp_path):
+    pytest.importorskip("torch")
+    from unitex import stage4_page as sp
+    sku = tmp_path / "eval" / "123"
+    cache = sku / "run" / "cache"
+    cache.mkdir(parents=True)
+    Image.new("RGB", (600, 800), (240, 240, 240)).save(sku / "ref.png")
+    json.dump({"pad": [0, 0], "orig_size": [600, 800], "fg_bbox_photo": [50, 50, 550, 750], "title": "Test box"},
+              open(sku / "ref_meta.json", "w"))
+    open(sku / "gt_text.txt", "w").write("# status: manual\n0 | GLUTEN FREE\n")
+    for n in ("mv_rgb.png", "mv_normal.png", "mv_ccm.png"):
+        Image.new("RGB", (3 * 512, 2 * 512), (90, 120, 160)).save(cache / n)
+    for name, extra in (("text.json", None), ("text_reg.json", "front_registered.png")):
+        d = _text_doc(extra)
+        d["items"][0]["src_quad"] = [[100, 300], [400, 300], [400, 360], [100, 360]]
+        d["lift"] = {"align": {"iou_bbox": 0.95, "iou": 0.97}}
+        json.dump(d, open(sku / name, "w"))
+    _front(sku / "front_registered.png")
+    page = sp.main(["--eval-dir", str(tmp_path / "eval"), "--sku", "123", "--run", "run", "--text-reg",
+                    "text_reg.json", "--out", str(tmp_path / "s4.html")])
+    for s in ("What this page shows", "4.1 Read", "4.5 Give", "4.8 Geometry", "crop of the photo", "manual"):
+        assert s in page, s
+    assert (tmp_path / "s4.html").stat().st_size > 10_000
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # position_audit
 # ────────────────────────────────────────────────────────────────────────────
