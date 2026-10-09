@@ -605,8 +605,9 @@ def main(argv=None):
                    help="per-SKU text.json, relative to <eval>/<sku>/ or with {eval} {sku}; turns glyphs on")
     g.add_argument("--glyph-mode", choices=("center", "stretch", "warp"), default=None,
                    help="GlyphConfig.anchor_mode (default: the config's, center)")
-    g.add_argument("--glyph-kind", choices=("fixed", "box"), default=None,
-                   help="GlyphConfig.infer_kind (default: the config's, fixed)")
+    g.add_argument("--glyph-kind", choices=("fixed", "box", "gt"), default=None,
+                   help="GlyphConfig.infer_kind (default: the config's, fixed). gt crops the front view from the "
+                        "text.json's front_image (anchors.py --front-image) and falls back to box elsewhere")
     g.add_argument("--glyph-config", default=None, help="GlyphConfig JSON file or inline JSON object")
     g.add_argument("--glyph-set", action="append", default=None, metavar="KEY=VALUE",
                    help="GlyphConfig override, repeatable (e.g. token_budget=3072)")

@@ -299,6 +299,61 @@ def test_refine_affine_keeps_exact_alignment():
     assert np.allclose(aff, fit_box_affine([50, 50, 250, 250], [25, 25, 125, 125]))
 
 
+def _view_run(tmp_path, R=256):
+    """A run cache at R px per view with a front silhouette at rows 40:200, cols 60:180."""
+    sku_dir = tmp_path / "sku"
+    cache = sku_dir / "run" / "cache"
+    cache.mkdir(parents=True)
+    json.dump({"fg_bbox_photo": [100, 50, 400, 450], "pad": [0, 0], "orig_size": [500, 500]},
+              open(sku_dir / "ref_meta.json", "w"))
+    alpha = np.zeros((2 * R, 3 * R), np.uint8)
+    alpha[40:200, 60:180] = 255
+    Image.fromarray(alpha).save(cache / "mv_alpha.png")
+    for n in ("mv_rgb.png", "mv_rgb_generated.png"):
+        Image.new("RGB", (3 * R, 2 * R), (128, 128, 128)).save(cache / n)
+    Image.new("RGB", (6 * R, R), (128, 128, 128)).save(cache / "mv_rgb_w_light.png")
+    Image.new("RGB", (6 * 512, 512), (128, 128, 128)).save(cache / "mv_rgb_delit_512.png")
+    return sku_dir
+
+
+def test_view_stage_boxes_follow_the_run_resolution(tmp_path):
+    """mv_alpha.png of a non-512 run: the front box was scaled twice before (doubled at 1024)."""
+    sku_dir = _view_run(tmp_path)
+    warnings = []
+    stages, _, front_box, _ = et.build_stages("sku", tmp_path, "run", ["lit", "delit512", "generated", "delit"],
+                                              None, warnings.append)
+    assert not warnings
+    assert front_box == [120.0, 80.0, 360.0, 400.0]                       # 512 px view-0 pixels
+    assert stages["lit"].obj_box == [60.0, 40.0, 180.0, 200.0] and stages["lit"].front512 == 2.0
+    assert stages["generated"].obj_box == stages["delit"].obj_box == stages["lit"].obj_box
+    assert stages["delit512"].obj_box == front_box and stages["delit512"].front512 == 1.0
+    assert sku_dir.exists()
+
+
+def test_homography_alignment_only_moves_the_view_stages(tmp_path):
+    sku_dir = _view_run(tmp_path)
+    stages, _, _, _ = et.build_stages("sku", tmp_path, "run", ["lit", "delit512"], None, print)
+    photo = Image.new("RGB", (500, 500), (255, 255, 255))
+    H = [[1.0, 0.02, 3.0], [-0.01, 1.0, -2.0], [0.0, 0.0, 1.0]]
+    pf = {"view_res": 256, "align": {"fg_box_photo": [100, 50, 400, 450], "view0_box": [60, 40, 180, 200]},
+          "register": {"method": "homography", "homography": H, "n_inliers": 40}}
+    (sku_dir / "pf").mkdir()
+    json.dump(pf, open(sku_dir / "pf" / "run_info.json", "w"))
+    warnings = []
+    et.align_stages(stages, photo, sku_dir, "homography", "pf", warnings.append)
+    assert not warnings and stages["lit"].align["method"] == "homography"
+    q = np.array([[100.0, 50.0], [400.0, 50.0], [400.0, 450.0], [100.0, 450.0]])
+    from unitex.anchors import registered_view0_map
+    assert np.allclose(stages["lit"].point_map(q), registered_view0_map(pf)[0](q))
+    assert np.allclose(stages["delit512"].point_map(q), 2 * registered_view0_map(pf)[0](q))
+    # a refused photo keeps the refined bbox fit, with a warning
+    pf["skipped"] = "photo not registered: NCC 0.04 < 0.6, view 0 kept"
+    json.dump(pf, open(sku_dir / "pf" / "run_info.json", "w"))
+    stages, _, _, _ = et.build_stages("sku", tmp_path, "run", ["lit"], None, print)
+    et.align_stages(stages, photo, sku_dir, "homography", "pf", warnings.append)
+    assert stages["lit"].point_map is None and "not registered" in warnings[0]
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # run_unitex loop (dry run)
 # ────────────────────────────────────────────────────────────────────────────

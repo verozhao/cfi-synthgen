@@ -25,6 +25,7 @@ glyph_config (GlyphConfig from JSON + key=value overrides).
 
 import json
 import math
+import os
 import warnings
 from dataclasses import fields
 
@@ -63,7 +64,10 @@ def load_text(src):
     if s.lstrip().startswith("{"):
         return json.loads(s)
     with open(s) as f:
-        return json.load(f)
+        doc = json.load(f)
+    if isinstance(doc, dict):
+        doc.setdefault("_dir", os.path.dirname(os.path.abspath(s)))    # resolves a relative front_image
+    return doc
 
 
 def _scale_pts(v, s):
@@ -270,12 +274,27 @@ def build_train_glyphs(text, target, step, rng, cfg=None, view_res=VIEW_RES):
     return scale_instances(insts, text512, views, view_res, cfg)
 
 
+def front_view_image(path, base=None, res=VIEW_RES):
+    """The photo registered into view 0 (anchors.py --front-image) -> uint8 (res, res, 3)."""
+    p = path if (base is None or os.path.isabs(path)) else os.path.join(base, path)
+    im = Image.open(p).convert("RGB")
+    if im.size != (res, res):
+        im = im.resize((res, res), BOX if im.width > res else LANCZOS)
+    return np.asarray(im)
+
+
 def build_infer_glyphs(text, cfg=None, view_res=VIEW_RES, views=None):
-    """Inference glyph instances at view_res (views: raw-ordered images at view_res for kind gt)."""
+    """Inference glyph instances at view_res (views: raw-ordered images at view_res for kind gt).
+
+    Without views, kind gt crops view 0 from the text.json's "front_image" (the photo registered
+    into the front view, path relative to the text.json). Gt instances on other views become box.
+    """
     cfg = cfg or gl.GlyphConfig()
     text = load_text(text)
     if text is None or not text.get("items"):
         return []
+    if views is None and cfg.infer_kind == "gt" and text.get("front_image"):
+        views = [front_view_image(text["front_image"], text.get("_dir"), view_res)] + [None] * 5
     text512 = rescale_text(text, VIEW_RES)
     insts = gl.build_glyphs_infer(text512, cfg, resize_views(views, VIEW_RES) if views else None)
     return scale_instances(insts, text512, views, view_res, cfg)

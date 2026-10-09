@@ -9,7 +9,9 @@ Only the front view has ground truth: the GT lines of <sku>/gt_text.txt (status 
   ref512    <run>/cache/processed_image.png                           what FLUX sees (512)
   vae512    <sku>/vae/vae512.png                                      512 px after the FLUX VAE
   lit       <run>/cache/mv_rgb_w_light.png slot 0                     texture LoRA output
-  delit     <run>/cache/mv_rgb.png front tile (common.split_grid)     after the delight LoRA
+  delit512  <run>/cache/mv_rgb_delit_512.png slot 0                   delight pass alone (--delight-res 512)
+  generated <run>/cache/mv_rgb_generated.png front tile               delight output before photo_front
+  delit     <run>/cache/mv_rgb.png front tile (common.split_grid)     after the delight LoRA (and photo_front)
   baked     front render of <run>/textured_mesh.glb at 1024           final asset
   baseline  front render of <sku>/baseline.glb at 1024 (--yaw-policy cfi3dgen)   current pipeline
 
@@ -30,7 +32,10 @@ Scoring per stage:
   without RMBG's faint specks and soft shadows).
   Stage object bbox: UniTEX framing box (ref / vae stages), mv_alpha.png tile 0 (lit / delit),
   render alpha (baked / baseline). For ref / vae stages framed from the saved RMBG mask the box
-  pair is UniTEX's exact map. For the others the bbox fit is refined (--align refine) by a
+  pair is UniTEX's exact map. With --align homography --register-run RUN, the view stages (lit,
+  delit512, generated, delit) use RUN's photo_front registration instead (bbox fit + SIFT
+  homography, anchors.registered_view0_map), so a line's crop does not depend on the bbox fit
+  that also placed its glyph tokens. For the others the bbox fit is refined (--align refine) by a
   small search over the destination box maximizing gradient NCC between the warped photo and
   the stage, because catalog photos are not orthographic and generated labels drift.
   Every GT line is bucketed by its height in the 512 px front view (photo quad mapped onto the
@@ -61,13 +66,16 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from unitex import ocr as ocr_mod
 from unitex import text_metrics as tm
+from unitex.anchors import registered_view0_map
 from unitex.common import apply_affine, bbox_of_mask, fit_box_affine, split_grid
 from unitex.ocr import quad_height, quad_length
 from unitex.prepare_eval import (load_gt, read_sku_list, ref1024_box_to_photo, unitex_frame_boxes,
                                  unitex_reference)
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-STAGES = ("ref1024", "vae1024", "ref512", "vae512", "lit", "delit", "baked", "baseline")
+STAGES = ("ref1024", "vae1024", "ref512", "vae512", "lit", "delit512", "generated", "delit", "baked", "baseline")
+DEFAULT_STAGES = ("ref1024", "vae1024", "ref512", "vae512", "lit", "delit", "baked", "baseline")
+VIEW_STAGES = ("lit", "delit512", "generated", "delit")       # UniTEX view 0 framing, --align homography applies
 GREY = (128, 128, 128)
 DEFAULT_BPY = os.environ.get("CFI_BPY_PYTHON", "/Users/test/cfi-synthgen/.venv/bin/python")
 DEFAULT_BAKED = "{eval}/{sku}/{run}/renders/baked/view_00.png"
@@ -220,6 +228,7 @@ class Stage:
         self.front512 = front512      # stage px -> 512 px front-view px
         self.exact = exact            # the box pair is UniTEX's own framing map, no refinement
         self.aff = None
+        self.point_map = None         # photo px -> stage px (--align homography), replaces the affine
         self.align = {"method": "exact" if exact else "bbox"}
 
     def affine(self):
@@ -327,11 +336,16 @@ def build_stages(sku, eval_dir, run_name, names, args, warn):
     if vae_meta and vae_meta.get("run_name") not in (None, run_name) and str(vae_meta.get("source", "")).startswith("run"):
         warn(f"vae ceiling images were made from run {vae_meta.get('run_name')!r}")
 
-    front_alpha = None
+    front_box = None                         # front silhouette bbox in 512 px view-0 pixels
     if (cache / "mv_alpha.png").exists():
         grid_a = np.asarray(Image.open(cache / "mv_alpha.png").convert("L"))
-        front_alpha = split_grid(grid_a, res=grid_a.shape[0] // 2)[0]
-    front_box = mask_box(front_alpha > 127) if front_alpha is not None else None
+        front_res = grid_a.shape[0] // 2     # the run's view res: 1024 for a 1024 run
+        b = mask_box(split_grid(grid_a, res=front_res)[0] > 127)
+        front_box = [v * 512 / front_res for v in b] if b is not None else None
+
+    def view_stage(name, p, img, res):
+        box = [v * res / 512 for v in front_box] if front_box is not None else nongrey_box(img)
+        stages[name] = Stage(name, img, box, fr["fg_box"], p, 512 / res)
 
     stages = {}
     for name in names:
@@ -359,26 +373,25 @@ def build_stages(sku, eval_dir, run_name, names, args, warn):
                                      1.0, fr_exact)
             else:
                 warn(f"{name}: skipped (no {p})")
-        elif name == "lit":
-            p = cache / "mv_rgb_w_light.png"
+        elif name in ("lit", "delit512"):
+            p = cache / ("mv_rgb_w_light.png" if name == "lit" else "mv_rgb_delit_512.png")
             if p.exists():
                 strip = Image.open(p).convert("RGB")
                 res = strip.height
-                img = strip.crop((0, 0, res, res))        # strip slot 0 is the front view
-                box = [v * res / 512 for v in front_box] if front_box is not None else nongrey_box(img)
-                stages[name] = Stage(name, img, box, fr["fg_box"], p, 512 / res)
+                view_stage(name, p, strip.crop((0, 0, res, res)), res)     # strip slot 0 is the front view
             else:
                 warn(f"{name}: skipped (no {p})")
-        elif name == "delit":
-            p = cache / "mv_rgb.png" if (cache / "mv_rgb.png").exists() else run_dir / "mv_rgb.png"
+        elif name in ("generated", "delit"):
+            if name == "generated":
+                p = cache / "mv_rgb_generated.png"
+            else:
+                p = cache / "mv_rgb.png" if (cache / "mv_rgb.png").exists() else run_dir / "mv_rgb.png"
             if p.exists():
                 grid = np.asarray(Image.open(p).convert("RGB"))
                 res = grid.shape[1] // 3
-                img = Image.fromarray(np.ascontiguousarray(split_grid(grid, res=res)[0]))
-                box = [v * res / 512 for v in front_box] if front_box is not None else nongrey_box(img)
-                stages[name] = Stage(name, img, box, fr["fg_box"], p, 512 / res)
+                view_stage(name, p, Image.fromarray(np.ascontiguousarray(split_grid(grid, res=res)[0])), res)
             else:
-                warn(f"{name}: skipped (no mv_rgb.png)")
+                warn(f"{name}: skipped (no {p.name})")
         elif name in ("baked", "baseline"):
             if name == "baked":
                 glb = run_dir / "textured_mesh.glb"
@@ -422,6 +435,31 @@ def _bucket_rows(line_rows, key_ned, key_hit, key_nw, key_nm):
             "word_recall": round(sum(r[key_nm] for r in rows) / nw, 4) if nw else None,
         }
     return out
+
+
+def align_stages(stages, photo, sku_dir, align="refine", register_run=None, warn=print):
+    """Photo -> stage maps. Exact framing stays exact. homography: the view stages use the
+    photo_front registration of <sku_dir>/<register_run>, falling back to refine when that photo
+    was not registered. The other stages refine the bbox fit unless align is bbox."""
+    pf = None
+    if align == "homography":
+        p = pathlib.Path(sku_dir) / register_run / "run_info.json"
+        if not p.exists():
+            warn(f"no {register_run}/run_info.json, view stages fall back to --align refine")
+        else:
+            with open(p) as f:
+                pf = json.load(f)
+            if pf.get("skipped"):
+                warn(f"{register_run}: {pf['skipped']}, view stages fall back to --align refine")
+                pf = None
+    for n, st in stages.items():
+        if pf is not None and n in VIEW_STAGES:
+            st.point_map, rec = registered_view0_map(pf, res=st.image.width)
+            st.align = {"method": rec["method"], "register_run": register_run, "n_inliers": rec["n_inliers"]}
+            continue
+        if st.exact or st.obj_box is None or st.photo_box is None or align == "bbox":
+            continue
+        st.aff, st.align = refine_affine(photo, st.image, st.photo_box, st.obj_box)
 
 
 def evaluate_sku(sku, eval_dir, out_dir, args, ocr_kwargs):
@@ -469,10 +507,7 @@ def evaluate_sku(sku, eval_dir, out_dir, args, ocr_kwargs):
     px, py = meta["pad"]
     W0, H0 = meta["orig_size"]
     photo = ref.crop((px, py, px + W0, py + H0))
-    for st in stages.values():
-        if st.exact or st.obj_box is None or st.photo_box is None or args.align == "bbox":
-            continue
-        st.aff, st.align = refine_affine(photo, st.image, st.photo_box, st.obj_box)
+    align_stages(stages, photo, sku_dir, args.align, args.register_run, warn)
 
     # OCR: one batch for all global images, one for all region crops
     names = list(stages)
@@ -486,13 +521,14 @@ def evaluate_sku(sku, eval_dir, out_dir, args, ocr_kwargs):
     for n in names:
         st = stages[n]
         aff = st.affine()
-        if aff is None:
+        if aff is None and st.point_map is None:
             warn(f"{n}: no object bbox, region scoring skipped")
             continue
         for g in gt_rows:
             if g["quad"] is None:
                 continue
-            c = rectified_crop(st.image, map_quad(g["quad"], aff), target_h=args.crop_height)
+            q = st.point_map(np.asarray(g["quad"], np.float64)) if st.point_map is not None else map_quad(g["quad"], aff)
+            c = rectified_crop(st.image, q, target_h=args.crop_height)
             if c is None:
                 continue
             crops.append(c)
@@ -674,7 +710,7 @@ def main(argv=None):
     p.add_argument("--run-name", default="unitex")
     p.add_argument("--skus", default=None, help="file or comma list (default <eval>/skus.txt)")
     p.add_argument("--limit", type=int, default=None)
-    p.add_argument("--stages", default=",".join(STAGES))
+    p.add_argument("--stages", default=",".join(DEFAULT_STAGES), help=f"comma list from {','.join(STAGES)}")
     p.add_argument("--out", default=None, help="default <eval>/results_<run-name>")
     ocr_mod.add_ocr_args(p)
     p.add_argument("--global-rotations", default="0,90,270")
@@ -685,8 +721,11 @@ def main(argv=None):
     p.add_argument("--gt-min-conf", type=float, default=0.5, help="OCR GT lines kept at or above this")
     p.add_argument("--fold-accents", action="store_true", help="compare without diacritics")
     p.add_argument("--no-crops", dest="save_crops", action="store_false")
-    p.add_argument("--align", choices=("refine", "bbox"), default="refine",
-                   help="photo -> stage map for lit / delit / baked / baseline: bbox fit, or refined on image gradients")
+    p.add_argument("--align", choices=("refine", "bbox", "homography"), default="refine",
+                   help="photo -> stage map for lit / delit / baked / baseline: bbox fit, or refined on image gradients. "
+                        "homography: the view stages use --register-run's photo_front registration, the others refine")
+    p.add_argument("--register-run", default=None,
+                   help="photo_front.py run under <eval>/<sku>/ whose run_info.json registration --align homography uses")
     p.add_argument("--render", choices=("auto", "never", "force"), default="auto")
     p.add_argument("--render-res", type=int, default=1024)
     p.add_argument("--blender-python", default=DEFAULT_BPY)
@@ -699,6 +738,8 @@ def main(argv=None):
     bad = [s for s in args.stages if s not in STAGES]
     if bad:
         p.error(f"unknown stages {bad}, choose from {STAGES}")
+    if args.align == "homography" and not args.register_run:
+        p.error("--align homography needs --register-run")
     args.global_rotations = ocr_mod.parse_rotations(args.global_rotations)
     args.region_rotations = ocr_mod.parse_rotations(args.region_rotations)
 
