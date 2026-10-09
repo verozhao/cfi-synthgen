@@ -214,9 +214,17 @@ def build(args):
         built[kind] = gt.build_infer_glyphs(src, gl.GlyphConfig(infer_kind=kind), view_res=R)
     rows, scale = [], 0.5
     by_id = {k: {i.item_id: i for i in v} for k, v in built.items()}
+    reg_v0 = {i.get("src_id", i["id"]): i for i in items_v0(reg)} if reg is not None else {}
     for it in items:
         x0, y0, x1, y1 = box_at(it["views"]["0"], f)
         cells = [f"<td>{html.escape(it['text'])}</td><td>{round(y1 - y0)} x {round(x1 - x0)}</td>"]
+        if reg is not None:
+            ri = reg_v0.get(it.get("src_id", it["id"]))
+            if ri is None:
+                cells.append('<td class="stats">-</td>')
+            else:
+                a0, b0, a1, b1 = box_at(ri["views"]["0"], R / reg["res"])
+                cells.append(f"<td>{round(b1 - b0)} x {round(a1 - a0)}</td>")
         for kind in kinds:
             inst = by_id[kind].get(it["id"])
             if inst is None:
@@ -229,7 +237,8 @@ def build(args):
                          f'<div class="stats">{phh} x {pw} px, {inst.token_hw[0]} x {inst.token_hw[1]} tokens</div></td>')
         rows.append(f"<tr>{''.join(cells)}</tr>")
     head = "".join(f"<th>{KIND_NAME[k]}</th>" for k in kinds)
-    table = (f'<table class="pt"><tr><th>line</th><th>real size on the front (h x w px)</th>{head}</tr>'
+    reg_head = "<th>registered size</th>" if reg is not None else ""
+    table = (f'<table class="pt"><tr><th>line</th><th>size on the front, box fit (h x w px)</th>{reg_head}{head}</tr>'
              f'{"".join(rows)}</table>')
     fx = [(i.text, i.patch.height / max(1e-6, (i.bbox[3] - i.bbox[1]))) for i in built["fixed"]]
     big = sorted(fx, key=lambda t: -t[1])[:3]
@@ -324,8 +333,26 @@ def build(args):
             "neighbouring lines (4.3, 4.5).</li>"
             "<li>Training: the LoRA mostly saw crops of real text and lines drawn to their box, while our runs "
             "used the fixed font (4.7).</li>"
-            "<li>Next test, no retraining needed: registered placement, then the box and gt kinds.</li></ul>")
-    sec.insert(0, ("What this page shows", "Four points, each explained step by step below.", take))
+            "<li>Next test, no retraining needed: registered placement, then the box and gt kinds.</li>")
+    if reg_v0:
+        moves = []
+        for it in items:
+            ri = reg_v0.get(it.get("src_id", it["id"]))
+            if ri is not None:
+                a, b = box_at(it["views"]["0"], f), box_at(ri["views"]["0"], R / reg["res"])
+                moves.append(np.hypot((a[0] + a[2] - b[0] - b[2]) / 2, (a[1] + a[3] - b[1] - b[3]) / 2) / TOKEN_PX)
+        if moves:
+            take += (f"<li>Measured here: with the photo registered, line centres move by {np.mean(moves):.1f} tokens "
+                     f"on average (up to {max(moves):.1f}).</li>")
+    if args.vae_json and pathlib.Path(args.vae_json).exists():
+        vm = json.load(open(args.vae_json)).get("mean") or {}
+        if all(k in vm for k in ("fixed", "box", "gt")):
+            take += (f"<li>VAE tokens (last section): drawn lines share almost nothing with the photo's tokens at "
+                     f"their spot (fixed {vm['fixed']['matched_c']:.2f}, box {vm['box']['matched_c']:.2f}), photo "
+                     f"crops do ({vm['gt']['matched_c']:.2f}). Edge maps bring drawn lines closer "
+                     f"({vm['box']['edges_matched_c']:.2f}).</li>")
+    take += "</ul>"
+    sec.insert(0, ("What this page shows", "The main points, each explained step by step below.", take))
     body = "".join(f'<div class="stage"><h3>{html.escape(t)}</h3><p class="sub">{p}</p>'
                    f'<div class="figs">{b}</div></div>' for t, p, b in sec)
     title = f"Stage 4, step by step: {html.escape(meta.get('title') or args.sku)}"

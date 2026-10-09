@@ -9,8 +9,11 @@ column ids, one 16 x 16 px cell per token) and encoded the same way. Then:
 
   matched   mean cosine similarity between glyph token k and the photo token at its position
   baseline  mean cosine over all glyph x photo token pairs of the line, positions ignored
-  edges     matched cosine for Canny edge maps of the patch and of the photo cut: the input an edge
-            map condition would give, which ignores colour and lighting
+  edges     matched and baseline for Canny edge maps of the patch and of the photo cut: the input
+            an edge map condition would give, which ignores colour and lighting
+  *_c       the same after subtracting each image's mean token: a flat background (white paper,
+            black edge map) makes every pair of tokens alike, centring leaves the letter shapes
+Only matched above baseline says the glyph tokens agree with the photo where they claim to be.
 
 gt patches are cut from the same photo, so their matched cosine is close to 1. It is below 1 because
 a patch is its box resampled to whole tokens while its position ids snap to whole tokens around the
@@ -108,19 +111,25 @@ def _uri(im):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def sheet(rows, scale=2):
-    """rows: [(label, [PIL images])] -> one image, every image upscaled by `scale` (nearest)."""
+def sheet(rows, scale=2, label_w=190):
+    """rows: [(label, [PIL images])] -> one image with the label left of each row, every image
+    upscaled by `scale` (nearest)."""
+    from PIL import ImageDraw
+    font = gl.load_font(15)
     ims = [[im.resize((im.width * scale, im.height * scale), Image.NEAREST) for im in r] for _, r in rows]
-    W = max(sum(i.width for i in r) + 8 * (len(r) - 1) for r in ims)
+    W = label_w + max(sum(i.width for i in r) + 8 * (len(r) - 1) for r in ims)
     H = sum(max(i.height for i in r) for r in ims) + 8 * (len(ims) - 1)
     out = Image.new("RGB", (W, H), (255, 255, 255))
+    d = ImageDraw.Draw(out)
     y = 0
-    for r in ims:
-        x = 0
+    for (label, _), r in zip(rows, ims):
+        h = max(i.height for i in r)
+        d.text((4, y + max(0, h // 2 - 9)), label, fill=(26, 26, 26), font=font)
+        x = label_w
         for im in r:
             out.paste(im.convert("RGB"), (x, y))
             x += im.width + 8
-        y += max(i.height for i in r) + 8
+        y += h + 8
     return out
 
 
@@ -144,12 +153,18 @@ def run(text_path, vae, view_res, out_dir, device="cpu"):
             photo = cut(front, footprint_px(inst))
             pz, phz, pe, phe = gt.encode_patches([inst.patch.convert("RGB"), photo, edges(inst.patch), edges(photo)],
                                                  vae, "mode", device=device)
-            m, b = cosines(tokens(pz), tokens(phz))
-            me, _ = cosines(tokens(pe), tokens(phe))
-            row[k] = {"tokens": int(tokens(pz).shape[0]), "matched": round(m, 4), "baseline": round(b, 4),
-                      "edges_matched": round(me, 4), "footprint_px": list(footprint_px(inst))}
+            g, ph, ge, phe_t = tokens(pz), tokens(phz), tokens(pe), tokens(phe)
+            m, b = cosines(g, ph)
+            mc, bc = cosines(g - g.mean(0), ph - ph.mean(0))
+            me, be = cosines(ge, phe_t)
+            mec, bec = cosines(ge - ge.mean(0), phe_t - phe_t.mean(0))
+            row[k] = {"tokens": int(g.shape[0]), "matched": round(m, 4), "baseline": round(b, 4),
+                      "matched_c": round(mc, 4), "baseline_c": round(bc, 4),
+                      "edges_matched": round(me, 4), "edges_baseline": round(be, 4),
+                      "edges_matched_c": round(mec, 4), "edges_baseline_c": round(bec, 4),
+                      "footprint_px": list(footprint_px(inst))}
             lat_all += [pz, phz]
-            ims_all += [(f"{k} patch", inst.patch.convert("RGB")), (f"photo at its {k} tokens", photo)]
+            ims_all += [(f"{k}: line image", inst.patch.convert("RGB")), (f"{k}: photo at its tokens", photo)]
         pcs = pca_rgb(lat_all)
         rows = [(lab, [im, pc.resize(im.size, Image.NEAREST), decode(vae, z)])
                 for (lab, im), pc, z in zip(ims_all, pcs, lat_all)]
@@ -158,22 +173,30 @@ def run(text_path, vae, view_res, out_dir, device="cpu"):
         sh.save(out_dir / f"latents_{item_id:02d}_{safe}.png")
         figures.append((row["text"], sh))
         lines.append(row)
-    mean = {k: {m: round(float(np.mean([r[k][m] for r in lines])), 4) for m in ("matched", "baseline", "edges_matched")}
-            for k in KINDS} if lines else {}
-    trs = "".join(f"<tr><td>{html.escape(r['text'])}</td>" + "".join(
-        f"<td>{r[k]['matched']:.2f} / {r[k]['baseline']:.2f} / {r[k]['edges_matched']:.2f}</td>" for k in KINDS)
-        + "</tr>" for r in lines)
-    summary = ("Each cell: matched / baseline / edges (cosine similarity of 64-number VAE tokens). Matched compares "
-               "every glyph token with the photo's token at the front-view spot it claims. Baseline ignores "
-               "positions. gt is cut from the photo itself: its matched value is below 1 only because tokens "
-               "snap to a 16 px grid around the box centre."
-               f'<table class="pt"><tr><th>line</th>{"".join(f"<th>{k}</th>" for k in KINDS)}</tr>{trs}'
-               "<tr><td><b>mean</b></td>" + "".join(
-                   f"<td><b>{mean[k]['matched']:.2f} / {mean[k]['baseline']:.2f} / {mean[k]['edges_matched']:.2f}</b></td>"
-                   for k in KINDS) + "</tr></table>") if lines else "No front-view line had all three kinds."
+    keys = ("matched", "baseline", "matched_c", "baseline_c", "edges_matched", "edges_baseline", "edges_matched_c",
+            "edges_baseline_c")
+    mean = {k: {m: round(float(np.mean([r[k][m] for r in lines])), 4) for m in keys} for k in KINDS} if lines else {}
+
+    def cell(v, b=False):
+        s = (f"{v['matched_c']:.2f} / {v['baseline_c']:.2f}</td><td>{v['edges_matched_c']:.2f} / "
+             f"{v['edges_baseline_c']:.2f}")
+        return f"<td><b>{s}</b></td>" if b else f"<td>{s}</td>"
+
+    trs = "".join(f"<tr><td>{html.escape(r['text'])}</td>" + "".join(cell(r[k]) for k in KINDS) + "</tr>"
+                  for r in lines)
+    head = "".join(f"<th>{k}: image</th><th>{k}: edges</th>" for k in KINDS)
+    summary = ("Cosine similarity of 64-number VAE tokens, each image's mean token removed. Each cell: matched / "
+               "baseline. Matched compares every glyph token with the photo's token at the front-view spot it "
+               "claims. Baseline pairs every glyph token with every photo token of the line, positions ignored. "
+               "Only matched above baseline means the glyph tokens agree with the photo where they claim to be. "
+               "gt is cut from the photo itself: it is below 1 only because tokens snap to a 16 px grid around the "
+               "box centre. Edges compare Canny edge maps of the same two images."
+               f'<table class="pt"><tr><th>line</th>{head}</tr>{trs}'
+               "<tr><td><b>mean</b></td>" + "".join(cell(mean[k], True) for k in KINDS) + "</tr></table>"
+               ) if lines else "No front-view line had all three kinds."
     figs = "".join(f'<figure style="flex:0 1 640px"><img src="{_uri(im)}" data-caption="{html.escape(t)}">'
-                   f'<figcaption>{html.escape(t)}: patch, latent (3 main components as colour), VAE reconstruction'
-                   f'</figcaption></figure>' for t, im in figures[:4])
+                   f'<figcaption>{html.escape(t)}: per row the image, its VAE latent (3 main components as colour, '
+                   f'one shared colour basis) and the VAE reconstruction</figcaption></figure>' for t, im in figures[:4])
     res = {"text": str(text_path), "view_res": view_res, "lines": lines, "mean": mean, "summary_html": summary,
            "figures_html": figs}
     with open(out_dir / "vae_tokens.json", "w") as f:
