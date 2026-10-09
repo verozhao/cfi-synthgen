@@ -120,8 +120,12 @@ def grid_overlay(patch):
     return im
 
 
-def sequence_svg(n_target, glyph_rows):
-    """FLUX input of the texture pass: what is denoised and what only conditions it."""
+def sequence_svg(R, glyph_rows):
+    """FLUX input of the texture pass: what is denoised and what only conditions it. Sizes: six
+    target views and the six-view geometry strip of (R/16)^2 tokens per view, the reference photo
+    of (R/16)^2 (at 512: 6144 + 6144 + 1024 + glyphs, STAGE2.md's patched infer_mv check)."""
+    n_target = 6 * (R // TOKEN_PX) ** 2
+    n_ref = (R // TOKEN_PX) ** 2
     W, y0, h = 1000, 40, 56
 
     def block(x, w, fill, stroke, title, sub):
@@ -131,8 +135,8 @@ def sequence_svg(n_target, glyph_rows):
 
     parts = [block(0, 150, PANEL, LINE, "prompt", "text tokens (T5)"),
              block(160, 330, "#ffffff", INK, "six target views", f"{n_target:,} tokens, denoised"),
-             block(500, 170, PANEL, LINE, "geometry", "normal + CCM image"),
-             block(680, 130, PANEL, LINE, "reference", "the photo"),
+             block(500, 170, PANEL, LINE, "geometry", f"normal + CCM, {n_target:,}"),
+             block(680, 130, PANEL, LINE, "reference", f"the photo, {n_ref:,}"),
              block(820, 180, "#ffffff", ACC, "glyph tokens", f"{sum(r[1] for r in glyph_rows):,} tokens, ours")]
     brace = (f'<path d="M500 {y0 + h + 8} v8 H1000 v-8" fill="none" stroke="{MUTED}"/>'
              f'<text x="750" y="{y0 + h + 32}" text-anchor="middle" font-size="12" fill="{MUTED}">'
@@ -272,14 +276,13 @@ def build(args):
                 "and overlap the lines next to it (overlapping positions are pushed apart by up to 2 tokens). "
                 "With box or gt, they cover the line.", "".join(fps)))
 
-    n_target = 6 * (R // TOKEN_PX) ** 2
     grow = [(i.text, int(i.n_keep)) for i in built["fixed"]]
     sec.append(("4.6 Add them to the FLUX input (appended, not added)",
                 "The glyph tokens are extra tokens at the end of the sequence. Nothing is added on top of the "
                 "view tokens: the views stay as they are, and the glyph tokens sit next to them as hints the "
                 "model can look at. FLUX only predicts the six views, its output at the glyph positions is "
                 f"thrown away. Here: {len(grow)} lines, {sum(n for _, n in grow):,} glyph tokens with the fixed "
-                "font.", sequence_svg(n_target, grow)))
+                "font.", sequence_svg(R, grow)))
 
     c = gl.GlyphConfig()
     p_gt, p_box, p_fixed = c.stages[0][1:4]

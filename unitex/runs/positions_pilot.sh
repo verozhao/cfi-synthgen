@@ -10,6 +10,8 @@
 #   old_box    bbox-fit placement, text drawn to its box    (size alone)
 #   reg_box    registered placement, text drawn to its box
 #   reg_gt     registered placement, crops of the registered photo on the front view
+#   d1024      the final run's glyphs, delight pass at 1024 instead of 512 + detail (same seed, so
+#              the texture pass is the same and only the delight pass differs)
 # Registered placement: anchors.py --register-run g1024_final_photofront (bbox fit, then the
 # photo_front SIFT homography). SKUs whose photo did not register keep the bbox fit.
 set -u
@@ -62,9 +64,11 @@ glyph_args() {
     old_box)   echo "--glyph-json-name text.json --glyph-kind box" ;;
     reg_box)   echo "--glyph-json-name text_reg.json --glyph-kind box" ;;
     reg_gt)    echo "--glyph-json-name text_reg.json --glyph-kind gt" ;;
+    d1024)     echo "--glyph-json-name text.json" ;;
     *) return 1 ;;
   esac
 }
+infer_args() { if [ "$1" = d1024 ]; then echo "${INFER/--delight-res 512/}"; else echo "$INFER"; fi; }
 for v in $VARIANTS; do glyph_args $v > /dev/null || { log "ABORT: unknown variant $v"; exit 1; }; done
 pids=()
 for v in $VARIANTS; do
@@ -79,7 +83,7 @@ for v in $VARIANTS; do
   done
   log "variant $v on GPU $g ($(wc -l < $SKUS) skus)"
   CUDA_VISIBLE_DEVICES=$g $PY $REPO/unitex/run_unitex_lowmem.py --unitex-root $R/repos/train/UniTEX \
-    --eval-dir $R/$EVAL --run-name pos_$v --seed 63 --resume --skus $SKUS --texture-lora $LORA $INFER \
+    --eval-dir $R/$EVAL --run-name pos_$v --seed 63 --resume --skus $SKUS --texture-lora $LORA $(infer_args $v) \
     $(glyph_args $v) >> $R/logs/pos_${v}_$EVAL.log 2>&1 < /dev/null &
   pids+=("$g:$!")
   sleep 120     # let the run load its models before the next GPU check
