@@ -387,6 +387,9 @@ def build_pipeline(args):
         pipe.export_video = lambda *a, **k: None
     if args.texture_lora:
         use_texture_lora(pipe, args.texture_lora)
+    if getattr(args, "ref_text_blur", False):
+        from unitex import ref_text
+        ref_text.wrap_reference_blur(pipe, args.ref_text_max_height)
     return pipe
 
 
@@ -509,6 +512,10 @@ def run(args):
             rec["pos_scale"] = args.pos_scale
         if args.delight_res is not None:
             rec["delight_res"] = args.delight_res
+        if args.ref_text_blur:
+            rec["ref_text_blur"] = {"max_height": args.ref_text_max_height}
+            if getattr(pipe, "ref_text_state", None):
+                pipe.ref_text_state["last"] = None      # never log the previous SKU's counts
         if glyph_settings:
             gpath = glyph_json_path(args.glyph_json_name, eval_dir, sku)
             rec["glyph"] = {"json": gpath, **glyph_settings}
@@ -549,6 +556,13 @@ def run(args):
             if mus:
                 rec["mu_per_pass"] = [round(m, 4) for m in mus]    # texture, delight
                 mus.clear()
+            rt = (getattr(pipe, "ref_text_state", None) or {}).get("last") if args.ref_text_blur else None
+            if rt:
+                rec["ref_text_blur"].update(n_regions=rt["n_regions"], n_blurred=rt["n_blurred"])
+            elif args.ref_text_blur and rec["status"] == "ok":
+                rec.update(status="error", error="--ref-text-blur: the reference was not blurred "
+                           "(no preprocess_reference_image call, or --dry-run)")
+                print(f"  [{sku}] ERROR {rec['error']}")
             gi = getattr(pipe, "last_glyph_info", None) if glyph_settings else None
             if gi:
                 rec["glyph"].update({k: gi.get(k) for k in GLYPH_LOG_KEYS})
@@ -614,6 +628,12 @@ def main(argv=None):
     g.add_argument("--glyph-delight", action="store_true", help="feed the glyphs to the delight pass too")
     g.add_argument("--glyph-sample-mode", choices=("argmax", "sample"), default="argmax",
                    help="VAE posterior mode (default, leaves the shared generator untouched) or a sample")
+    g.add_argument("--ref-text-blur", action="store_true",
+                   help="blur small text in the reference image before the texture pass (unitex.ref_text, "
+                        "what a LoRA trained with --cfi_ref_text_blur saw); cache/processed_image_sharp.png "
+                        "keeps the original")
+    g.add_argument("--ref-text-max-height", type=int, default=64,
+                   help="blur text up to this height, px at 1024 (unitex.ref_text.MAX_HEIGHT)")
     args = p.parse_args(argv)
     if (args.add_lora_path is None) != (args.add_lora_weights is None) or (
             args.add_lora_path and len(args.add_lora_path) != len(args.add_lora_weights)):
@@ -628,6 +648,8 @@ def main(argv=None):
                                  ("--glyph-sample-mode", args.glyph_sample_mode != "argmax")) if v]
     if glyph_opts and not args.glyph_json_name:
         p.error(f"{', '.join(glyph_opts)} need --glyph-json-name")
+    if args.ref_text_blur and args.dry_run:
+        p.error("--ref-text-blur needs the real pipeline (the dry run writes no reference to blur)")
     if args.glyph_json_name and args.view_res % 512:
         p.error("glyphs need --view-res to be a multiple of 512 (unitex.glyph_tokens)")
     if args.glyph_json_name:

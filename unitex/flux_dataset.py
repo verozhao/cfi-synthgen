@@ -14,6 +14,7 @@ index, with the tensor conventions of UniTEX-FLUX data/datasets.py (MVDataset + 
   prompts, uids      str (caption/<uid>/prompt.txt, "" if missing)
   text_json          str, content of render/<uid>/text.json ("" if missing)
   ref_index          int, the chosen render_random view
+  ref_text_blurred   int, 1 when the reference's small text was blurred (ref_text_blur)
 R = view_res (512 default, 1024 option), Rr = ref_res (default R). Images at another size are
 resized like datasets.py: bilinear + antialias for rgb / albedo / alpha, nearest for nocs / normal.
 
@@ -170,10 +171,14 @@ class CFIFluxDataset(Dataset):
     caption/). image_ext: "auto" (data.mdb when present, else PNG), ".mdb" or ".png".
     ref_views: number of render_random candidates (UniTEX-FLUX uses 0..19), None = all in its
     metadata.json. skip_broken: log loudly and use the next uid instead of raising.
+    ref_text_dir / ref_text_blur: with probability ref_text_blur, text up to ref_text_max_height
+    px (at 1024, default unitex.ref_text.MAX_HEIGHT) is blurred in the reference, using the polygons
+    unitex.ref_text precompute wrote for every uid, so the model has to take it from the glyphs.
     """
 
     def __init__(self, roots, view_res=512, ref_res=None, image_ext="auto", alpha_source="rgb",
-                 ref_views=N_REF_VIEWS, trigger_prompt=None, skip_broken=False, uids=None):
+                 ref_views=N_REF_VIEWS, trigger_prompt=None, skip_broken=False, uids=None,
+                 ref_text_dir=None, ref_text_blur=0.0, ref_text_max_height=None):
         roots = [roots] if isinstance(roots, (str, os.PathLike)) else list(roots)
         if image_ext not in IMAGE_EXTS:
             raise ValueError(f"image_ext must be one of {IMAGE_EXTS}")
@@ -196,6 +201,19 @@ class CFIFluxDataset(Dataset):
                 for uid in json.load(f):
                     if uids is None or uid in uids:
                         self.samples.append((root, uid))
+        if not 0.0 <= float(ref_text_blur) <= 1.0:
+            raise ValueError(f"ref_text_blur {ref_text_blur} is not a probability")
+        if ref_text_blur > 0 and not ref_text_dir:
+            raise ValueError("ref_text_blur needs ref_text_dir (unitex.ref_text precompute)")
+        self.ref_text_dir = ref_text_dir
+        self.ref_text_blur = float(ref_text_blur)
+        self.ref_text_max_height = ref_text_max_height
+        if self.ref_text_blur > 0:
+            from unitex import ref_text
+            missing = [u for _, u in self.samples if not os.path.isfile(ref_text.ref_json_path(ref_text_dir, u))]
+            if missing:
+                raise FileNotFoundError(f"{len(missing)} of {len(self.samples)} uids have no reference text "
+                                        f"polygons in {ref_text_dir} (first: {missing[0]})")
 
     def __len__(self):
         return len(self.samples)
@@ -280,8 +298,18 @@ class CFIFluxDataset(Dataset):
             "native_normals": make_strip(v["normal"]),
             "text_json": self.load_text_json(root, uid),
             "ref_index": k,
+            "ref_text_blurred": 0,
         }
         out.update(self.load_reference(ref_dir, k))
+        if self.ref_text_blur > 0 and random.random() < self.ref_text_blur:
+            from unitex import ref_text
+            polys, res = ref_text.load_ref_polys(self.ref_text_dir, uid, k)
+            kw = {"max_height": self.ref_text_max_height} if self.ref_text_max_height else {}
+            s = self.ref_res / res[0]
+            if polys and ref_text.n_blurred(polys, s, self.ref_res, **kw):
+                out["rgbs_ip"] = ref_text.blur_tensor(out["rgbs_ip"], polys, s, **kw)
+                out["albedos_ip"] = ref_text.blur_tensor(out["albedos_ip"], polys, s, **kw)
+                out["ref_text_blurred"] = 1
         return out
 
     def __getitem__(self, index):

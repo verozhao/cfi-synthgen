@@ -11,7 +11,7 @@ index d4fa89b..d400e75 100644
  from matplotlib import pyplot as plt
  import numpy as np
 diff --git a/launch.py b/launch.py
-index 566ae4f..34f3c27 100644
+index 566ae4f..7630a7a 100644
 --- a/launch.py
 +++ b/launch.py
 @@ -32,6 +32,7 @@ from torchvision.transforms.functional import crop
@@ -22,7 +22,7 @@ index 566ae4f..34f3c27 100644
  import diffusers
  from diffusers import (
      AutoencoderKL,
-@@ -800,6 +801,53 @@ def parse_args(input_args=None):
+@@ -800,6 +801,60 @@ def parse_args(input_args=None):
              " or to a folder containing files that 🤗 Datasets can understand."
          ),
      )
@@ -72,11 +72,18 @@ index 566ae4f..34f3c27 100644
 +                             "which peft 0.15.2 never did. diffusers 0.32.2 drops it at load.")
 +    parser.add_argument("--text_keep_boost", type=float, default=0.0,
 +                        help="noise drop: target tokens in text boxes are kept with p + boost * (1 - p)")
++    parser.add_argument("--cfi_ref_text_dir", type=str, default=None,
++                        help="unitex.ref_text precompute output: text polygons of every render_random view")
++    parser.add_argument("--cfi_ref_text_blur", type=float, default=0.0,
++                        help="probability that a sample's reference gets its small text blurred, so those letters "
++                             "have to come from the glyph tokens (needs --cfi_ref_text_dir)")
++    parser.add_argument("--cfi_ref_text_max_height", type=int, default=None,
++                        help="blur text up to this height, px at 1024 (default unitex.ref_text.MAX_HEIGHT)")
 +
      if input_args is not None:
          args = parser.parse_args(input_args)
      else:
-@@ -835,6 +883,20 @@ def parse_args(input_args=None):
+@@ -835,6 +890,22 @@ def parse_args(input_args=None):
      assert len(args.multiscale_training_step_range) == 2, \
          f'multiscale_training error: {args.multiscale_training_step_range}'
  
@@ -93,11 +100,13 @@ index 566ae4f..34f3c27 100644
 +        raise ValueError("--text_keep_boost must be in [0, 1]")
 +    if args.text_keep_boost > 0 and args.dataset_impl != "cfi":
 +        raise ValueError("--text_keep_boost needs --dataset_impl cfi (text_json per sample)")
++    if args.cfi_ref_text_blur > 0 and (args.dataset_impl != "cfi" or not args.cfi_ref_text_dir):
++        raise ValueError("--cfi_ref_text_blur needs --dataset_impl cfi and --cfi_ref_text_dir")
 +
      env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
      if env_local_rank != -1 and env_local_rank != args.local_rank:
          args.local_rank = env_local_rank
-@@ -902,7 +964,19 @@ def main(args):
+@@ -902,7 +973,23 @@ def main(args):
          transformers.utils.logging.set_verbosity_error()
          diffusers.utils.logging.set_verbosity_error()
      # dataset perparation
@@ -112,13 +121,17 @@ index 566ae4f..34f3c27 100644
 +            image_ext=args.cfi_image_ext,
 +            alpha_source=args.cfi_alpha_source,
 +            skip_broken=args.cfi_skip_broken,
++            ref_text_dir=args.cfi_ref_text_dir,
++            ref_text_blur=args.cfi_ref_text_blur,
++            ref_text_max_height=args.cfi_ref_text_max_height,
 +        )
-+        logger.info(f"cfi dataset: {len(train_dataset)} uids from {train_dataset.roots}, view_resolution {args.view_resolution}")
++        logger.info(f"cfi dataset: {len(train_dataset)} uids from {train_dataset.roots}, view_resolution {args.view_resolution}, "
++                    f"reference text blur {args.cfi_ref_text_blur} ({args.cfi_ref_text_dir})")
 +    elif args.dataset_name_list is None:
          train_dataset = PBRTextureGenerationDataset(
              args.dataset_name, 
              MVDatasetConfig(
-@@ -928,6 +1002,7 @@ def main(args):
+@@ -928,6 +1015,7 @@ def main(args):
                  bump_background_color=args.background_color,
                  metallic_background_color=args.background_color,
                  roughness_background_color=args.background_color,
@@ -126,7 +139,7 @@ index 566ae4f..34f3c27 100644
                  skip_broken=True,
              ), 
              extra_dataset=ReconstructDataset(
-@@ -936,7 +1011,8 @@ def main(args):
+@@ -936,7 +1024,8 @@ def main(args):
                      image_ext='.mdb',
                      skip_broken=True,
                      rgb_background_color=args.background_color,
@@ -136,7 +149,7 @@ index 566ae4f..34f3c27 100644
                  ),
              ),
          )
-@@ -967,6 +1043,7 @@ def main(args):
+@@ -967,6 +1056,7 @@ def main(args):
                      bump_background_color=args.background_color,
                      metallic_background_color=args.background_color,
                      roughness_background_color=args.background_color,
@@ -144,7 +157,7 @@ index 566ae4f..34f3c27 100644
                      skip_broken=True,
                  ), 
                  extra_dataset=ReconstructDataset(
-@@ -974,7 +1051,8 @@ def main(args):
+@@ -974,7 +1064,8 @@ def main(args):
                      ReconstructDatasetConfig(
                          image_ext='.mdb',
                          rgb_background_color=args.background_color,
