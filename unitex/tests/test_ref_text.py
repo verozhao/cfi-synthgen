@@ -133,11 +133,18 @@ def test_dataset_blurs_the_reference_text(synth_ref):
 
 
 def test_dataset_needs_polygons_for_every_uid(synth_ref, tmp_path):
-    root, _ = synth_ref
+    root, out = synth_ref
     with pytest.raises(FileNotFoundError, match="2 of 2 uids"):
         fd.CFIFluxDataset(root, view_res=512, ref_text_dir=str(tmp_path), ref_text_blur=0.5)
     with pytest.raises(ValueError, match="needs ref_text_dir"):
         fd.CFIFluxDataset(root, view_res=512, ref_text_blur=0.5)
+    # with skip_broken a uid without polygons is a broken sample: the next uid is used instead
+    only_a = tmp_path / "only_a"
+    os.makedirs(only_a / "synth")
+    with open(rt.ref_json_path(out, "synth/a")) as f, open(rt.ref_json_path(str(only_a), "synth/a"), "w") as g:
+        g.write(f.read())
+    ds = fd.CFIFluxDataset(root, view_res=512, ref_text_dir=str(only_a), ref_text_blur=0.5, skip_broken=True)
+    assert ds[1]["uids"] == "synth/a" and ds.n_broken == 1
 
 
 class _DummyPipe:

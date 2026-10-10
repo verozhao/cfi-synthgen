@@ -212,8 +212,11 @@ class CFIFluxDataset(Dataset):
             from unitex import ref_text
             missing = [u for _, u in self.samples if not os.path.isfile(ref_text.ref_json_path(ref_text_dir, u))]
             if missing:
-                raise FileNotFoundError(f"{len(missing)} of {len(self.samples)} uids have no reference text "
-                                        f"polygons in {ref_text_dir} (first: {missing[0]})")
+                msg = (f"{len(missing)} of {len(self.samples)} uids have no reference text polygons in "
+                       f"{ref_text_dir} (first: {missing[0]})")
+                if not skip_broken:
+                    raise FileNotFoundError(msg)
+                print(f"[flux_dataset] {msg}: they count as broken samples", file=sys.stderr, flush=True)
 
     def __len__(self):
         return len(self.samples)
@@ -301,8 +304,11 @@ class CFIFluxDataset(Dataset):
             "ref_text_blurred": 0,
         }
         out.update(self.load_reference(ref_dir, k))
-        if self.ref_text_blur > 0 and random.random() < self.ref_text_blur:
+        if self.ref_text_blur > 0:
             from unitex import ref_text
+            if not os.path.isfile(ref_text.ref_json_path(self.ref_text_dir, uid)):
+                raise FileNotFoundError(f"no reference text polygons for {uid} in {self.ref_text_dir}")
+        if self.ref_text_blur > 0 and random.random() < self.ref_text_blur:
             polys, res = ref_text.load_ref_polys(self.ref_text_dir, uid, k)
             kw = {"max_height": self.ref_text_max_height} if self.ref_text_max_height else {}
             s = self.ref_res / res[0]
