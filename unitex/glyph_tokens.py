@@ -374,13 +374,14 @@ def encode_glyphs(instances, vae, sample_mode="sample", generator=None, device=N
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Target tokens inside text boxes (keep-mask boost)
+# Target tokens inside text boxes (keep-mask boost, text loss weight)
 # ────────────────────────────────────────────────────────────────────────────
 
-def text_token_mask(text, view_res=VIEW_RES, min_height_px=0.0, pad_tokens=0):
+def text_token_mask(text, view_res=VIEW_RES, min_height_px=0.0, pad_tokens=0, max_height_px=math.inf):
     """Bool [(R/16) * (6R/16)] over the target strip tokens (row-major like the packed target):
     True where the token's 16 x 16 px cell overlaps some item's view bbox, grown by pad_tokens
-    tokens and kept inside the item's view slot."""
+    tokens and kept inside the item's view slot. Only view boxes min_height_px to max_height_px
+    tall (px at view_res) count."""
     R = int(view_res)
     nr, nc = R // TOKEN_PX, 6 * R // TOKEN_PX
     m = np.zeros((nr, nc), bool)
@@ -393,7 +394,8 @@ def text_token_mask(text, view_res=VIEW_RES, min_height_px=0.0, pad_tokens=0):
             for k, v in (it.get("views") or {}).items():
                 if not (v.get("bbox") or v.get("quad")):
                     continue
-                if gl._view_height(v) < min_height_px:
+                h = gl._view_height(v)
+                if h < min_height_px or h > max_height_px:
                     continue
                 x0, y0, x1, y1 = gl._view_bbox(v)
                 off = FULL_INDEX.index(int(k)) * R
@@ -413,6 +415,28 @@ def boosted_keep_prob(keep_p, text_mask, boost):
     p = torch.full(text_mask.shape, float(keep_p), dtype=torch.float32)
     p[text_mask] = float(keep_p) + float(boost) * (1.0 - float(keep_p))
     return p
+
+
+def text_loss_weight(text, view_res, weight, max_height_1024=None):
+    """Float32 [(R/16) * (6R/16)] loss weight per target strip token: 1 + weight on the tokens of
+    text boxes up to max_height_1024 tall (px at 1024 per view, None or 0 = every box), 1 elsewhere."""
+    mh = float(max_height_1024) * int(view_res) / 1024 if max_height_1024 else math.inf
+    return 1.0 + float(weight) * text_token_mask(text, view_res, max_height_px=mh).float()
+
+
+def weighted_flow_loss(pred, target, keep, weighting, token_weight):
+    """The trainer's masked flow matching loss, sum(weighting * (keep * (pred - target))^2) / sum(keep),
+    as a weighted mean in which every latent value counts token_weight times. token_weight = 1
+    everywhere gives the trainer's loss."""
+    err = weighting.float() * ((pred * keep).float() - (target * keep).float()) ** 2
+    w = token_weight.float()
+    return torch.sum(w * err) / torch.sum(w * keep.float())
+
+
+def text_loss_share(keep, token_weight):
+    """Share of the loss weight that sits on weighted (text) latent values."""
+    w = token_weight.float() * keep.float()
+    return float(w[token_weight > 1].sum() / w.sum())
 
 
 # ────────────────────────────────────────────────────────────────────────────

@@ -301,6 +301,31 @@ def test_text_token_mask_and_boost():
     assert gt.text_token_mask("", 512).sum() == 0
 
 
+def test_text_loss_weight_and_weighted_loss():
+    small, big = [20, 40, 50, 60], [100, 100, 200, 148]          # 20 and 48 px tall at 512
+    text = {"res": 512, "items": [{"id": 0, "text": "A", "views": {"1": {"bbox": small}}},
+                                  {"id": 1, "text": "B", "views": {"1": {"bbox": big}}}]}
+    one = lambda b: gt.text_loss_weight({"res": 512, "items": [{"id": 0, "text": "A", "views": {"1": {"bbox": b}}}]},
+                                        512, 1.0, 0) > 1
+    w = gt.text_loss_weight(text, 512, 9.0, 64)                  # 64 px at 1024 = 32 at 512: the small box only
+    assert w.dtype == torch.float32 and set(w.unique().tolist()) == {1.0, 10.0}
+    assert torch.equal(w > 1, one(small))
+    assert torch.equal(gt.text_loss_weight(text, 512, 9.0, 0) > 1, one(small) | one(big))
+    assert torch.equal(gt.text_loss_weight(text, 1024, 9.0, 64) > 1,
+                       gt.text_token_mask({"res": 512, "items": text["items"][:1]}, 1024))
+    g = torch.Generator().manual_seed(0)
+    pred, target = torch.randn(1, 16, 8, 8, generator=g), torch.randn(1, 16, 8, 8, generator=g)
+    keep = (torch.rand(1, 16, 8, 8, generator=g) < 0.5).float()
+    weighting = torch.ones(1, 1, 1, 1)
+    trainer_loss = torch.sum(weighting * ((pred * keep) - (target * keep)) ** 2) / keep.sum()
+    assert float(gt.weighted_flow_loss(pred, target, keep, weighting, torch.ones_like(pred))) == float(trainer_loss)
+    tw = torch.ones_like(pred)
+    tw[..., :2, :] = 5.0
+    manual = (tw * keep * (pred - target) ** 2).sum() / (tw * keep).sum()
+    assert float(gt.weighted_flow_loss(pred, target, keep, weighting, tw)) == pytest.approx(float(manual), rel=1e-6)
+    assert gt.text_loss_share(keep, tw) == pytest.approx(float((tw * keep)[..., :2, :].sum() / (tw * keep).sum()))
+
+
 def test_glyph_config_json_and_overrides(tmp_path):
     cfg = gt.glyph_config('{"anchor_mode": "warp", "stages": [[100, 1, 0, 0], ["inf", 0, 0, 1]]}',
                           ["token_budget=512", "aug_scale=[0.9, 1.1]", "drop_flags=[]"])
@@ -670,6 +695,17 @@ def worker(spec):
 
     trainer.transformer.register_forward_pre_hook(pre, with_kwargs=True)
     trainer.transformer.register_forward_hook(post, with_kwargs=True)
+    if spec.get("capture_text_loss"):
+        g = tm.glyph_tokens()
+        orig_wfl = g.weighted_flow_loss
+
+        def wfl(pred, target, keep, weighting, token_weight):
+            loss = orig_wfl(pred, target, keep, weighting, token_weight)
+            torch.save({k: v.detach().cpu() for k, v in (("pred", pred), ("target", target), ("keep", keep),
+                                                          ("weighting", weighting), ("token_weight", token_weight))},
+                       os.path.join(out_dir, "text_loss.pt"))
+            return loss
+        g.weighted_flow_loss = wfl
     losses = []
     orig_backward = accelerator.backward
 
@@ -824,6 +860,29 @@ def test_text_keep_boost(tmp_path, patched, pretrained, sample_real):
     kept[tgt[:, 1].long(), tgt[:, 2].long()] = True
     assert m.sum() > 0 and bool(kept[m].all())         # every text token kept at boost 1
     assert one["calls"][0]["n_tokens"] > z["calls"][0]["n_tokens"]
+
+
+def test_text_loss_weight(tmp_path, patched, pretrained, sample512):
+    """--text_loss_weight: weights of 1 give the original loss, and the weight sits on the latent
+    values of the small text boxes (2 x 2 latent pixels per token, every channel)."""
+    base = run_worker(tmp_path, patched, pretrained, sample512, argv=["--zero_text_embeds"])
+    ones = run_worker(tmp_path, patched, pretrained, sample512, capture_text_loss=True,
+                      argv=["--zero_text_embeds", "--text_loss_weight", "9", "--text_loss_max_height", "1"])
+    on = run_worker(tmp_path, patched, pretrained, sample512, capture_text_loss=True,
+                    argv=["--zero_text_embeds", "--text_loss_weight", "9"])
+    assert ones["losses"][0] == pytest.approx(base["losses"][0], rel=1e-6)
+    c = torch.load(os.path.join(on["out_dir"], "text_loss.pt"))
+    text = torch.load(str(sample512))["text_json"]
+    m = gt.text_token_mask(text, 512, max_height_px=32).reshape(32, 192)     # SIDE and BACK PANEL, not FRONT LABEL
+    every = gt.text_token_mask(text, 512).reshape(32, 192)
+    assert m.any() and (every & ~m).any() and not (m & ~every).any()
+    want = 1 + 9 * m.float().repeat_interleave(2, 0).repeat_interleave(2, 1)
+    assert c["token_weight"].shape == (1, 16, 64, 384)
+    assert torch.equal(c["token_weight"], want.expand(1, 16, 64, 384))
+    tw = c["token_weight"]
+    manual = (tw * c["weighting"] * (c["keep"] * (c["pred"] - c["target"])) ** 2).sum() / (tw * c["keep"]).sum()
+    assert on["losses"][0] == pytest.approx(float(manual), rel=1e-5)
+    assert on["losses"][0] != pytest.approx(base["losses"][0], rel=1e-3)
 
 
 @pytest.mark.skipif(not SLOW, reason="FLUX_TEST_SLOW=0")
