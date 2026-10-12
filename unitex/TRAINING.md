@@ -136,6 +136,9 @@ fixed_font_px=12 fixed_line_px=16 fixed_margin_px=0`. The trainer writes the res
 | `--zero_text_embeds` | off | zero T5 `[B, 512, 4096]` and CLIP `[B, 768]` like UniTEX inference, text encoders not loaded |
 | `--train_x_embedder` | off | put `x_embedder` back in `modules_to_save` and make it trainable |
 | `--text_keep_boost b` | 0 | noise drop keeps text-box target tokens with `p + b(1 - p)` (p = 0.25 at the default drop) |
+| `--glyph_layout` | off | every text line drawn at its place and size in each view (`unitex/glyph_layout.py`), VAE-encoded, on 64 extra input channels of the target tokens through a zero-initialised projection next to `x_embedder` |
+| `--glyph_layout_config` / `--glyph_layout_set k=v ...` | none | LayoutConfig (which lines, drops, share of edge-map lines) |
+| `--glyph_layout_probe_every N` | 0 | every N steps one more forward without the layout, logs the drawn small-text loss with and without it |
 
 Other changes in the patch: position ids are built in fp32 everywhere (trainer call sites and
 `_prepare_latent_image_ids` in both task pipelines), the loss slice is `model_pred[:, :n_noise]`,
@@ -145,6 +148,16 @@ Other changes in the patch: position ids are built in fp32 everywhere (trainer c
 (it raised `NameError` on import without `CAUGHT_ALL_EXCEPTIONS=1`).
 
 ## 4. Recommendations
+
+- **Glyph layout instead of glyph tokens.** Appended glyph tokens reach the target only through
+  attention, placed by their position ids, and the trained LoRAs ignore them (same output with and
+  without glyphs). In training they were jittered by up to 2 tokens at 1024 and fixed renders are
+  2 to 5 times the height of small text, so a patch almost never lies on its letters at their size.
+  `--glyph_layout` gives target token (r, c) the latent of the layout pixels it covers. Train it with
+  `GLYPH_ARGS=""` (no glyph tokens), the reference text blur and `--text_loss_weight`, which then
+  only covers the lines drawn in that sample's layout. The projection is saved as
+  `glyph_layout_proj.safetensors` next to every `pytorch_lora_weights.safetensors`, and
+  `run_unitex.py --glyph-layout` loads it. `layout_probe_rank<r>.jsonl` in the output dir has the probe.
 
 - **Warm start from the released LoRA** through `checkpoint-0` as above. It needs `--lora_rank 16
   --lora_alpha 16` and the default target modules (no `--lora_layers`), which match the 684 LoRA

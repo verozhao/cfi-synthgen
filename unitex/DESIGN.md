@@ -128,3 +128,20 @@ text are reported separately.
 - Inference layout: OCR the photo, map boxes into the front view (affine fit of the photo's
   foreground bbox onto the mesh's front silhouette), lift through the front CCM onto the
   surface, re-project into all six views with a visibility test (`unitex/anchors.py`).
+
+## Glyph layout inside UniTEX-FLUX (step 5)
+
+- The text of every line is drawn dark on white into its view quad, stretched to fill it, in every
+  view where the line is visible enough: a layout strip at the target's size (`unitex/glyph_layout.py`).
+  Kind `font` draws the OCR text. Kind `edges` draws Canny edges of the view's own pixels inside the
+  quad (training: the target view, inference: the photo registered into the front view).
+- The strip is VAE-encoded (posterior mode), packed like the target, and the packed latent of a white
+  strip is subtracted. Token (r, c) of the target gets those 64 numbers as extra input channels, the
+  condition and glyph tokens get zeros. `x_embedder` is wrapped: the first 64 channels go through the
+  original layer, the extra 64 through a bias-free projection that starts at zero, so a warm-started
+  LoRA gives exactly its old output until the projection learns.
+- No position ids, no attention routing and no jitter: the layout sits on the target pixels it
+  describes, at their size. This is how FLUX.1 Canny / Depth take their control image.
+- Training lines: every text.json line passing the filters (generated text included by default),
+  15% of lines and 10% of whole layouts dropped so the model keeps painting from the reference, 30%
+  of lines drawn as edges. With `--text_loss_weight` only drawn lines are weighted.

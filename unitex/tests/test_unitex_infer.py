@@ -20,6 +20,7 @@ Run: python -m pytest unitex/tests/test_unitex_infer.py -v      (INFER_TEST_SLOW
 """
 
 import ast
+import contextlib
 import importlib.util
 import json
 import os
@@ -38,6 +39,7 @@ sys.path.insert(0, REPO)
 sys.path.insert(1, os.path.join(REPO, "unitex"))
 from unitex import glyph as gl
 from unitex import glyph_ids as gid
+from unitex import glyph_layout as gla
 from unitex import glyph_tokens as gt
 import run_unitex  # noqa: E402  (unitex/run_unitex.py, a script)
 
@@ -301,6 +303,56 @@ def test_b_glyph_input_validation(pipes):
 # ────────────────────────────────────────────────────────────────────────────
 # (c) 1024 px per view: fp32 ids, no collisions
 # ────────────────────────────────────────────────────────────────────────────
+
+@contextlib.contextmanager
+def _wrapped(tr, weight=None):
+    """The session's tiny transformer with its x_embedder wrapped for layout channels, restored after."""
+    orig = tr.x_embedder
+    try:
+        yield gla.wrap_x_embedder(tr, weight, dtype=torch.bfloat16)
+    finally:
+        tr.x_embedder = orig
+
+
+def _layout(R, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(1, _n_tokens(R)[0], 64, generator=g).to(torch.bfloat16)
+
+
+def test_b_glyph_layout_zero_projection_changes_nothing(pipes, tiny):
+    base = _run(pipes["patched"], 64)
+    with _wrapped(tiny[0]):
+        lay = _run(pipes["patched"], 64, glyph_layout=_layout(64))
+        plain = _run(pipes["patched"], 64)
+    assert np.array_equal(base, lay) and np.array_equal(base, plain)
+
+
+def test_b_glyph_layout_channels_reach_the_target_tokens_only(pipes, tiny):
+    R = 64
+    nn, nc, nd = _n_tokens(R)
+    lay = _layout(R)
+    w = torch.randn(tiny[0].x_embedder.out_features, 64, generator=torch.Generator().manual_seed(1)) * 0.05
+    base = _run(pipes["patched"], R)
+    with _wrapped(tiny[0], w):
+        with Capture(tiny[0]) as cp:
+            out = _run(pipes["patched"], R, glyph_layout=lay)
+    hs = cp.calls[0]["hidden_states"]
+    assert len(cp.calls) == 2 and hs.shape == (1, nn + nc + nd, 128)
+    assert torch.equal(hs[:, :nn, 64:], lay) and not hs[:, nn:, 64:].any()
+    assert torch.equal(cp.calls[1]["hidden_states"][..., 64:], hs[..., 64:])      # the same layout every step
+    assert pipes["patched"]._last_layout_tokens == nn
+    assert not np.array_equal(out, base)
+
+
+def test_b_glyph_layout_validation(pipes, tiny):
+    with pytest.raises(ValueError, match="wrapped"):
+        _run(pipes["patched"], 64, glyph_layout=_layout(64))
+    with _wrapped(tiny[0]):
+        with pytest.raises(ValueError, match="does not match"):
+            _run(pipes["patched"], 64, glyph_layout=_layout(64)[:, :-1])
+        _run(pipes["patched"], 64)
+        assert pipes["patched"]._last_layout_tokens == 0
+
 
 def _unique_rows(t):
     return torch.unique(t, dim=0).shape[0]
@@ -621,6 +673,66 @@ def test_infer_mv_with_the_tiny_flux_pipeline(repos, pipes, eval2, tmp_path):
     assert a.shape == (1024, 1536, 3)
 
 
+class LayoutFlux(FakeFlux):
+    """FakeFlux with a VAE (infer_mv encodes the layout with pipeline.vae) that reports the layout
+    tokens it took, or none when ignore is set."""
+
+    def __init__(self, vae, ignore=False):
+        super().__init__()
+        self.vae, self.ignore, self._last_layout_tokens = vae, ignore, 0
+
+    def __call__(self, **kw):
+        lay = kw.get("glyph_layout")
+        self._last_layout_tokens = 0 if lay is None or self.ignore else int(lay.shape[1])
+        return super().__call__(**kw)
+
+
+@pytest.mark.parametrize("tokens", [True, False])
+def test_glyph_layout_goes_to_the_texture_pass_only(repos, tiny, eval2, tmp_path, tokens):
+    flux = LayoutFlux(tiny[1])
+    C = unitex_classes(repos["patched"], flux=flux)
+    pipe = C.CustomRGBTextureFullPipeline(seed=0, glyph_layout=True, glyph_tokens=tokens, glyph_delight=True)
+    pipe.infer_mv(str(tmp_path), *_grids(str(tmp_path), 512), glyph_text=_text(eval2))
+    tex, dl = [c[1] for c in flux.calls if c[0] == "call"]
+    n = _n_tokens(512)[0]
+    assert tex["glyph_layout"].shape == (1, n, 64) and "glyph_layout" not in dl
+    assert ("glyph_instances" in tex) == tokens and ("glyph_instances" in dl) == tokens
+    info = json.load(open(tmp_path / "glyph_layout.json"))
+    assert info == json.loads(json.dumps(pipe.last_layout_info))
+    assert info["n_lines"] > 0 and info["n_tokens"] == n and 0 < info["strong_tokens"] < n // 4
+    assert Image.open(tmp_path / "glyph_layout.png").size == (6 * 512, 512)
+    assert (tmp_path / "glyph_tokens.json").exists() == tokens
+    # run_unitex --dry-run draws the same lines without UniTEX
+    _, dry = run_unitex.layout_summary(_text(eval2), gla.LayoutConfig(), 512)
+    assert dry["lines"] == info["lines"] and dry["per_view"] == info["per_view"]
+    # a texture pass that does not take the layout is an error, not a silent stock run
+    C2 = unitex_classes(repos["patched"], flux=LayoutFlux(tiny[1], ignore=True))
+    pipe2 = C2.CustomRGBTextureFullPipeline(seed=0, glyph_layout=True)
+    with pytest.raises(RuntimeError, match="glyph layout"):
+        pipe2.infer_mv(str(tmp_path), *_grids(str(tmp_path), 512), glyph_text=_text(eval2))
+
+
+def test_use_texture_lora_wraps_x_embedder_with_the_projection(tmp_path):
+    from safetensors.torch import save_file
+    t = torch.nn.Module()
+    t.x_embedder = torch.nn.Linear(64, 32)
+    t.config = types.SimpleNamespace(in_channels=64)
+    loaded = []
+    pipe = types.SimpleNamespace(
+        pipeline=types.SimpleNamespace(transformer=t, load_lora_weights=lambda p, adapter_name: loaded.append(p)),
+        adapter_names=["texture", "delight"], weights_for_texture=[1.0, 0.0], weights_for_delight=[0.0, 1.0])
+    lora = tmp_path / "pytorch_lora_weights.safetensors"
+    lora.write_bytes(b"")
+    with pytest.raises(FileNotFoundError):
+        run_unitex.use_texture_lora(pipe, str(lora), layout=True)
+    assert loaded == [] and pipe.adapter_names == ["texture", "delight"]
+    w = torch.randn(32, 64)
+    save_file({gla.PROJ_KEY: w}, str(tmp_path / gla.LAYOUT_PROJ_FILE))
+    run_unitex.use_texture_lora(pipe, str(lora), layout=True)
+    assert torch.equal(t.x_embedder.layout_proj.weight, w) and loaded == [str(lora)]
+    assert pipe.weights_for_texture == [0.0, 0.0, 1.0] and pipe.weights_for_delight == [0.0, 1.0, 0.0]
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # (d) run_unitex.py --dry-run and run_eval.sh
 # ────────────────────────────────────────────────────────────────────────────
@@ -694,6 +806,29 @@ def test_d_missing_text_json_and_flag_validation(eval2, tmp_path):
                 ["--glyph-json-name", "text.json", "--view-res", "768"], ["--view-res", "500"]):
         r = _run_unitex("--eval-dir", eval2, "--dry-run", "--run-name", "bad", *bad)
         assert r.returncode == 2, (bad, r.stderr)
+
+
+def test_d_dry_run_glyph_layout(eval2):
+    r = _run_unitex("--eval-dir", eval2, "--dry-run", "--run-name", "layout_dry", "--glyph-json-name", "text.json",
+                    "--glyph-layout", "--no-glyph-tokens", "--glyph-layout-set", "min_height_px=4")
+    assert r.returncode == 0, r.stderr
+    recs = _log(eval2, "layout_dry")
+    assert len(recs) == 2
+    for rec in recs:
+        g = rec["glyph"]
+        assert rec["status"] == "ok" and g["tokens"] is False
+        assert g["layout"]["kind"] == "font" and g["layout"]["config"]["min_height_px"] == 4
+        cache = os.path.join(eval2, rec["sku"], "layout_dry", "cache")
+        assert not os.path.exists(os.path.join(cache, "glyph_tokens.json"))
+        info = json.load(open(os.path.join(cache, "glyph_layout.json")))
+        assert info["n_lines"] == g["layout"]["n_lines"] > 0 and info["per_view"] == g["layout"]["per_view"]
+    for bad in (["--glyph-layout"], ["--glyph-json-name", "text.json", "--no-glyph-tokens"],
+                ["--glyph-json-name", "text.json", "--glyph-layout-kind", "edges"],
+                ["--glyph-json-name", "text.json", "--glyph-layout", "--glyph-layout-set", "nope=1"]):
+        r = _run_unitex("--eval-dir", eval2, "--dry-run", "--run-name", "bad", *bad)
+        assert r.returncode == 2, (bad, r.stderr)
+    r = _run_unitex("--eval-dir", eval2, "--run-name", "bad", "--glyph-json-name", "text.json", "--glyph-layout")
+    assert r.returncode == 2 and "--texture-lora" in r.stderr
 
 
 def test_d_run_eval_sh_anchors_and_glyph_passthrough(tmp_path):

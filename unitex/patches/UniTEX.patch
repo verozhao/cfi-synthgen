@@ -85,7 +85,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
      @torch.no_grad()
      @replace_example_docstring(EXAMPLE_DOC_STRING)
      def __call__(
-@@ -428,6 +474,13 @@
+@@ -428,6 +474,14 @@
          callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
          callback_on_step_end_tensor_inputs: List[str] = ["latents"],
          max_sequence_length: int = 512,
@@ -96,10 +96,11 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
 +        glyph_generator: Optional[torch.Generator] = None,
 +        mu: Optional[float] = None,
 +        pos_scale: float = 1.0,
++        glyph_layout: Optional[torch.FloatTensor] = None,
      ):
          r"""
          Function invoked when calling the pipeline for generation.
-@@ -490,6 +543,10 @@
+@@ -490,6 +544,14 @@
                  will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
                  `._callback_tensor_inputs` attribute of your pipeline class.
              max_sequence_length (`int` defaults to 512): Maximum sequence length to use with the `prompt`.
@@ -107,10 +108,14 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
 +                `prepare_glyph_tokens`). Appended after the control and reference tokens, so like them
 +                they are re-inserted clean at every step and stripped before decoding. None (default)
 +                runs the stock pipeline.
++            glyph_layout: CFI glyph layout channels [1 | B, n_target, 4C] (cfi-synthgen
++                unitex/glyph_layout.py encode_layout), concatenated to the target tokens' latent
++                channels at every step (zeros for condition and glyph tokens). Needs the transformer's
++                x_embedder wrapped with its trained projection (glyph_layout.wrap_x_embedder).
  
          Examples:
  
-@@ -577,6 +634,7 @@
+@@ -577,6 +639,7 @@
          )
          latents = noise_latents
          latent_image_ids = noise_ids
@@ -118,7 +123,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
          if dual_latents is not None and control_latents is not None:
              condition_latents = torch.cat([control_latents, dual_latents], dim=1)
              condition_ids = torch.cat([control_ids, dual_ids], dim=0)
-@@ -589,17 +647,37 @@
+@@ -589,17 +652,37 @@
          else:
              condition_latents = None
              condition_ids = None
@@ -163,7 +168,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
          timesteps, num_inference_steps = retrieve_timesteps(
              self.scheduler,
              num_inference_steps,
-@@ -627,9 +705,16 @@
+@@ -627,9 +710,34 @@
          else:
              prompt_image_embeds = prompt_embeds
              text_image_ids = text_ids
@@ -177,19 +182,41 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
 +            # the tokens on the 512 layout, where the control sits 32 rows below the target.
 +            latent_image_ids = latent_image_ids.clone()
 +            latent_image_ids[:, 1:] = latent_image_ids[:, 1:] * float(pos_scale)
++        layout_full = None
++        if glyph_layout is not None:
++            # CFI glyph layout: extra input channels of the target tokens (zeros for every other
++            # token), read by the projection next to x_embedder. The scheduler never sees them.
++            if not hasattr(self.transformer.x_embedder, 'layout_proj'):
++                raise ValueError('glyph_layout needs transformer.x_embedder wrapped with its trained projection '
++                                 '(cfi-synthgen unitex/glyph_layout.py wrap_x_embedder, run_unitex.py --glyph-layout)')
++            glyph_layout = torch.as_tensor(glyph_layout).to(device=latents.device, dtype=latents.dtype)
++            if glyph_layout.ndim == 2:
++                glyph_layout = glyph_layout.unsqueeze(0)
++            if glyph_layout.ndim != 3 or glyph_layout.shape[1] != n_noise or glyph_layout.shape[2] != latents.shape[2]:
++                raise ValueError(f'glyph_layout {tuple(glyph_layout.shape)} does not match the {n_noise} target tokens '
++                                 f'of {latents.shape[2]} channels')
++            if glyph_layout.shape[0] == 1 and latents.shape[0] > 1:
++                glyph_layout = glyph_layout.repeat(latents.shape[0], 1, 1)
++            layout_full = torch.cat([glyph_layout, glyph_layout.new_zeros(
++                glyph_layout.shape[0], latents.shape[1] - n_noise, glyph_layout.shape[2])], dim=1)
++        self._last_layout_tokens = 0 if layout_full is None else int(n_noise)
          with self.progress_bar(total=num_inference_steps) as progress_bar:
              for i, t in enumerate(timesteps):
                  if self.interrupt:
-@@ -642,7 +727,7 @@
+@@ -642,9 +750,10 @@
                  # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                  timestep = t.expand(latents.shape[0]).to(latents.dtype)
                  if condition_latents is not None:
 -                    latents = torch.cat([latents[:, :-condition_latents.shape[1]], condition_latents], dim=1)
 +                    latents = torch.cat([latents[:, :n_noise], condition_latents], dim=1)
                  noise_pred = self.transformer(
-                     hidden_states=latents,  # vae: [1, 8192, 64], change dim to 3072
+-                    hidden_states=latents,  # vae: [1, 8192, 64], change dim to 3072
++                    # vae: [1, 8192, 64], change dim to 3072 (CFI: + 64 layout channels with glyph_layout)
++                    hidden_states=latents if layout_full is None else torch.cat([latents, layout_full], dim=-1),
                      timestep=timestep / 1000,
-@@ -681,7 +766,7 @@
+                     guidance=guidance,
+                     pooled_projections=pooled_prompt_embeds,  # clip: [1, 768]
+@@ -681,7 +790,7 @@
                      xm.mark_step()
  
          if condition_latents is not None:
@@ -217,7 +244,7 @@ diff --git a/pipeline.py b/pipeline.py
          quantization_config = BitsAndBytesConfig(
              load_in_4bit=True,
              bnb_4bit_quant_type="nf4",
-@@ -136,8 +138,48 @@
+@@ -136,8 +138,57 @@
  
  
  
@@ -237,11 +264,20 @@ diff --git a/pipeline.py b/pipeline.py
  class RGBTextureFullPipelineBase:
 -    def __init__(self, pretrain_models=None, pipeline_name='texture_plus',super_resolutions=False, seed=0, speedup_mode=None,add_lora_path=None, add_lora_weights=None, filt_gradient_points=False,filt_large_angle_points=True, enable_rembg=False):
 +    # CFI: view_res / glyph options below (unitex/patches/UniTEX.patch in cfi-synthgen)
-+    GLYPH_API = 4     # 2: shift_mu, 3: pos_scale, 4: delight_res
++    GLYPH_API = 5     # 2: shift_mu, 3: pos_scale, 4: delight_res, 5: glyph_layout / glyph_tokens
 +
 +    def __init__(self, pretrain_models=None, pipeline_name='texture_plus',super_resolutions=False, seed=0, speedup_mode=None,add_lora_path=None, add_lora_weights=None, filt_gradient_points=False,filt_large_angle_points=True, enable_rembg=False,
 +                 view_res=512, glyph_config=None, glyph_delight=False, glyph_sample_mode='argmax',
-+                 shift_mu=None, pos_scale=None, delight_res=None):
++                 shift_mu=None, pos_scale=None, delight_res=None,
++                 glyph_layout=False, glyph_layout_config=None, glyph_tokens=True):
++        # glyph_layout: draw the glyph text.json's lines at their place and size (cfi-synthgen
++        # unitex/glyph_layout.py) and feed them to the texture pass as extra input channels of the
++        # target tokens (needs a LoRA trained with --glyph_layout). glyph_layout_config: LayoutConfig
++        # or JSON. glyph_tokens=False keeps the text for the layout only (no appended glyph tokens).
++        self.glyph_layout = bool(glyph_layout)
++        self.glyph_layout_config = glyph_layout_config
++        self.glyph_tokens = bool(glyph_tokens)
++        self.last_layout_info = None
 +        # view_res: px per view of the FLUX strip (view_res x 6 view_res) and of the geometry grids.
 +        # The released LoRAs were trained at 512. glyph_config: unitex.glyph.GlyphConfig, or a JSON
 +        # path / inline JSON for unitex.glyph_tokens.glyph_config (None: GlyphConfig defaults).
@@ -267,7 +303,7 @@ diff --git a/pipeline.py b/pipeline.py
          pipeline,weights_for_texture,weights_for_delight,adapter_names = build_pipeline(pretrain_models=pretrain_models, pipeline_name=pipeline_name,speedup_mode = speedup_mode, add_lora_path=add_lora_path,add_lora_weights=add_lora_weights, model='rgb')
          if enable_rembg:
              rembg_session = build_rembg()
-@@ -184,31 +226,34 @@
+@@ -184,31 +235,34 @@
  
      @CPUTimer('preprocess_reference_image')
      def preprocess_reference_image(self, save_dir, input_image_path, scale=0.95, color='grey'):
@@ -308,10 +344,43 @@ diff --git a/pipeline.py b/pipeline.py
              fov_deg=49.1,
              scale=scale,
              perspective=False,
-@@ -231,20 +276,66 @@
+@@ -231,20 +285,104 @@
          torch.save(camera_info, os.path.join(save_dir, 'camera_info.pth'))
  
  
++    def prepare_glyph_layout(self, save_dir, glyph_text):
++        """text.json (path / dict) -> layout channels [1, n_target, 64] for PBRFluxPipeline (glyph_layout),
++        plus <save_dir>/glyph_layout.png (the drawn strip) and glyph_layout.json (lines, config)."""
++        import torch
++        from unitex import glyph_layout as gla       # cfi-synthgen on PYTHONPATH
++        from unitex import glyph_tokens as gt
++        cfg = self.glyph_layout_config
++        if cfg is None:
++            cfg = gla.LayoutConfig()
++        elif not isinstance(cfg, gla.LayoutConfig):
++            cfg = gla.layout_config(cfg)
++        R = getattr(self, 'view_res', 512)
++        text = gt.load_text(glyph_text)
++        views = None
++        if cfg.infer_kind == 'edges' and text is not None and text.get('front_image'):
++            views = [gt.front_view_image(text['front_image'], text.get('_dir'), R)] + [None] * 5
++        strip, info = gla.layout_strip(text, R, cfg, rng=None, views=views)
++        Image.fromarray(strip).save(os.path.join(save_dir, 'glyph_layout.png'))
++        tokens = gla.encode_layout(strip, self.pipeline.vae, dtype=torch.bfloat16)
++        self.last_layout_info = {
++            'text_json': glyph_text if isinstance(glyph_text, str) else None,
++            'view_res': R, 'n_lines': info['n_lines'], 'kinds': info['kinds'], 'per_view': info['per_view'],
++            # the VAE's group norms move every token a little, the text tokens stand out
++            'n_tokens': int(tokens.shape[1]),
++            'strong_tokens': int((tokens.abs().amax(-1) > 0.1 * tokens.abs().max().clamp_min(1e-12)).sum()),
++            'lines': [dict({k: ln[k] for k in ('item_id', 'raw_view', 'text', 'kind')}, height=round(ln['height'], 1))
++                      for ln in info['lines']],
++            'config': gla.layout_config_dict(cfg),
++        }
++        with open(os.path.join(save_dir, 'glyph_layout.json'), 'w') as f:
++            json.dump(self.last_layout_info, f, indent=1)
++        return tokens
++
 +    def prepare_glyphs(self, save_dir, glyph_text):
 +        """text.json (path / dict, photo-lift layout from cfi-synthgen unitex/anchors.py) -> kwargs
 +        for PBRFluxPipeline, plus a summary in self.last_glyph_info and <save_dir>/glyph_tokens.json."""
@@ -364,7 +433,12 @@ diff --git a/pipeline.py b/pipeline.py
 +        if reference_image.size != (R, R):
 +            raise ValueError(f'{input_image_path} is {reference_image.size}, expected ({R}, {R})')
 +        self.last_glyph_info = None
-+        glyph_kwargs = self.prepare_glyphs(save_dir, glyph_text) if glyph_text is not None else {}
++        self.last_layout_info = None
++        use_tokens = glyph_text is not None and getattr(self, 'glyph_tokens', True)
++        glyph_kwargs = self.prepare_glyphs(save_dir, glyph_text) if use_tokens else {}
++        layout_kwargs = {}
++        if glyph_text is not None and getattr(self, 'glyph_layout', False):
++            layout_kwargs = {'glyph_layout': self.prepare_glyph_layout(save_dir, glyph_text)}
          if self.pipeline_name == 'texture_plus':
              # NOTE: frtbld -> frbltd
 -            img_temp = np.array(control_image).reshape(2, 512, 3, 512, -1)
@@ -379,7 +453,7 @@ diff --git a/pipeline.py b/pipeline.py
              self.pipeline.set_adapters(adapter_names=self.adapter_names, adapter_weights=self.weights_for_texture)
              out = self.pipeline(
                  prompt='[MVFLUX]',
-@@ -252,37 +343,51 @@
+@@ -252,37 +390,54 @@
                  dual_image=reference_image,
                  prompt_embeds=None,
                  pooled_prompt_embeds=None,
@@ -396,7 +470,10 @@ diff --git a/pipeline.py b/pipeline.py
 +                **({} if getattr(self, 'shift_mu', None) is None else {'mu': self.shift_mu}),
 +                **({} if getattr(self, 'pos_scale', None) is None else {'pos_scale': self.pos_scale}),
 +                **glyph_kwargs,
++                **layout_kwargs,
              )
++            if layout_kwargs and getattr(self.pipeline, '_last_layout_tokens', 0) != self.last_layout_info['n_tokens']:
++                raise RuntimeError('glyph layout: the texture pass did not take the layout channels')
 +            if glyph_kwargs:
 +                n_enc = getattr(self.pipeline, '_last_n_glyph_tokens', None)
 +                if n_enc != self.last_glyph_info['n_tokens']:
@@ -438,7 +515,7 @@ diff --git a/pipeline.py b/pipeline.py
              
              if self.super_resolutions:
                  mv_rgb.save(os.path.join(save_dir, 'mv_rgb_lr.png'))
-@@ -576,13 +681,13 @@
+@@ -576,13 +731,13 @@
  
  
  class RGBTextureFullPipeline(RGBTextureFullPipelineBase):
@@ -454,7 +531,7 @@ diff --git a/pipeline.py b/pipeline.py
  
      def step_2_1(self, cache_dir:str, input_image_path:str, input_mesh_path:str, clear_cache=False, *args, **kwargs):
          self.reproject_and_query_field(cache_dir, os.path.join(cache_dir, 'processed_mesh.obj'), os.path.join(cache_dir, 'mv_rgb.png'), os.path.join(cache_dir, 'camera_info.pth'), inpainting=False)
-@@ -607,7 +712,9 @@
+@@ -607,7 +762,9 @@
          input_image_path:str, 
          input_mesh_path:str, 
          clear_cache=False,
@@ -464,7 +541,7 @@ diff --git a/pipeline.py b/pipeline.py
          os.makedirs(save_dir, exist_ok=True)
          cache_dir = os.path.join(os.path.abspath(save_dir), 'cache')
          os.makedirs(cache_dir, exist_ok=True)
-@@ -616,6 +723,7 @@
+@@ -616,6 +773,7 @@
              input_image_path=input_image_path, 
              input_mesh_path=input_mesh_path, 
              clear_cache=clear_cache,

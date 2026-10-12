@@ -63,8 +63,14 @@ unitex/setup_unitex.sh, and this repo importable; all off by default, which runs
                              texture pass, the delight pass keeps the released delight LoRA. A
                              checkpoint warm-started from mv_lora_weights already holds the released
                              weights, so --add-lora-path (stacked on both passes) would apply them twice
+  --glyph-layout             draw the glyph json's lines at their place and size (unitex/glyph_layout.py)
+                             and feed them to the texture pass on extra input channels of the target
+                             tokens. Needs a --texture-lora trained with --glyph_layout, whose
+                             glyph_layout_proj.safetensors sits next to it. --glyph-layout-kind font |
+                             edges, --glyph-layout-set k=v, --no-glyph-tokens (the layout only)
   Added outputs: cache/glyph_tokens.json (instances, token counts, config); run_log.jsonl and
   run_info.json get "view_res" and "glyph" (settings, n_instances, n_tokens, tokens_per_view).
+  With --glyph-layout also cache/glyph_layout.png (the drawn strip) and glyph_layout.json.
 
 Usage (GPU server):
   cd /path/to/UniTEX && python /path/to/cfi-synthgen/unitex/run_unitex.py \\
@@ -204,6 +210,37 @@ def glyph_summary(glyph_text, cfg, view_res, delight, sample_mode):
 
 
 GLYPH_LOG_KEYS = ("text_json_res", "n_items", "n_instances", "n_tokens", "tokens_per_view")
+LAYOUT_LOG_KEYS = ("n_lines", "kinds", "per_view", "n_tokens", "strong_tokens")
+
+
+def make_layout_config(args):
+    """LayoutConfig from --glyph-layout-set, then --glyph-layout-kind."""
+    glyph_modules()
+    from unitex import glyph_layout as gla
+    overrides = list(args.glyph_layout_set or [])
+    if args.glyph_layout_kind:
+        overrides.append(f"infer_kind={args.glyph_layout_kind}")
+    return gla.layout_config(None, overrides)
+
+
+def layout_summary(glyph_text, cfg, view_res):
+    """The layout lines for one asset (no VAE) -> the summary keys the patched UniTEX writes to
+    cache/glyph_layout.json, for --dry-run."""
+    glyph_modules()
+    from unitex import glyph_layout as gla
+    from unitex import glyph_tokens as gt
+    text = gt.load_text(glyph_text)
+    views = None
+    if cfg.infer_kind == "edges" and text is not None and text.get("front_image"):
+        views = [gt.front_view_image(text["front_image"], text.get("_dir"), view_res)] + [None] * 5
+    strip, info = gla.layout_strip(text, view_res, cfg, rng=None, views=views)
+    n = (view_res // 16) * (6 * view_res // 16)
+    return strip, {"text_json": glyph_text if isinstance(glyph_text, str) else None, "view_res": view_res,
+                   "n_lines": info["n_lines"], "kinds": info["kinds"], "per_view": info["per_view"],
+                   "n_tokens": n, "strong_tokens": None,
+                   "lines": [dict({k: ln[k] for k in ("item_id", "raw_view", "text", "kind")},
+                                  height=round(ln["height"], 1)) for ln in info["lines"]],
+                   "config": gla.layout_config_dict(cfg)}
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -264,7 +301,8 @@ class FakePipeline:
     is written like the patched UniTEX does, so token counts in the log are the real ones."""
 
     def __init__(self, seed=0, view_res=512, glyph_config=None, glyph_delight=False,
-                 glyph_sample_mode="argmax", **kwargs):
+                 glyph_sample_mode="argmax", glyph_layout=False, glyph_layout_config=None, glyph_tokens=True,
+                 **kwargs):
         self.seed = seed
         self.generator = None
         self.rembg_session = None
@@ -272,7 +310,11 @@ class FakePipeline:
         self.glyph_config = glyph_config
         self.glyph_delight = glyph_delight
         self.glyph_sample_mode = glyph_sample_mode
+        self.glyph_layout = glyph_layout
+        self.glyph_layout_config = glyph_layout_config
+        self.glyph_tokens = glyph_tokens
         self.last_glyph_info = None
+        self.last_layout_info = None
         self.kwargs = kwargs
 
     def __call__(self, save_dir, input_image_path, input_mesh_path, clear_cache=False, glyph_text=None):
@@ -284,11 +326,17 @@ class FakePipeline:
         for d in (cache, os.path.join(cache, "wo_LTM"), os.path.join(cache, "w_LTM")):
             os.makedirs(d, exist_ok=True)
         self.last_glyph_info = None
-        if glyph_text is not None:
+        self.last_layout_info = None
+        if glyph_text is not None and self.glyph_tokens:
             _, self.last_glyph_info = glyph_summary(glyph_text, self.glyph_config, R, self.glyph_delight,
                                                     self.glyph_sample_mode)
             with open(os.path.join(cache, "glyph_tokens.json"), "w") as f:
                 json.dump(self.last_glyph_info, f, indent=1)
+        if glyph_text is not None and self.glyph_layout:
+            strip, self.last_layout_info = layout_summary(glyph_text, self.glyph_layout_config, R)
+            Image.fromarray(strip).save(os.path.join(cache, "glyph_layout.png"))
+            with open(os.path.join(cache, "glyph_layout.json"), "w") as f:
+                json.dump(self.last_layout_info, f, indent=1)
 
         im = Image.open(input_image_path).convert("RGB").resize((S, S))
         mask = Image.fromarray((_border_mask(np.asarray(im)) * 255).astype(np.uint8))
@@ -361,6 +409,11 @@ def build_pipeline(args):
                              "(unitex/setup_unitex.sh applies it)")
         extra = dict(view_res=args.view_res, glyph_config=args.glyph_cfg, glyph_delight=args.glyph_delight,
                      glyph_sample_mode=args.glyph_sample_mode)
+        if getattr(args, "glyph_layout", False):
+            if getattr(CustomRGBTextureFullPipeline, "GLYPH_API", 0) < 5:
+                raise SystemExit(f"{root} has an older UniTEX.patch without --glyph-layout, re-apply the current one")
+            extra.update(glyph_layout=True, glyph_layout_config=args.layout_cfg,
+                         glyph_tokens=not args.no_glyph_tokens)
         if args.shift_mu is not None:
             if getattr(CustomRGBTextureFullPipeline, "GLYPH_API", 0) < 2:
                 raise SystemExit(f"{root} has an older UniTEX.patch without --shift-mu, re-apply the current one")
@@ -386,21 +439,29 @@ def build_pipeline(args):
         # step_2_ablition always renders two 120-frame orbit mp4s, minutes per SKU for nothing
         pipe.export_video = lambda *a, **k: None
     if args.texture_lora:
-        use_texture_lora(pipe, args.texture_lora)
+        use_texture_lora(pipe, args.texture_lora, layout=getattr(args, "glyph_layout", False))
     if getattr(args, "ref_text_blur", False):
         from unitex import ref_text
         ref_text.wrap_reference_blur(pipe, args.ref_text_max_height)
     return pipe
 
 
-def use_texture_lora(pipe, path, adapter_name="cfi_texture"):
+def use_texture_lora(pipe, path, adapter_name="cfi_texture", layout=False):
     """Load our texture LoRA and swap it in for UniTEX's 'texture' adapter in the texture pass.
 
     UniTEX's infer_mv calls set_adapters(pipe.adapter_names, pipe.weights_for_texture) before the
     texture pass and weights_for_delight before the delight pass, so editing those lists is enough.
+    layout: also wrap x_embedder with the LoRA's glyph layout projection (glyph_layout_proj.safetensors
+    next to it). Input without layout channels (the delight pass) only goes through the original
+    embedder, so the wrapped model is unchanged there.
     """
     if "texture" not in pipe.adapter_names:
         raise RuntimeError(f"no 'texture' adapter in {pipe.adapter_names}")
+    if layout:
+        glyph_modules()
+        from unitex import glyph_layout as gla
+        gla.wrap_x_embedder(pipe.pipeline.transformer, gla.load_layout_proj(path))
+        print(f"  glyph layout projection: {gla.layout_proj_path(path)}")
     pipe.pipeline.load_lora_weights(path, adapter_name=adapter_name)
     pipe.adapter_names.append(adapter_name)
     pipe.weights_for_texture[pipe.adapter_names.index("texture")] = 0.0
@@ -469,14 +530,25 @@ def run(args):
         return
 
     args.glyph_cfg = make_glyph_config(args) if args.glyph_json_name else None
+    args.glyph_layout = getattr(args, "glyph_layout", False)
+    args.no_glyph_tokens = getattr(args, "no_glyph_tokens", False)
+    args.layout_cfg = make_layout_config(args) if args.glyph_layout else None
     glyph_settings = None
     if args.glyph_json_name:
         _, gt = glyph_modules()
         glyph_settings = {"json_name": args.glyph_json_name, "mode": args.glyph_cfg.anchor_mode,
                           "kind": args.glyph_cfg.infer_kind, "delight": args.glyph_delight,
                           "sample_mode": args.glyph_sample_mode, "config": gt.glyph_config_dict(args.glyph_cfg)}
-        print(f"glyphs on: {args.glyph_json_name}, mode {args.glyph_cfg.anchor_mode}, kind "
-              f"{args.glyph_cfg.infer_kind}, delight {args.glyph_delight}, view res {args.view_res}")
+        if args.glyph_layout:
+            from unitex import glyph_layout as gla
+            glyph_settings.update(tokens=not args.no_glyph_tokens,
+                                  layout={"kind": args.layout_cfg.infer_kind,
+                                          "config": gla.layout_config_dict(args.layout_cfg)})
+        print(f"glyphs on: {args.glyph_json_name}, "
+              + (f"mode {args.glyph_cfg.anchor_mode}, kind {args.glyph_cfg.infer_kind}, delight {args.glyph_delight}"
+                 if not args.no_glyph_tokens else "no glyph tokens")
+              + (f", layout {args.layout_cfg.infer_kind}" if args.glyph_layout else "")
+              + f", view res {args.view_res}")
 
     try:
         import torch
@@ -484,7 +556,9 @@ def run(args):
         torch = None
     if args.dry_run:
         pipe = FakePipeline(seed=args.seed, view_res=args.view_res, glyph_config=args.glyph_cfg,
-                            glyph_delight=args.glyph_delight, glyph_sample_mode=args.glyph_sample_mode)
+                            glyph_delight=args.glyph_delight, glyph_sample_mode=args.glyph_sample_mode,
+                            glyph_layout=args.glyph_layout, glyph_layout_config=args.layout_cfg,
+                            glyph_tokens=not args.no_glyph_tokens)
         cap = pipe.rembg_session = MaskCapture(None)
     else:
         pipe = build_pipeline(args)
@@ -541,6 +615,7 @@ def run(args):
                 cap.path = os.path.join(save_dir, "rmbg_mask_1024.png")
             if glyph_settings:
                 pipe.last_glyph_info = None            # never log the previous SKU's counts
+                pipe.last_layout_info = None
             print(f"  [{sku}] ({i + 1}/{len(todo)}) running")
             t0 = time.time()
             try:
@@ -568,6 +643,13 @@ def run(args):
                 rec["glyph"].update({k: gi.get(k) for k in GLYPH_LOG_KEYS})
                 print(f"  [{sku}] glyphs: {gi['n_instances']} instances, {gi['n_tokens']} tokens "
                       f"(per view {gi['tokens_per_view']})")
+            li = getattr(pipe, "last_layout_info", None) if args.glyph_layout else None
+            if li:
+                rec["glyph"]["layout"] = dict(rec["glyph"]["layout"], **{k: li.get(k) for k in LAYOUT_LOG_KEYS})
+                print(f"  [{sku}] glyph layout: {li['n_lines']} lines {li['kinds']} (per view {li['per_view']})")
+            elif args.glyph_layout and rec["status"] == "ok":
+                rec.update(status="error", error="--glyph-layout: no layout was built (an old UniTEX.patch?)")
+                print(f"  [{sku}] ERROR {rec['error']}")
             if use_cuda:
                 rec["max_mem_alloc_gb"] = round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
                 rec["max_mem_reserved_gb"] = round(torch.cuda.max_memory_reserved() / 1024 ** 3, 2)
@@ -634,6 +716,16 @@ def main(argv=None):
                         "keeps the original")
     g.add_argument("--ref-text-max-height", type=int, default=64,
                    help="blur text up to this height, px at 1024 (unitex.ref_text.MAX_HEIGHT)")
+    g.add_argument("--glyph-layout", action="store_true",
+                   help="draw the glyph json's lines at their place and size (unitex.glyph_layout) and feed them to "
+                        "the texture pass as layout channels of the target tokens. Needs a --texture-lora trained "
+                        "with --glyph_layout (glyph_layout_proj.safetensors next to it)")
+    g.add_argument("--glyph-layout-kind", choices=("font", "edges"), default=None,
+                   help="LayoutConfig.infer_kind: font (default) or edges of the registered photo (front view)")
+    g.add_argument("--glyph-layout-set", action="append", default=None, metavar="KEY=VALUE",
+                   help="LayoutConfig override, repeatable")
+    g.add_argument("--no-glyph-tokens", action="store_true",
+                   help="with --glyph-layout: the glyph json feeds the layout only, no appended glyph tokens")
     args = p.parse_args(argv)
     if (args.add_lora_path is None) != (args.add_lora_weights is None) or (
             args.add_lora_path and len(args.add_lora_path) != len(args.add_lora_weights)):
@@ -657,6 +749,20 @@ def main(argv=None):
             make_glyph_config(args)
         except (ValueError, TypeError, OSError) as e:
             p.error(f"glyph config: {e}")
+    layout_opts = [o for o, v in (("--glyph-layout-kind", args.glyph_layout_kind),
+                                  ("--glyph-layout-set", args.glyph_layout_set),
+                                  ("--no-glyph-tokens", args.no_glyph_tokens)) if v]
+    if layout_opts and not args.glyph_layout:
+        p.error(f"{', '.join(layout_opts)} need --glyph-layout")
+    if args.glyph_layout and not args.glyph_json_name:
+        p.error("--glyph-layout needs --glyph-json-name (the lines to draw)")
+    if args.glyph_layout and not args.dry_run and not args.texture_lora:
+        p.error("--glyph-layout needs --texture-lora (a LoRA trained with --glyph_layout)")
+    if args.glyph_layout:
+        try:
+            make_layout_config(args)
+        except (ValueError, TypeError, OSError) as e:
+            p.error(f"layout config: {e}")
     run(args)
 
 

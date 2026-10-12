@@ -618,6 +618,8 @@ def worker(spec):
     if spec.get("checkpoint0"):
         os.makedirs(os.path.join(out_dir, "checkpoint-0"), exist_ok=True)
         shutil.copy(spec["checkpoint0"], os.path.join(out_dir, "checkpoint-0", "pytorch_lora_weights.safetensors"))
+    if spec.get("checkpoint0_proj"):
+        shutil.copy(spec["checkpoint0_proj"], os.path.join(out_dir, "checkpoint-0", "glyph_layout_proj.safetensors"))
     if spec.get("from_args"):
         torch.manual_seed(0)
         trainer = tm.Trainer.from_args(args, accelerator, logger, dl)
@@ -657,6 +659,9 @@ def worker(spec):
 
     res["trainable"] = [n for n, p in trainer.transformer.named_parameters() if p.requires_grad]
     xe = trainer.transformer.x_embedder
+    if hasattr(xe, "layout_proj"):       # --glyph_layout wraps the original embedder
+        res["layout_proj_abs"] = float(xe.layout_proj.weight.detach().abs().sum())
+        xe = xe.base
     w = xe.modules_to_save["default"].weight if hasattr(xe, "modules_to_save") else xe.weight
     base = FluxTransformer2DModel.from_pretrained(spec["pretrained"], subfolder="transformer").x_embedder.weight
     res["x_embedder_zero"] = bool((w == 0).all())
@@ -674,8 +679,11 @@ def worker(spec):
 
     def pre(mod, a, kw):
         ids = kw["img_ids"]
-        rec["calls"].append({"n_tokens": int(kw["hidden_states"].shape[1]), "ids_dtype": str(ids.dtype),
-                             "n_glyph": int(getattr(trainer, "last_n_glyph", 0))})
+        hs = kw["hidden_states"]
+        rec["calls"].append({"n_tokens": int(hs.shape[1]), "ids_dtype": str(ids.dtype),
+                             "n_glyph": int(getattr(trainer, "last_n_glyph", 0)), "channels": int(hs.shape[-1]),
+                             "layout_abs": float(hs[..., 64:].detach().float().abs().sum()) if hs.shape[-1] > 64 else 0.0,
+                             "grad": bool(torch.is_grad_enabled())})
         rec["ids"] = ids.detach().float().cpu()
         if spec.get("mode") == "ids":
             raise StopForward
@@ -883,6 +891,66 @@ def test_text_loss_weight(tmp_path, patched, pretrained, sample512):
     manual = (tw * c["weighting"] * (c["keep"] * (c["pred"] - c["target"])) ** 2).sum() / (tw * c["keep"]).sum()
     assert on["losses"][0] == pytest.approx(float(manual), rel=1e-5)
     assert on["losses"][0] != pytest.approx(base["losses"][0], rel=1e-3)
+
+
+def test_glyph_layout_channels(tmp_path, patched, pretrained, sample512):
+    """--glyph_layout: the forward gets 64 layout channels next to the latents, the projection starts at
+    zero (first loss equal to the run without layout), trains, is saved with every checkpoint and the
+    final LoRA and is loaded on resume. The probe's two losses are equal at step 1 and differ after it."""
+    base = run_worker(tmp_path, patched, pretrained, sample512, argv=["--zero_text_embeds"], steps=2)
+    lay_argv = ["--zero_text_embeds", "--glyph_layout", "--glyph_layout_set", "p_all_drop=0", "p_item_drop=0",
+                "p_edges=0.5", "--glyph_layout_probe_every", "1", "--checkpointing_steps", "1"]
+    lay = run_worker(tmp_path, patched, pretrained, sample512, argv=lay_argv, steps=2)
+    out = lay["out_dir"]
+    assert "x_embedder.layout_proj.weight" in lay["trainable"] and lay["layout_proj_abs"] == 0.0
+    assert not any("x_embedder.base" in n for n in lay["trainable"])
+    train_calls = [c for c in lay["calls"] if c["grad"]]
+    assert [c["channels"] for c in train_calls] == [128, 128] and all(c["layout_abs"] > 0 for c in train_calls)
+    assert all(c["channels"] == 64 for c in lay["calls"] if not c["grad"])      # the probe's no-layout forward
+    assert lay["losses"][0] == base["losses"][0]
+    probe = [json.loads(s) for s in open(os.path.join(out, "layout_probe_rank0.jsonl"))]
+    assert [p["step"] for p in probe] == [1, 2] and all(p["n_tokens"] > 0 for p in probe)
+    assert probe[0]["with"] == pytest.approx(probe[0]["without"], rel=1e-6)
+    assert probe[1]["with"] != pytest.approx(probe[1]["without"], rel=1e-9, abs=0)
+    cfg = json.load(open(os.path.join(out, "glyph_layout_config.json")))
+    assert cfg["p_edges"] == 0.5 and cfg["p_all_drop"] == 0
+    from unitex import glyph_layout as gla
+    w1 = gla.load_layout_proj(os.path.join(out, "checkpoint-1"))
+    w2 = gla.load_layout_proj(os.path.join(out, "pytorch_lora_weights.safetensors"))
+    assert w1.abs().sum() > 0 and not torch.equal(w1, w2)
+    # resume from a checkpoint with a projection: it is loaded, not reset
+    res = run_worker(tmp_path, patched, pretrained, sample512, mode="params",
+                     argv=lay_argv + ["--resume_from_checkpoint", "latest"],
+                     checkpoint0=os.path.join(out, "pytorch_lora_weights.safetensors"),
+                     checkpoint0_proj=gla.layout_proj_path(os.path.join(out, "pytorch_lora_weights.safetensors")))
+    assert res["layout_proj_abs"] == pytest.approx(float(w2.abs().sum()), rel=1e-6)
+    # a warm start without one starts at zero
+    res0 = run_worker(tmp_path, patched, pretrained, sample512, mode="params",
+                      argv=lay_argv + ["--resume_from_checkpoint", "latest"],
+                      checkpoint0=os.path.join(out, "pytorch_lora_weights.safetensors"))
+    assert res0["layout_proj_abs"] == 0.0 and res0["lora_loaded"]
+
+
+def test_glyph_layout_argument_checks(patched, tmp_path):
+    common = BASE_ARGV + ["--pretrained_model_name_or_path", "x", "--output_dir", "y"]
+    cases = {"ok": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_probe_every", "5"],
+             "x_embedder": common + ["--dataset_impl", "cfi", "--glyph_layout", "--train_x_embedder"],
+             "probe_alone": common + ["--dataset_impl", "cfi", "--glyph_layout_probe_every", "5"],
+             "probe_negative": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_probe_every", "-1"],
+             "not_cfi": common + ["--glyph_layout"]}
+    (tmp_path / "cases.json").write_text(json.dumps(cases))
+    script = ("import json, sys\nimport launch\nout = {}\n"
+              "for k, argv in json.load(open(sys.argv[1])).items():\n"
+              "    try:\n        a = launch.parse_args(argv)\n        out[k] = 'ok' if a.glyph_layout else 'off'\n"
+              "    except ValueError as e:\n        out[k] = 'ValueError'\n"
+              "print(json.dumps(out))\n")
+    env = dict(os.environ, PYTHONPATH=patched + os.pathsep + REPO, USE_TF="0", CAUGHT_ALL_EXCEPTIONS="1")
+    r = subprocess.run([sys.executable, "-c", script, str(tmp_path / "cases.json")], capture_output=True, text=True,
+                       env=env, cwd=patched, timeout=600)
+    assert r.returncode == 0, r.stderr[-3000:]
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got == {"ok": "ok", "x_embedder": "ValueError", "probe_alone": "ValueError",
+                   "probe_negative": "ValueError", "not_cfi": "ValueError"}
 
 
 @pytest.mark.skipif(not SLOW, reason="FLUX_TEST_SLOW=0")

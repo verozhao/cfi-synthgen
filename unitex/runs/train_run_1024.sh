@@ -4,10 +4,13 @@
 # 1024 px per view, one sample per GPU (DDP over the listed GPUs), 4-bit FLUX base, checkpointed
 # activations in pinned CPU RAM. init_lora seeds checkpoint-0 (the released LoRA or one of ours).
 # Optional env: CFI (cfi-synthgen copy), TRAIN_REPO (patched UniTEX-FLUX copy), EXTRA_ARGS (more
-# launch.py flags, e.g. --cfi_ref_text_dir D --cfi_ref_text_blur 0.5).
+# launch.py flags, e.g. --cfi_ref_text_dir D --cfi_ref_text_blur 0.5), GLYPH_ARGS (the glyph token
+# flags, default appended glyph tokens from data/glyph_train.json; empty turns them off, e.g. for a
+# --glyph_layout run).
 set -u
 source /mnt/nvme1n1/veronica_unitex/env.sh
 GPUS=$1; NAME=$2; DATA=$3; STEPS=$4; ACC=$5; CKPT=$6; INIT=$7; PORT=${8:-29517}
+GLYPH_ARGS=${GLYPH_ARGS-"--glyph --glyph_config $R/data/glyph_train.json"}
 NP=$(echo $GPUS | tr ',' '\n' | grep -c .)
 FLUX=$(ls -d $R/cache/hf/hub/models--black-forest-labs--FLUX.1-dev/snapshots/*/ | head -1)
 export NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1
@@ -36,6 +39,6 @@ CUDA_VISIBLE_DEVICES=$GPUS $R/venv/bin/accelerate launch $MP --num_machines 1 --
   --random_drop_condition --random_drop_condition_probability 0.25 \
   --max_train_steps $STEPS --checkpointing_steps $CKPT --validation_steps 10000000 --dataloader_num_workers 4 \
   --zero_text_embeds --quantize_base nf4 --offload_activations --pos_scale ${POS_SCALE:-1.0} \
-  --glyph --glyph_config $R/data/glyph_train.json --text_keep_boost 0.3 \
+  $GLYPH_ARGS --text_keep_boost 0.3 \
   --resume_from_checkpoint latest --output_dir $OUT --report_to tensorboard --tasks texturing --seed 666 \
   ${EXTRA_ARGS:-}
