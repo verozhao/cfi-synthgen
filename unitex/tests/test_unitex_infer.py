@@ -675,7 +675,7 @@ def test_infer_mv_with_the_tiny_flux_pipeline(repos, pipes, eval2, tmp_path):
 
 class LayoutFlux(FakeFlux):
     """FakeFlux with a VAE (infer_mv encodes the layout with pipeline.vae) that reports the layout
-    tokens it took, or none when ignore is set."""
+    channels or layout tokens (glyph_latents) it took, or none when ignore is set."""
 
     def __init__(self, vae, ignore=False):
         super().__init__()
@@ -684,7 +684,10 @@ class LayoutFlux(FakeFlux):
     def __call__(self, **kw):
         lay = kw.get("glyph_layout")
         self._last_layout_tokens = 0 if lay is None or self.ignore else int(lay.shape[1])
-        return super().__call__(**kw)
+        out = super().__call__(**kw)
+        if kw.get("glyph_latents") is not None:
+            self._last_n_glyph_tokens = 0 if self.ignore else int(kw["glyph_latents"].shape[1])
+        return out
 
 
 @pytest.mark.parametrize("tokens", [True, False])
@@ -709,6 +712,41 @@ def test_glyph_layout_goes_to_the_texture_pass_only(repos, tiny, eval2, tmp_path
     C2 = unitex_classes(repos["patched"], flux=LayoutFlux(tiny[1], ignore=True))
     pipe2 = C2.CustomRGBTextureFullPipeline(seed=0, glyph_layout=True)
     with pytest.raises(RuntimeError, match="glyph layout"):
+        pipe2.infer_mv(str(tmp_path), *_grids(str(tmp_path), 512), glyph_text=_text(eval2))
+
+
+def test_glyph_layout_tokens_go_to_the_texture_pass_only(repos, tiny, eval2, tmp_path):
+    """Tokens mode: the layout tokens reach the texture pass as glyph_latents + glyph_ids (no layout
+    channels, no GlyphAnchor tokens), ids on the glyph plane at the target tokens under the drawn lines."""
+    flux = LayoutFlux(tiny[1])
+    C = unitex_classes(repos["patched"], flux=flux)
+    assert C.CustomRGBTextureFullPipeline.GLYPH_API >= 6
+    pipe = C.CustomRGBTextureFullPipeline(seed=0, glyph_layout=True, glyph_tokens=False, glyph_delight=True,
+                                          glyph_layout_mode="tokens")
+    pipe.infer_mv(str(tmp_path), *_grids(str(tmp_path), 512), glyph_text=_text(eval2))
+    tex, dl = [c[1] for c in flux.calls if c[0] == "call"]
+    info = json.load(open(tmp_path / "glyph_layout.json"))
+    n = info["n_tokens"]
+    assert info["mode"] == "tokens" and n > 0 and info["token_lines"] == info["n_lines"] > 0
+    assert tex["glyph_latents"].shape == (1, n, 64) and tex["glyph_ids"].shape == (n, 3)
+    assert "glyph_layout" not in tex and "glyph_instances" not in tex
+    assert not any(k.startswith("glyph") for k in dl)
+    strip, li = gla.layout_strip(_text(eval2), 512, gla.LayoutConfig())
+    idx, _ = gla.layout_token_index(li, 4096)
+    assert torch.equal(tex["glyph_ids"].cpu(), gla.layout_token_ids(idx, 512))
+    assert not (tmp_path / "glyph_tokens.json").exists()
+    # run_unitex --dry-run counts the same tokens without UniTEX
+    _, dry = run_unitex.layout_summary(_text(eval2), gla.LayoutConfig(), 512, "tokens")
+    assert dry["n_tokens"] == n and dry["token_lines"] == info["token_lines"] and dry["lines"] == info["lines"]
+    # layout tokens and GlyphAnchor tokens together are refused, so is an unknown mode
+    with pytest.raises(ValueError, match="glyph_tokens=False"):
+        C.CustomRGBTextureFullPipeline(seed=0, glyph_layout=True, glyph_layout_mode="tokens")
+    with pytest.raises(ValueError, match="glyph_layout_mode"):
+        C.CustomRGBTextureFullPipeline(seed=0, glyph_layout=True, glyph_tokens=False, glyph_layout_mode="sideways")
+    # a texture pass that does not take the tokens is an error
+    C2 = unitex_classes(repos["patched"], flux=LayoutFlux(tiny[1], ignore=True))
+    pipe2 = C2.CustomRGBTextureFullPipeline(seed=0, glyph_layout=True, glyph_tokens=False, glyph_layout_mode="tokens")
+    with pytest.raises(RuntimeError, match="layout tokens"):
         pipe2.infer_mv(str(tmp_path), *_grids(str(tmp_path), 512), glyph_text=_text(eval2))
 
 
@@ -822,7 +860,17 @@ def test_d_dry_run_glyph_layout(eval2):
         assert not os.path.exists(os.path.join(cache, "glyph_tokens.json"))
         info = json.load(open(os.path.join(cache, "glyph_layout.json")))
         assert info["n_lines"] == g["layout"]["n_lines"] > 0 and info["per_view"] == g["layout"]["per_view"]
+    # tokens mode: no GlyphAnchor tokens without asking, the token count is logged
+    r = _run_unitex("--eval-dir", eval2, "--dry-run", "--run-name", "layout_tok_dry", "--glyph-json-name", "text.json",
+                    "--glyph-layout", "--glyph-layout-mode", "tokens")
+    assert r.returncode == 0, r.stderr
+    for rec in _log(eval2, "layout_tok_dry"):
+        g = rec["glyph"]
+        assert rec["status"] == "ok" and g["tokens"] is False and g["layout"]["mode"] == "tokens"
+        assert g["layout"]["n_tokens"] > 0 and g["layout"]["token_lines"] == g["layout"]["n_lines"] > 0
+        assert not os.path.exists(os.path.join(eval2, rec["sku"], "layout_tok_dry", "cache", "glyph_tokens.json"))
     for bad in (["--glyph-layout"], ["--glyph-json-name", "text.json", "--no-glyph-tokens"],
+                ["--glyph-json-name", "text.json", "--glyph-layout-mode", "tokens"],
                 ["--glyph-json-name", "text.json", "--glyph-layout-kind", "edges"],
                 ["--glyph-json-name", "text.json", "--glyph-layout", "--glyph-layout-set", "nope=1"]):
         r = _run_unitex("--eval-dir", eval2, "--dry-run", "--run-name", "bad", *bad)

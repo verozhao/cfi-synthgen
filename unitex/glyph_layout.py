@@ -11,6 +11,15 @@ The texture LoRA learned to ignore them (positions, reference blur and text loss
 token (r, c) gets the latent of exactly the layout pixels it covers, through a projection that starts
 at zero, so the warm-started LoRA behaves as before until training gives the projection weight.
 
+Two ways in:
+  channels  the layout latent minus a blank one on 64 extra input channels of the target tokens,
+            through a zero-initialised projection next to x_embedder. The frozen base reads the sum
+            as part of the noisy latent: once the projection grows, small-text loss at low noise goes
+            up (1-GPU probe, 2026-10-12), so this mode stays for comparison.
+  tokens    the layout latent at the target tokens under the drawn lines, appended as tokens on the
+            glyph plane at exactly those tokens' (row, col) ids: glyph tokens without jitter, at the
+            text's size, the way EasyText and OminiControl place spatially aligned conditions.
+
 Ink per line (`kind`):
   font   the line's OCR text drawn into its view quad, stretched to fill it (any view)
   edges  Canny edges of the view's own pixels inside the quad, drawn dark on white. Training: the
@@ -22,6 +31,8 @@ API (numpy / torch / PIL / cv2, no UniTEX imports, the VAE is any diffusers Auto
   layout_lines(text, view_res, cfg, rng)         filtered lines (item, raw view, quad at view_res, kind)
   layout_strip(text, view_res, cfg, rng, views)  uint8 (R, 6R, 3) strip + info (lines drawn, drawn text.json)
   encode_layout(strip, vae)                      [1, (R/16)(6R/16), 4C] = packed latent - packed blank latent
+  layout_tokens(strip, info, vae, max_tokens)    layout tokens: latents [1, N, 4C] + ids [N, 3] on the glyph plane
+  lines_text(lines, view_res)                    text.json dict of drawn lines (text loss weight)
   GlyphLayoutEmbedder, wrap_x_embedder           x_embedder + zero-initialised projection of the extra channels
   save_layout_proj, load_layout_proj             LAYOUT_PROJ_FILE next to pytorch_lora_weights.safetensors
 """
@@ -47,6 +58,7 @@ except ImportError:   # imported with unitex/ itself on sys.path
 
 LAYOUT_PROJ_FILE = "glyph_layout_proj.safetensors"
 PROJ_KEY = "layout_proj.weight"
+LAYOUT_PLANE = 1.0       # axis 0 of layout token ids: the glyph plane (the target and conditions use 0)
 KINDS = ("font", "edges")
 WHITE = 255
 _LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
@@ -260,7 +272,7 @@ def layout_strip(text, view_res, cfg=None, rng=None, views=None):
     R = int(view_res)
     canv = [np.full((R, R), WHITE, np.uint8) for _ in range(6)]
     lines = layout_lines(text, R, cfg, rng)
-    drawn, kinds, per_view, items = [], {}, {}, {}
+    drawn, kinds, per_view = [], {}, {}
     for ln in lines:
         img = views[ln["raw_view"]] if views is not None and ln["raw_view"] < len(views) else None
         kind = ln["kind"] if (ln["kind"] == "font" or img is not None) else "font"
@@ -273,12 +285,19 @@ def layout_strip(text, view_res, cfg=None, rng=None, views=None):
         drawn.append({**ln, "kind": kind})
         kinds[kind] = kinds.get(kind, 0) + 1
         per_view[str(ln["raw_view"])] = per_view.get(str(ln["raw_view"]), 0) + 1
-        it = items.setdefault(ln["item_id"], {"id": ln["item_id"], "text": ln["text"], "views": {}})
-        it["views"][str(ln["raw_view"])] = {"quad": ln["quad"], "height_px": ln["height"]}
     strip = np.concatenate([canv[FULL_INDEX[s]] for s in range(6)], axis=1)
     info = {"view_res": R, "lines": drawn, "n_lines": len(drawn), "kinds": kinds, "per_view": per_view,
-            "drawn_text": {"version": 1, "res": R, "items": list(items.values())}}
+            "drawn_text": lines_text(drawn, R)}
     return np.repeat(strip[..., None], 3, axis=2), info
+
+
+def lines_text(lines, view_res):
+    """text.json dict at view_res holding the given drawn lines (their views only, grouped by item)."""
+    items = {}
+    for ln in lines:
+        it = items.setdefault(ln["item_id"], {"id": ln["item_id"], "text": ln["text"], "views": {}})
+        it["views"][str(ln["raw_view"])] = {"quad": ln["quad"], "height_px": ln["height"]}
+    return {"version": 1, "res": int(view_res), "items": list(items.values())}
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -295,29 +314,82 @@ def _encode(x, vae):
 
 
 @torch.no_grad()
-def encode_layout(strip, vae, device=None, dtype=None):
+def encode_layout(strip, vae, device=None, dtype=None, subtract_blank=True):
     """uint8 (R, 6R, 3) strip -> [1, (R/16)(6R/16), 4C] packed latent minus the packed latent of a
     white strip (posterior mode), so text-free tokens are about zero. An all-white strip gives exact
-    zeros without running the VAE."""
+    zeros without running the VAE. subtract_blank=False: the plain packed latent (layout tokens)."""
     device = device or next(vae.parameters()).device
     dtype = dtype or vae.dtype
     a = np.asarray(strip)
     H, W = a.shape[:2]
     C = int(vae.config.latent_channels) * 4
     n = (H // TOKEN_PX) * (W // TOKEN_PX)
-    if (a == WHITE).all():
+    if subtract_blank and (a == WHITE).all():
         return torch.zeros(1, n, C, device=device, dtype=dtype)
     vd = next(vae.parameters()).device
     x = torch.from_numpy(np.ascontiguousarray(a[..., :3].transpose(2, 0, 1))).float().div(255.0)[None]
     x = x.to(device=vd, dtype=vae.dtype)
-    key = (H, W, str(vd), str(vae.dtype), id(vae))
-    if key not in _BLANK:
-        _BLANK.clear()
-        _BLANK[key] = gt.pack_latents(_encode(torch.ones_like(x), vae))
-    z = gt.pack_latents(_encode(x, vae)) - _BLANK[key]
+    z = gt.pack_latents(_encode(x, vae))
+    if subtract_blank:
+        key = (H, W, str(vd), str(vae.dtype), id(vae))
+        if key not in _BLANK:
+            _BLANK.clear()
+            _BLANK[key] = gt.pack_latents(_encode(torch.ones_like(x), vae))
+        z = z - _BLANK[key]
     if z.shape[1] != n:
         raise ValueError(f"layout strip {a.shape[:2]} packs to {z.shape[1]} tokens, expected {n}")
     return z.to(device=device, dtype=dtype)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Layout tokens
+# ────────────────────────────────────────────────────────────────────────────
+
+def layout_token_index(info, max_tokens=None):
+    """Target tokens under the drawn lines of a layout_strip info -> (sorted LongTensor index, kept
+    lines). Over max_tokens the lines with the most tokens are left out (large text needs no help)."""
+    R = int(info["view_res"])
+    n = (R // TOKEN_PX) * (6 * R // TOKEN_PX)
+    lines = list(info.get("lines") or [])
+    masks = [gt.text_token_mask(lines_text([ln], R), R) for ln in lines]
+    keep = list(range(len(lines)))
+    if max_tokens is not None:
+        order = sorted(keep, key=lambda i: (int(masks[i].sum()), i))
+        keep, union = [], torch.zeros(n, dtype=torch.bool)
+        for i in order:
+            u = union | masks[i]
+            if int(u.sum()) <= int(max_tokens):
+                union = u
+                keep.append(i)
+        keep.sort()
+    m = torch.zeros(n, dtype=torch.bool)
+    for i in keep:
+        m |= masks[i]
+    return torch.nonzero(m).flatten(), [lines[i] for i in keep]
+
+
+def layout_token_ids(index, view_res, plane=LAYOUT_PLANE):
+    """[N, 3] fp32 ids (plane, row, col) for target tokens `index` (row-major over the strip, like the
+    packed target whose ids are (0, row, col)), so each layout token sits on the token it describes."""
+    nc = 6 * int(view_res) // TOKEN_PX
+    idx = torch.as_tensor(index, dtype=torch.long).flatten().cpu()
+    return torch.stack([torch.full(idx.shape, float(plane)), (idx // nc).float(), (idx % nc).float()], dim=1)
+
+
+def layout_tokens(strip, info, vae, max_tokens=None, device=None, dtype=None):
+    """Layout tokens: the strip's packed latent (no blank subtracted, an image of the text like glyph
+    tokens) at the target tokens under the drawn lines, ids on the glyph plane at those tokens' (row,
+    col). -> (latents [1, N, 4C], ids [N, 3] fp32, info) with info["n_layout_tokens"],
+    info["token_lines"] and info["drawn_text"] narrowed to the lines that got tokens."""
+    index, kept = layout_token_index(info, max_tokens)
+    R = int(info["view_res"])
+    info = dict(info, n_layout_tokens=int(index.numel()), token_lines=len(kept), drawn_text=lines_text(kept, R))
+    if index.numel() == 0:
+        C = int(vae.config.latent_channels) * 4
+        dev = device or next(vae.parameters()).device
+        return torch.zeros(1, 0, C, device=dev, dtype=dtype or vae.dtype), torch.zeros(0, 3), info
+    z = encode_layout(strip, vae, device=device, dtype=dtype, subtract_blank=False)
+    return z[:, index.to(z.device)], layout_token_ids(index, R), info
 
 
 def layout_tokens_full(layout, n_total, keep_index=None):

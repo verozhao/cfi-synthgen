@@ -681,7 +681,8 @@ def worker(spec):
         ids = kw["img_ids"]
         hs = kw["hidden_states"]
         rec["calls"].append({"n_tokens": int(hs.shape[1]), "ids_dtype": str(ids.dtype),
-                             "n_glyph": int(getattr(trainer, "last_n_glyph", 0)), "channels": int(hs.shape[-1]),
+                             "n_glyph": int(getattr(trainer, "last_n_glyph", 0)),
+                             "n_layout": int(getattr(trainer, "last_n_layout", 0)), "channels": int(hs.shape[-1]),
                              "layout_abs": float(hs[..., 64:].detach().float().abs().sum()) if hs.shape[-1] > 64 else 0.0,
                              "grad": bool(torch.is_grad_enabled())})
         rec["ids"] = ids.detach().float().cpu()
@@ -734,6 +735,7 @@ def worker(spec):
             raise
         res["end_error"] = f"AttributeError: {e}"
     res.update(losses=losses, calls=rec["calls"], lora_changed=bool((lora[0][1].detach() - before).abs().sum() > 0))
+    res["drawn_text"] = (getattr(trainer, "last_layout_info", None) or {}).get("drawn_text")
     lp = getattr(trainer.transformer.x_embedder, "layout_proj", None)
     if lp is not None:
         res["layout_proj_max_after"] = float(lp.weight.detach().abs().max())
@@ -950,6 +952,37 @@ def test_glyph_layout_lr(tmp_path, patched, pretrained, sample512):
     assert fast["losses"] == slow["losses"] and fast["lora_changed"]
 
 
+def test_glyph_layout_tokens(tmp_path, patched, pretrained, sample512):
+    """--glyph_layout_mode tokens: x_embedder stays as it is, the layout tokens come last with ids
+    (1, row, col) of exactly the target tokens under the drawn lines, are cut off before the loss, the
+    probe drops them, and no projection is saved."""
+    argv = ["--zero_text_embeds", "--glyph_layout", "--glyph_layout_mode", "tokens", "--glyph_layout_set",
+            "p_all_drop=0", "p_item_drop=0", "p_edges=0.5"]
+    ids_run = run_worker(tmp_path, patched, pretrained, sample512, argv=argv, mode="ids", no_drop=True)
+    n_lay = ids_run["calls"][0]["n_layout"]
+    assert n_lay > 0 and ids_run["calls"][0]["channels"] == 64
+    ids = torch.load(os.path.join(ids_run["out_dir"], "img_ids.pt"))
+    nr, nc = 512 // 16, 6 * 512 // 16
+    assert torch.equal(ids[:nr * nc, 0], torch.zeros(nr * nc))           # the full target first (no drop)
+    idx = torch.nonzero(gt.text_token_mask(ids_run["drawn_text"], 512)).flatten()
+    lay = ids[-n_lay:]
+    assert idx.numel() == n_lay and torch.equal(lay[:, 0], torch.ones(n_lay))
+    assert torch.equal(lay[:, 1:], ids[idx, 1:])                          # on the target tokens they describe
+    run = run_worker(tmp_path, patched, pretrained, sample512, steps=2,
+                     argv=argv + ["--glyph_layout_probe_every", "1", "--checkpointing_steps", "1"])
+    assert not any("layout_proj" in n for n in run["trainable"]) and run["x_embedder_is_base"]
+    train_calls = [c for c in run["calls"] if c["grad"]]
+    probe_calls = [c for c in run["calls"] if not c["grad"]]
+    assert len(train_calls) == len(probe_calls) == 2 and all(c["n_layout"] > 0 for c in train_calls)
+    assert [p["n_tokens"] for p in probe_calls] == [c["n_tokens"] - c["n_layout"] for c in train_calls]
+    probe = [json.loads(s) for s in open(os.path.join(run["out_dir"], "layout_probe_rank0.jsonl"))]
+    assert [p["step"] for p in probe] == [1, 2] and all(p["layout_tokens"] > 0 for p in probe)
+    assert "proj_mean_abs" not in probe[0] and probe[0]["with"] != pytest.approx(probe[0]["without"], rel=1e-9, abs=0)
+    assert not os.path.exists(os.path.join(run["out_dir"], "checkpoint-1", "glyph_layout_proj.safetensors"))
+    assert not os.path.exists(os.path.join(run["out_dir"], "glyph_layout_proj.safetensors"))
+    assert os.path.exists(os.path.join(run["out_dir"], "pytorch_lora_weights.safetensors"))
+
+
 def test_glyph_layout_argument_checks(patched, tmp_path):
     common = BASE_ARGV + ["--pretrained_model_name_or_path", "x", "--output_dir", "y"]
     cases = {"ok": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_probe_every", "5"],
@@ -959,6 +992,13 @@ def test_glyph_layout_argument_checks(patched, tmp_path):
              "probe_negative": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_probe_every", "-1"],
              "lr_alone": common + ["--dataset_impl", "cfi", "--glyph_layout_lr", "2e-4"],
              "lr_negative": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_lr", "-1"],
+             "tokens": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_mode", "tokens"],
+             "tokens_lr": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_mode", "tokens",
+                                    "--glyph_layout_lr", "2e-4"],
+             "tokens_glyph": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_mode", "tokens",
+                                       "--glyph"],
+             "tokens_cap": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_mode", "tokens",
+                                     "--glyph_layout_max_tokens", "0"],
              "not_cfi": common + ["--glyph_layout"]}
     (tmp_path / "cases.json").write_text(json.dumps(cases))
     script = ("import json, sys\nimport launch\nout = {}\n"
@@ -973,7 +1013,8 @@ def test_glyph_layout_argument_checks(patched, tmp_path):
     got = json.loads(r.stdout.strip().splitlines()[-1])
     assert got == {"ok": "ok", "lr": "ok", "x_embedder": "ValueError", "probe_alone": "ValueError",
                    "probe_negative": "ValueError", "lr_alone": "ValueError", "lr_negative": "ValueError",
-                   "not_cfi": "ValueError"}
+                   "tokens": "ok", "tokens_lr": "ValueError", "tokens_glyph": "ValueError",
+                   "tokens_cap": "ValueError", "not_cfi": "ValueError"}
 
 
 @pytest.mark.skipif(not SLOW, reason="FLUX_TEST_SLOW=0")

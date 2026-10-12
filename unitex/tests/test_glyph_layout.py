@@ -236,6 +236,54 @@ def test_layout_tokens_full():
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Layout tokens
+# ────────────────────────────────────────────────────────────────────────────
+
+def test_layout_tokens_sit_on_the_drawn_lines(vae):
+    """The plain packed latent at the tokens under the drawn lines, with ids (1, row, col) of exactly
+    those target tokens (the target's own ids are (0, row, col), row-major over the strip)."""
+    R = 512
+    text = _text([_item(0, "GLUTEN FREE", {"0": _view(_quad(64, 192, 448, 256))}),
+                  _item(1, "NET WT 18.6 OZ", {"2": _view(_quad(100, 400, 300, 420)),
+                                              "0": _view(_quad(40, 40, 120, 52))})])
+    strip, info = gla.layout_strip(text, R)
+    lat, ids, tinfo = gla.layout_tokens(strip, info, vae)
+    m = gt.text_token_mask(info["drawn_text"], R)
+    idx = torch.nonzero(m).flatten()
+    assert lat.shape == (1, idx.numel(), 64) and ids.shape == (idx.numel(), 3) and ids.dtype == torch.float32
+    z = gla.encode_layout(strip, vae, subtract_blank=False)
+    assert torch.equal(lat, z[:, idx])
+    nr, nc = R // TOKEN_PX, 6 * R // TOKEN_PX
+    target_ids = torch.stack(torch.meshgrid(torch.arange(nr), torch.arange(nc), indexing="ij"), -1).view(-1, 2).float()
+    assert torch.equal(ids[:, 0], torch.ones(idx.numel())) and torch.equal(ids[:, 1:], target_ids[idx])
+    assert tinfo["n_layout_tokens"] == idx.numel() and tinfo["token_lines"] == info["n_lines"] == 3
+    assert torch.equal(gt.text_token_mask(tinfo["drawn_text"], R), m)
+    # the plain latent is the channels-mode latent plus the blank latent
+    blank = gla.encode_layout(np.full_like(strip, 255), vae, subtract_blank=False)
+    assert torch.allclose(z - blank, gla.encode_layout(strip, vae), atol=1e-5)
+
+
+def test_layout_tokens_cap_leaves_out_the_largest_lines(vae):
+    R = 512
+    big = _item(0, "BIG", {"0": _view(_quad(20, 20, 480, 200))})
+    small = [_item(i, f"S{i}", {"1": _view(_quad(20, 20 + 30 * i, 120, 34 + 30 * i))}) for i in range(1, 5)]
+    strip, info = gla.layout_strip(_text([big] + small), R)
+    _, kept = gla.layout_token_index(info)
+    assert len(kept) == 5
+    n_small = int(gt.text_token_mask(gla.lines_text([ln for ln in info["lines"] if ln["item_id"]], R), R).sum())
+    idx, kept = gla.layout_token_index(info, max_tokens=n_small)
+    assert sorted(ln["item_id"] for ln in kept) == [1, 2, 3, 4] and idx.numel() == n_small
+    lat, ids, tinfo = gla.layout_tokens(strip, info, vae, max_tokens=n_small)
+    assert lat.shape[1] == n_small and tinfo["token_lines"] == 4
+    assert sorted(it["id"] for it in tinfo["drawn_text"]["items"]) == [1, 2, 3, 4]
+    # nothing drawn: no tokens
+    white = np.full((R, 6 * R, 3), 255, np.uint8)
+    _, info0 = gla.layout_strip(_text([]), R)
+    lat0, ids0, t0 = gla.layout_tokens(white, info0, vae)
+    assert lat0.shape == (1, 0, 64) and ids0.shape == (0, 3) and t0["n_layout_tokens"] == 0
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # x_embedder wrapper
 # ────────────────────────────────────────────────────────────────────────────
 

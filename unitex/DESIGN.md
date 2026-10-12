@@ -148,3 +148,12 @@ text are reported separately.
 - The projection trains in its own AdamW (`--glyph_layout_lr`). Prodigy picks one step size for all
   its weights from the LoRA, about 1e-5 per weight per step on a warm start, so a projection that
   starts at zero stays too small to matter within a fine-tune.
+- Tokens mode (`--glyph_layout_mode tokens`) is the second way in. The layout strip is VAE-encoded
+  without subtracting the blank strip, and the tokens under the drawn lines (at most 4096, the
+  largest lines left out first) are appended last with ids (1, row, col): the glyph plane, exactly
+  on the target tokens they describe. They are never dropped and are cut off before the loss. This
+  is the GlyphAnchor glyph token without jitter and at the text's size, the way EasyText and
+  OminiControl place spatially aligned conditions. The channels mode adds the projected layout to
+  the target's own input embedding, which the frozen base reads as noisy latent. With a working
+  learning rate that made small-text loss worse at low noise. At inference the layout tokens reach
+  the texture pass as `glyph_latents` + `glyph_ids` (GLYPH_API 6).

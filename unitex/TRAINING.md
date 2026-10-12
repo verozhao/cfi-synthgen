@@ -140,6 +140,8 @@ fixed_font_px=12 fixed_line_px=16 fixed_margin_px=0`. The trainer writes the res
 | `--glyph_layout_config` / `--glyph_layout_set k=v ...` | none | LayoutConfig (which lines, drops, share of edge-map lines) |
 | `--glyph_layout_probe_every N` | 0 | every N steps one more forward without the layout, logs the drawn small-text loss with and without it |
 | `--glyph_layout_lr lr` | 0 | a separate AdamW with this learning rate for the layout projection (0 = it stays in the main optimizer) |
+| `--glyph_layout_mode {channels,tokens}` | channels | channels: the layout on extra input channels through the projection. tokens: the layout latent under the drawn lines appended as tokens on the glyph plane at those target tokens' (row, col), no projection |
+| `--glyph_layout_max_tokens N` | 4096 | tokens mode: at most N layout tokens, the lines with the most tokens left out |
 
 Other changes in the patch: position ids are built in fp32 everywhere (trainer call sites and
 `_prepare_latent_image_ids` in both task pipelines), the loss slice is `model_pred[:, :n_noise]`,
@@ -162,6 +164,12 @@ Other changes in the patch: position ids are built in fp32 everywhere (trainer c
   Give the projection its own learning rate with `--glyph_layout_lr`. On a warm start Prodigy moves
   each weight about 1e-5 per step, and after 250 steps the projection was 1% of `x_embedder`'s size
   with under 1% less small-text loss in the probe.
+- **Layout tokens over layout channels.** With its own AdamW (lr 3e-4) the projection grows, but the
+  probe's small-text loss with the layout is 2 to 5% higher at noise levels up to 0.44 for the first
+  100 steps: the frozen base reads the projected layout as part of the noisy latent. Use
+  `--glyph_layout_mode tokens`: the same layout latent goes in as tokens on the glyph plane at the
+  text's own target tokens, and the model reads them through attention. Inference:
+  `run_unitex.py --glyph-layout --glyph-layout-mode tokens` (no projection file, no GlyphAnchor tokens).
 
 - **Warm start from the released LoRA** through `checkpoint-0` as above. It needs `--lora_rank 16
   --lora_alpha 16` and the default target modules (no `--lora_layers`), which match the 684 LoRA
