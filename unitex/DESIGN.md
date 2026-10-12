@@ -145,3 +145,6 @@ text are reported separately.
 - Training lines: every text.json line passing the filters (generated text included by default),
   15% of lines and 10% of whole layouts dropped so the model keeps painting from the reference, 30%
   of lines drawn as edges. With `--text_loss_weight` only drawn lines are weighted.
+- The projection trains in its own AdamW (`--glyph_layout_lr`). Prodigy picks one step size for all
+  its weights from the LoRA, about 1e-5 per weight per step on a warm start, so a projection that
+  starts at zero stays too small to matter within a fine-tune.

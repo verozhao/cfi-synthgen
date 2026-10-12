@@ -139,6 +139,7 @@ fixed_font_px=12 fixed_line_px=16 fixed_margin_px=0`. The trainer writes the res
 | `--glyph_layout` | off | every text line drawn at its place and size in each view (`unitex/glyph_layout.py`), VAE-encoded, on 64 extra input channels of the target tokens through a zero-initialised projection next to `x_embedder` |
 | `--glyph_layout_config` / `--glyph_layout_set k=v ...` | none | LayoutConfig (which lines, drops, share of edge-map lines) |
 | `--glyph_layout_probe_every N` | 0 | every N steps one more forward without the layout, logs the drawn small-text loss with and without it |
+| `--glyph_layout_lr lr` | 0 | a separate AdamW with this learning rate for the layout projection (0 = it stays in the main optimizer) |
 
 Other changes in the patch: position ids are built in fp32 everywhere (trainer call sites and
 `_prepare_latent_image_ids` in both task pipelines), the loss slice is `model_pred[:, :n_noise]`,
@@ -158,6 +159,9 @@ Other changes in the patch: position ids are built in fp32 everywhere (trainer c
   only covers the lines drawn in that sample's layout. The projection is saved as
   `glyph_layout_proj.safetensors` next to every `pytorch_lora_weights.safetensors`, and
   `run_unitex.py --glyph-layout` loads it. `layout_probe_rank<r>.jsonl` in the output dir has the probe.
+  Give the projection its own learning rate with `--glyph_layout_lr`. On a warm start Prodigy moves
+  each weight about 1e-5 per step, and after 250 steps the projection was 1% of `x_embedder`'s size
+  with under 1% less small-text loss in the probe.
 
 - **Warm start from the released LoRA** through `checkpoint-0` as above. It needs `--lora_rank 16
   --lora_alpha 16` and the default target modules (no `--lora_layers`), which match the 684 LoRA

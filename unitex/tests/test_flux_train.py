@@ -734,6 +734,11 @@ def worker(spec):
             raise
         res["end_error"] = f"AttributeError: {e}"
     res.update(losses=losses, calls=rec["calls"], lora_changed=bool((lora[0][1].detach() - before).abs().sum() > 0))
+    lp = getattr(trainer.transformer.x_embedder, "layout_proj", None)
+    if lp is not None:
+        res["layout_proj_max_after"] = float(lp.weight.detach().abs().max())
+        res["layout_in_main_optimizer"] = any(p is lp.weight for g in trainer.optimizer.param_groups for p in g["params"])
+        res["layout_optimizer"] = getattr(trainer, "layout_optimizer", None) is not None
     if "ids" in rec:
         torch.save(rec["ids"], os.path.join(out_dir, "img_ids.pt"))
     return res
@@ -910,6 +915,7 @@ def test_glyph_layout_channels(tmp_path, patched, pretrained, sample512):
     assert lay["losses"][0] == base["losses"][0]
     probe = [json.loads(s) for s in open(os.path.join(out, "layout_probe_rank0.jsonl"))]
     assert [p["step"] for p in probe] == [1, 2] and all(p["n_tokens"] > 0 for p in probe)
+    assert probe[0]["proj_mean_abs"] == 0.0 and probe[1]["proj_mean_abs"] > 0
     assert probe[0]["with"] == pytest.approx(probe[0]["without"], rel=1e-6)
     assert probe[1]["with"] != pytest.approx(probe[1]["without"], rel=1e-9, abs=0)
     cfg = json.load(open(os.path.join(out, "glyph_layout_config.json")))
@@ -931,12 +937,28 @@ def test_glyph_layout_channels(tmp_path, patched, pretrained, sample512):
     assert res0["layout_proj_abs"] == 0.0 and res0["lora_loaded"]
 
 
+def test_glyph_layout_lr(tmp_path, patched, pretrained, sample512):
+    """--glyph_layout_lr: the layout projection leaves Prodigy for its own AdamW, so the first step moves every
+    weight with a gradient by the learning rate. In Prodigy (d0 1e-6) the first step moves it about 1e-6."""
+    argv = ["--zero_text_embeds", "--glyph_layout", "--glyph_layout_set", "p_all_drop=0", "p_item_drop=0"]
+    slow = run_worker(tmp_path, patched, pretrained, sample512, argv=argv, steps=1)
+    fast = run_worker(tmp_path, patched, pretrained, sample512, argv=argv + ["--glyph_layout_lr", "1e-3"], steps=1)
+    assert slow["layout_in_main_optimizer"] and not slow["layout_optimizer"]
+    assert fast["layout_optimizer"] and not fast["layout_in_main_optimizer"]
+    assert fast["layout_proj_max_after"] == pytest.approx(1e-3, rel=1e-3)
+    assert 0 < slow["layout_proj_max_after"] < 1e-4
+    assert fast["losses"] == slow["losses"] and fast["lora_changed"]
+
+
 def test_glyph_layout_argument_checks(patched, tmp_path):
     common = BASE_ARGV + ["--pretrained_model_name_or_path", "x", "--output_dir", "y"]
     cases = {"ok": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_probe_every", "5"],
+             "lr": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_lr", "2e-4"],
              "x_embedder": common + ["--dataset_impl", "cfi", "--glyph_layout", "--train_x_embedder"],
              "probe_alone": common + ["--dataset_impl", "cfi", "--glyph_layout_probe_every", "5"],
              "probe_negative": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_probe_every", "-1"],
+             "lr_alone": common + ["--dataset_impl", "cfi", "--glyph_layout_lr", "2e-4"],
+             "lr_negative": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_lr", "-1"],
              "not_cfi": common + ["--glyph_layout"]}
     (tmp_path / "cases.json").write_text(json.dumps(cases))
     script = ("import json, sys\nimport launch\nout = {}\n"
@@ -949,8 +971,9 @@ def test_glyph_layout_argument_checks(patched, tmp_path):
                        env=env, cwd=patched, timeout=600)
     assert r.returncode == 0, r.stderr[-3000:]
     got = json.loads(r.stdout.strip().splitlines()[-1])
-    assert got == {"ok": "ok", "x_embedder": "ValueError", "probe_alone": "ValueError",
-                   "probe_negative": "ValueError", "not_cfi": "ValueError"}
+    assert got == {"ok": "ok", "lr": "ok", "x_embedder": "ValueError", "probe_alone": "ValueError",
+                   "probe_negative": "ValueError", "lr_alone": "ValueError", "lr_negative": "ValueError",
+                   "not_cfi": "ValueError"}
 
 
 @pytest.mark.skipif(not SLOW, reason="FLUX_TEST_SLOW=0")
