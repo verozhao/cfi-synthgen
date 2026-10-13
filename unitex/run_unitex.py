@@ -58,7 +58,12 @@ unitex/setup_unitex.sh, and this repo importable; all off by default, which runs
                              a 512 model, blocky at 1024 even with --pos-scale) and add back the
                              texture pass's detail above R. --shift-mu / --pos-scale / glyphs then
                              apply to the texture pass only
-  --texture-lora PATH        our texture LoRA (pytorch_lora_weights.safetensors of the patched
+  --delight-shading S        take only the shading of the delight pass: mv_rgb = lit x G(delit) / G(lit),
+                             G a Gaussian of S px per view at 512, in place of the detail add-back. The
+                             delight pass redraws small letters at its resolution, so everything finer
+                             than S comes from the texture pass (4 is the tested setting). The raw
+                             delight output is then also saved as cache/mv_rgb_delit_<res>.png
+  --texture-lora PATH       our texture LoRA (pytorch_lora_weights.safetensors of the patched
                              UniTEX-FLUX trainer). It REPLACES the released texture LoRA in the
                              texture pass, the delight pass keeps the released delight LoRA. A
                              checkpoint warm-started from mv_lora_weights already holds the released
@@ -412,7 +417,7 @@ def build_pipeline(args):
     from pipeline import CustomRGBTextureFullPipeline
     extra = {}
     if (args.glyph_json_name or args.view_res != 512 or args.shift_mu is not None or args.pos_scale is not None
-            or args.delight_res is not None):
+            or args.delight_res is not None or args.delight_shading is not None):
         if getattr(CustomRGBTextureFullPipeline, "GLYPH_API", 0) < 1:
             raise SystemExit(f"{root} is stock UniTEX: --glyph-* / --view-res need unitex/patches/UniTEX.patch "
                              "(unitex/setup_unitex.sh applies it)")
@@ -439,6 +444,10 @@ def build_pipeline(args):
             if getattr(CustomRGBTextureFullPipeline, "GLYPH_API", 0) < 4:
                 raise SystemExit(f"{root} has an older UniTEX.patch without --delight-res, re-apply the current one")
             extra["delight_res"] = args.delight_res
+        if args.delight_shading is not None:
+            if getattr(CustomRGBTextureFullPipeline, "GLYPH_API", 0) < 7:
+                raise SystemExit(f"{root} has an older UniTEX.patch without --delight-shading, re-apply the current one")
+            extra["delight_shading"] = args.delight_shading
     pipe = CustomRGBTextureFullPipeline(
         super_resolutions=False,
         filt_gradient_points=False,
@@ -603,6 +612,8 @@ def run(args):
             rec["pos_scale"] = args.pos_scale
         if args.delight_res is not None:
             rec["delight_res"] = args.delight_res
+        if args.delight_shading is not None:
+            rec["delight_shading"] = args.delight_shading
         if args.ref_text_blur:
             rec["ref_text_blur"] = {"max_height": args.ref_text_max_height}
             if getattr(pipe, "ref_text_state", None):
@@ -714,6 +725,9 @@ def main(argv=None):
     g.add_argument("--delight-res", type=int, default=None,
                    help="px per view of the delight pass (512: the released delight LoRA's), detail above it "
                         "comes from the texture pass")
+    g.add_argument("--delight-shading", type=float, default=None, metavar="S",
+                   help="take only the shading of the delight pass, a Gaussian of S px per view at 512 (4: the "
+                        "tested setting): letters and fine print come from the texture pass")
     g.add_argument("--glyph-json-name", default=None,
                    help="per-SKU text.json, relative to <eval>/<sku>/ or with {eval} {sku}; turns glyphs on")
     g.add_argument("--glyph-mode", choices=("center", "stretch", "warp"), default=None,
@@ -755,6 +769,8 @@ def main(argv=None):
         p.error("--view-res must be a positive multiple of 16")
     if args.delight_res is not None and (args.delight_res <= 0 or args.delight_res % 16):
         p.error("--delight-res must be a positive multiple of 16")
+    if args.delight_shading is not None and not args.delight_shading > 0:
+        p.error("--delight-shading must be > 0")
     glyph_opts = [o for o, v in (("--glyph-mode", args.glyph_mode), ("--glyph-kind", args.glyph_kind),
                                  ("--glyph-config", args.glyph_config), ("--glyph-set", args.glyph_set),
                                  ("--glyph-delight", args.glyph_delight),

@@ -244,7 +244,7 @@ diff --git a/pipeline.py b/pipeline.py
          quantization_config = BitsAndBytesConfig(
              load_in_4bit=True,
              bnb_4bit_quant_type="nf4",
-@@ -136,8 +138,66 @@
+@@ -136,8 +138,96 @@
  
  
  
@@ -261,16 +261,41 @@ diff --git a/pipeline.py b/pipeline.py
 +    return Image.fromarray(np.clip(np.rint(up + hi - hi_low), 0, 255).astype(np.uint8))
 +
 +
++def shading_detail(low, high, sigma, n_views=6, eps=4.0):
++    """CFI: only the shading of the delight pass on the texture pass's strip: high * G(up(low)) / G(high),
++    G a Gaussian of sigma px at high's size inside each of the n_views tiles, ratio clipped to [1/5, 5].
++    The delight pass redraws small text at its resolution, so everything finer than sigma (letters,
++    fine print) comes from the texture pass and only the smooth lighting change from the delight pass.
++    With low = high it returns high."""
++    W, H = high.size
++    w = W // n_views
++    up = torch.from_numpy(np.asarray(low.convert('RGB').resize((W, H), Image.BICUBIC), dtype=np.float32))
++    hi = torch.from_numpy(np.asarray(high.convert('RGB'), dtype=np.float32))
++    r = max(1, int(round(4 * sigma)))
++    k = torch.exp(-0.5 * (torch.arange(-r, r + 1, dtype=torch.float32) / sigma) ** 2)
++    k = k / k.sum()
++
++    def blur(x):      # (H, W, 3) -> the same, blurred per view tile with reflected borders
++        t = x.permute(2, 0, 1).reshape(3, H, n_views, w).permute(2, 0, 1, 3).reshape(3 * n_views, 1, H, w)
++        t = torch.nn.functional.pad(t, (r, r, r, r), mode='reflect')
++        t = torch.nn.functional.conv2d(torch.nn.functional.conv2d(t, k.view(1, 1, -1, 1)), k.view(1, 1, 1, -1))
++        return t.reshape(n_views, 3, H, w).permute(1, 2, 0, 3).reshape(3, H, W).permute(1, 2, 0)
++
++    ratio = ((blur(up) + eps) / (blur(hi) + eps)).clamp(0.2, 5.0)
++    return Image.fromarray(np.clip(np.rint((hi * ratio).numpy()), 0, 255).astype(np.uint8))
++
++
  class RGBTextureFullPipelineBase:
 -    def __init__(self, pretrain_models=None, pipeline_name='texture_plus',super_resolutions=False, seed=0, speedup_mode=None,add_lora_path=None, add_lora_weights=None, filt_gradient_points=False,filt_large_angle_points=True, enable_rembg=False):
 +    # CFI: view_res / glyph options below (unitex/patches/UniTEX.patch in cfi-synthgen)
-+    GLYPH_API = 6     # 2: shift_mu, 3: pos_scale, 4: delight_res, 5: glyph_layout / glyph_tokens, 6: glyph_layout_mode
++    GLYPH_API = 7     # 2: shift_mu, 3: pos_scale, 4: delight_res, 5: glyph_layout / glyph_tokens, 6: glyph_layout_mode,
++                      # 7: delight_shading
 +
 +    def __init__(self, pretrain_models=None, pipeline_name='texture_plus',super_resolutions=False, seed=0, speedup_mode=None,add_lora_path=None, add_lora_weights=None, filt_gradient_points=False,filt_large_angle_points=True, enable_rembg=False,
 +                 view_res=512, glyph_config=None, glyph_delight=False, glyph_sample_mode='argmax',
 +                 shift_mu=None, pos_scale=None, delight_res=None,
 +                 glyph_layout=False, glyph_layout_config=None, glyph_tokens=True,
-+                 glyph_layout_mode='channels', glyph_layout_max_tokens=4096):
++                 glyph_layout_mode='channels', glyph_layout_max_tokens=4096, delight_shading=None):
 +        # glyph_layout: draw the glyph text.json's lines at their place and size (cfi-synthgen
 +        # unitex/glyph_layout.py) and feed them to the texture pass (needs a LoRA trained with
 +        # --glyph_layout in the same glyph_layout_mode): extra input channels of the target tokens
@@ -305,6 +330,11 @@ diff --git a/pipeline.py b/pipeline.py
 +        self.delight_res = None if delight_res is None or int(delight_res) == self.view_res else int(delight_res)
 +        if self.delight_res is not None and self.delight_res % 16:
 +            raise ValueError(f'delight_res must be a multiple of 16, got {delight_res}')
++        # delight_shading: take only the shading of the delight pass, a Gaussian of this many px per view
++        # at 512 (shading_detail), in place of add_detail. None keeps the delight output as it is.
++        self.delight_shading = None if delight_shading is None else float(delight_shading)
++        if self.delight_shading is not None and not self.delight_shading > 0:
++            raise ValueError(f'delight_shading must be > 0, got {delight_shading}')
 +        self.glyph_config = glyph_config
 +        self.glyph_delight = bool(glyph_delight)
 +        self.glyph_sample_mode = glyph_sample_mode
@@ -312,7 +342,7 @@ diff --git a/pipeline.py b/pipeline.py
          pipeline,weights_for_texture,weights_for_delight,adapter_names = build_pipeline(pretrain_models=pretrain_models, pipeline_name=pipeline_name,speedup_mode = speedup_mode, add_lora_path=add_lora_path,add_lora_weights=add_lora_weights, model='rgb')
          if enable_rembg:
              rembg_session = build_rembg()
-@@ -184,31 +244,34 @@
+@@ -184,31 +274,34 @@
  
      @CPUTimer('preprocess_reference_image')
      def preprocess_reference_image(self, save_dir, input_image_path, scale=0.95, color='grey'):
@@ -353,7 +383,7 @@ diff --git a/pipeline.py b/pipeline.py
              fov_deg=49.1,
              scale=scale,
              perspective=False,
-@@ -231,20 +294,115 @@
+@@ -231,20 +324,115 @@
          torch.save(camera_info, os.path.join(save_dir, 'camera_info.pth'))
  
  
@@ -473,7 +503,7 @@ diff --git a/pipeline.py b/pipeline.py
              self.pipeline.set_adapters(adapter_names=self.adapter_names, adapter_weights=self.weights_for_texture)
              out = self.pipeline(
                  prompt='[MVFLUX]',
-@@ -252,37 +410,58 @@
+@@ -252,37 +440,62 @@
                  dual_image=reference_image,
                  prompt_embeds=None,
                  pooled_prompt_embeds=None,
@@ -529,8 +559,12 @@ diff --git a/pipeline.py b/pipeline.py
              )
              out_delighted_image = out.images[0]
 -            img_temp = np.array(out_delighted_image).reshape(512, 6, 512, -1)
-+            if Rd != R:
++            shading = getattr(self, 'delight_shading', None)
++            if Rd != R or shading is not None:
 +                out_delighted_image.save(os.path.join(save_dir, f'mv_rgb_delit_{Rd}.png'))
++            if shading is not None:
++                out_delighted_image = shading_detail(out_delighted_image, out_image, shading * R / 512)
++            elif Rd != R:
 +                out_delighted_image = add_detail(out_delighted_image, out_image)
 +            img_temp = np.array(out_delighted_image).reshape(R, 6, R, -1)
              img_temp[:,5] = img_temp[::-1,5,::-1]
@@ -539,7 +573,7 @@ diff --git a/pipeline.py b/pipeline.py
              
              if self.super_resolutions:
                  mv_rgb.save(os.path.join(save_dir, 'mv_rgb_lr.png'))
-@@ -576,13 +755,13 @@
+@@ -576,13 +789,13 @@
  
  
  class RGBTextureFullPipeline(RGBTextureFullPipelineBase):
@@ -555,7 +589,7 @@ diff --git a/pipeline.py b/pipeline.py
  
      def step_2_1(self, cache_dir:str, input_image_path:str, input_mesh_path:str, clear_cache=False, *args, **kwargs):
          self.reproject_and_query_field(cache_dir, os.path.join(cache_dir, 'processed_mesh.obj'), os.path.join(cache_dir, 'mv_rgb.png'), os.path.join(cache_dir, 'camera_info.pth'), inpainting=False)
-@@ -607,7 +786,9 @@
+@@ -607,7 +820,9 @@
          input_image_path:str, 
          input_mesh_path:str, 
          clear_cache=False,
@@ -565,7 +599,7 @@ diff --git a/pipeline.py b/pipeline.py
          os.makedirs(save_dir, exist_ok=True)
          cache_dir = os.path.join(os.path.abspath(save_dir), 'cache')
          os.makedirs(cache_dir, exist_ok=True)
-@@ -616,6 +797,7 @@
+@@ -616,6 +831,7 @@
              input_image_path=input_image_path, 
              input_mesh_path=input_mesh_path, 
              clear_cache=clear_cache,

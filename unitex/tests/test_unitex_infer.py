@@ -402,7 +402,7 @@ def test_c_view_res_1024_ids_unique_in_fp32(pipes, tiny, eval2):
 # ────────────────────────────────────────────────────────────────────────────
 
 CLASSES = ("RGBTextureFullPipelineBase", "RGBTextureFullPipeline", "CustomRGBTextureFullPipeline")
-HELPERS = ("add_detail",)          # module-level functions the patch adds (numpy / PIL only)
+HELPERS = ("add_detail", "shading_detail")    # module-level functions the patch adds (numpy / PIL / torch)
 
 
 class FakeExporter:
@@ -475,7 +475,7 @@ def unitex_classes(src_dir, flux=None):
           "build_rembg": lambda: None, "VideoExporter": FakeExporter,
           "NVDiffRendererInverse": lambda device=None: None, "TSDSRPipeline": None}
     exec(compile(ast.Module(body=body, type_ignores=[]), path, "exec"), ns)
-    return types.SimpleNamespace(**{k: ns[k] for k in CLASSES})
+    return types.SimpleNamespace(**{k: ns[k] for k in CLASSES + HELPERS if k in ns})
 
 
 def _grids(d, R, seed=0):
@@ -549,6 +549,60 @@ def test_delight_res_runs_delight_smaller_and_restores_detail(repos, tmp_path):
         grids[name] = np.asarray(Image.open(d / "mv_rgb.png"))
     assert grids["low"].shape == grids["full"].shape == (128, 192, 3)
     assert np.abs(grids["low"].astype(int) - grids["full"].astype(int)).max() <= 1
+
+
+def test_shading_detail_keeps_the_texture_pass_letters_and_the_delight_shading(repos):
+    """lit = albedo x smooth shading, the delight pass gives the albedo at half resolution with its letters
+    redrawn 3 px off: the merge is the albedo with the lit letters, add_detail keeps the redrawn ones."""
+    C = unitex_classes(repos["patched"])
+    R, V = 64, 6
+    rng = np.random.default_rng(0)
+    albedo = np.where(rng.random((R // 4, V * R // 4)) < 0.4, 40.0, 220.0).repeat(4, 0).repeat(4, 1)[..., None] \
+        * np.ones(3)
+    x = np.arange(V * R) % R / (R - 1)
+    shade = (0.55 + 0.4 * x)[None, :, None] * np.ones((R, 1, 3))
+    lit = Image.fromarray(np.rint(albedo * shade).astype(np.uint8))
+    redrawn = np.roll(albedo, 3, axis=1).astype(np.uint8)
+    delit = Image.fromarray(redrawn).resize((V * R // 2, R // 2), Image.LANCZOS)
+    out = np.asarray(C.shading_detail(delit, lit, 4.0), dtype=np.float32)
+    old = np.asarray(C.add_detail(delit, lit), dtype=np.float32)
+    inner = (slice(8, -8), np.concatenate([np.arange(v * R + 8, (v + 1) * R - 8) for v in range(V)]))
+    err_new = np.abs(out - albedo)[inner].mean()
+    err_old = np.abs(old - albedo)[inner].mean()
+    err_lit = np.abs(np.asarray(lit, dtype=np.float32) - albedo)[inner].mean()
+    assert err_new < 0.4 * err_old and err_new < 0.6 * err_lit, (err_new, err_old, err_lit)
+    # the same image as delight output changes nothing, at any sigma
+    for s in (0.5, 4.0):
+        assert np.array_equal(np.asarray(C.shading_detail(lit, lit, s)), np.asarray(lit))
+
+
+@pytest.mark.parametrize("delight_res", [None, 32])
+def test_delight_shading_replaces_add_detail_only_when_set(repos, tmp_path, delight_res):
+    """A 64 run with delight_shading 4 (px at 512, so 0.5 px at 64): the raw delight output is saved and
+    mv_rgb is shading_detail of it and the lit strip. A pass-through FLUX at the same resolution gives
+    back the lit strip unchanged."""
+    C = unitex_classes(repos["patched"])
+    grids = {}
+    for name, extra in (("off", {}), ("on", {"delight_shading": 4.0})):
+        d = tmp_path / name
+        d.mkdir()
+        kw = {} if delight_res is None else {"delight_res": delight_res}
+        pipe = C.CustomRGBTextureFullPipeline(seed=0, view_res=64, **kw, **extra)
+        pipe.infer_mv(str(d), *_grids(str(d), 64))
+        Rd = delight_res or 64
+        assert (d / f"mv_rgb_delit_{Rd}.png").exists() == (name == "on" or delight_res is not None)
+        grids[name] = np.asarray(Image.open(d / "mv_rgb.png"))
+        if name == "on":
+            want = C.shading_detail(Image.open(d / f"mv_rgb_delit_{Rd}.png"), Image.open(d / "mv_rgb_w_light.png"),
+                                    0.5)
+            t = np.array(want).reshape(64, 6, 64, -1)
+            t[:, 5] = t[::-1, 5, ::-1]
+            want = t.transpose(1, 0, 2, 3)[[0, 2, 4, 3, 1, 5]].reshape(2, 3, 64, 64, -1).transpose(0, 2, 1, 3, 4)
+            assert np.array_equal(grids[name], want.reshape(128, 192, -1))
+    if delight_res is None:
+        assert np.array_equal(grids["on"], grids["off"])
+    with pytest.raises(ValueError, match="delight_shading"):
+        C.CustomRGBTextureFullPipeline(seed=0, view_res=64, delight_shading=0)
 
 
 @pytest.mark.parametrize("pos_scale", [None, 0.5])
@@ -841,7 +895,8 @@ def test_d_missing_text_json_and_flag_validation(eval2, tmp_path):
     assert r.returncode == 0 and _log(eval2, "pattern")[0]["status"] == "ok"
     for bad in (["--glyph-mode", "warp"], ["--glyph-delight"], ["--glyph-set", "token_budget=1"],
                 ["--glyph-json-name", "text.json", "--glyph-set", "no_such_field=1"],
-                ["--glyph-json-name", "text.json", "--view-res", "768"], ["--view-res", "500"]):
+                ["--glyph-json-name", "text.json", "--view-res", "768"], ["--view-res", "500"],
+                ["--delight-shading", "0"], ["--delight-shading", "-2"]):
         r = _run_unitex("--eval-dir", eval2, "--dry-run", "--run-name", "bad", *bad)
         assert r.returncode == 2, (bad, r.stderr)
 

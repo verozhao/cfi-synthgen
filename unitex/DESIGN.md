@@ -98,7 +98,7 @@ Only the front view has ground truth. Stages scored against the photo's OCR:
 | `ref512` | UniTEX `processed_image.png` | input ceiling: what FLUX can see |
 | `vae512` | `ref512` after a FLUX VAE round trip | representational ceiling at 512 px |
 | `lit` | `mv_rgb_w_light.png` slot 0 | texture LoRA output |
-| `delit` | `mv_rgb.png` front tile | after the delight LoRA |
+| `delit` | `mv_rgb.png` front tile | after the delight LoRA (with `--delight-shading`, its shading on `lit`) |
 | `baked` | `textured_mesh.glb` rendered from the front at 1024 | final asset |
 | `baseline` | our current `textured.glb` rendered from the front | current Gemini pipeline |
 
@@ -167,3 +167,48 @@ text are reported separately.
   small-text loss with those tokens fell to about a quarter of the loss without them. Font and edges
   ink gave no gain after 200 steps: it has to be turned into the label's own lettering and colours,
   which a short fine-tune does not learn. A crop is the closest a real photo gets to the oracle.
+- Crop eval (`layouttokC_1024_ft500`, crops for 70% of training lines, 500 AdamW steps). Every line of
+  the 6 test products is scored at its photo-registered spot (`eval_text --align homography`), 56
+  lines in all.
+  - With the photo's text blurred (`--ref-text-blur`) only the crops show the text. The final view
+    then reads 28 of the 56 lines. Every earlier run with blurred text read at most 13 and no line
+    under 16 px, with glyph tokens or without. So the glyph tokens never carried text, and the crops do.
+  - With the sharp photo the crop run reads 34 lines in the final view and the same LoRA without a
+    layout reads 30. Before the delight pass the crop run reads 39, the most of any run. The delight
+    pass loses the difference (step 6).
+
+## Delight shading (step 6)
+
+- At 1024 px per view the delight pass runs at half size (`--delight-res 512`), and `add_detail` puts
+  back the texture pass's detail above that size. Below it the delight output is used as it is, and
+  the delight LoRA redraws small letters there. In the crop run Gluten became Bluten, charms became
+  Suleua and CONDENSED became (BOBURO).
+- `--delight-shading S` takes only the shading from the delight pass: `mv_rgb = lit * G(delit) / G(lit)`.
+  G is a Gaussian of S px per view at 512, applied inside each view tile. The ratio is clipped to
+  [0.2, 5]. Letters and fine print come from the texture pass, and the raw delight output is also
+  saved (`mv_rgb_delit_<res>.png`). The option needs GLYPH_API 7.
+- The merge depends only on the two saved strips, so it was tested on finished runs. `add_detail` on
+  `mv_rgb_w_light.png` and `mv_rgb_delit_512.png` rebuilds the saved `mv_rgb.png` exactly. Additive
+  and multiplicative merges at three widths were tried on the crop run. The multiplicative one at
+  S = 4 was kept and run on six more runs, with the pipeline's own `shading_detail`.
+- Colours and broad shading stay those of the delight output. The difference to it is on letter and
+  line edges.
+- Lines read out of 56. The last column counts the 28 lines under 16 px:
+
+| run | lit | delit now | delit with `--delight-shading 4` | under 16 px, now → with |
+|---|---|---|---|---|
+| crop layout, sharp photo | 39 | 34 | 39 | 10 → 14 |
+| font layout, sharp photo | 37 | 34 | 39 | 9 → 13 |
+| same LoRA, no layout | 34 | 30 | 34 | 8 → 9 |
+| crop layout, photo text blurred | 32 | 28 | 33 | 5 → 8 |
+| `rb_new_fixed_sharp` (reference text blur LoRA) | 37 | 35 | 36 | 9 → 11 |
+| `tl_fixed_sharp` (text loss LoRA) | 37 | 33 | 37 | 9 → 11 |
+| `g1024_final` (glyph tokens LoRA at 1024) | 36 | 31 | 35 | 8 → 11 |
+
+- Over the seven runs the merge turns 31 missed lines into hits. It turns 3 hits into misses. Each
+  run ends near its own lit score.
+- With the merge the crop layout reads 39 lines and the same LoRA without a layout reads 34. The crop
+  and font layouts tie overall, and both lead every run without a layout on small text.
+- OCR noise: the stylised Lucky Charms logo reads charms or SulEUD in two images that differ by at
+  most one grey level. A difference of one line between runs is noise.
+- Lighting features finer than S, such as small glints, are kept from the lit view.
