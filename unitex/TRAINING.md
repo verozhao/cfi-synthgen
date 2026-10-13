@@ -170,6 +170,15 @@ Other changes in the patch: position ids are built in fp32 everywhere (trainer c
   `--glyph_layout_mode tokens`: the same layout latent goes in as tokens on the glyph plane at the
   text's own target tokens, and the model reads them through attention. Inference:
   `run_unitex.py --glyph-layout --glyph-layout-mode tokens` (no projection file, no GlyphAnchor tokens).
+- **AdamW for fine-tunes.** Add `--optimizer AdamW --learning_rate 1e-4 --lr_scheduler
+  constant_with_warmup --lr_warmup_steps 20`. Prodigy restarts its step size estimate on a warm start,
+  and a fine-tune of a trained LoRA then barely moves it (0.04% of the effective weights in 100 steps).
+- **Crops for the layout.** `--glyph_layout_set p_edges=0.0 p_crop=0.7 crop_shift=1.0 crop_blur=0.75
+  crop_color=0.15` draws 70% of the training lines as degraded crops of the target view and the rest
+  as font. Inference: `--glyph-layout-kind crop` with a registered text json (`front_image`), so
+  front-view lines get crops of the photo and other views fall back to font.
+  `--glyph_layout_oracle` (diagnostic) feeds the clean target latents instead of the drawn layout,
+  which shows how fast aligned layout tokens can be learned at all.
 
 - **Warm start from the released LoRA** through `checkpoint-0` as above. It needs `--lora_rank 16
   --lora_alpha 16` and the default target modules (no `--lora_layers`), which match the 684 LoRA

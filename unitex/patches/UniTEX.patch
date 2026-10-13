@@ -372,7 +372,7 @@ diff --git a/pipeline.py b/pipeline.py
 +        R = getattr(self, 'view_res', 512)
 +        text = gt.load_text(glyph_text)
 +        views = None
-+        if cfg.infer_kind == 'edges' and text is not None and text.get('front_image'):
++        if cfg.infer_kind in gla.VIEW_KINDS and text is not None and text.get('front_image'):
 +            views = [gt.front_view_image(text['front_image'], text.get('_dir'), R)] + [None] * 5
 +        strip, info = gla.layout_strip(text, R, cfg, rng=None, views=views)
 +        Image.fromarray(strip).save(os.path.join(save_dir, 'glyph_layout.png'))

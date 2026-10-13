@@ -69,7 +69,7 @@ unitex/setup_unitex.sh, and this repo importable; all off by default, which runs
                              input channels of the target tokens through glyph_layout_proj.safetensors
                              next to the LoRA) or tokens (layout tokens on the glyph plane at the text's
                              own target tokens, no GlyphAnchor tokens). --glyph-layout-kind font |
-                             edges, --glyph-layout-set k=v, --no-glyph-tokens (the layout only)
+                             edges | crop, --glyph-layout-set k=v, --no-glyph-tokens (the layout only)
   Added outputs: cache/glyph_tokens.json (instances, token counts, config); run_log.jsonl and
   run_info.json get "view_res" and "glyph" (settings, n_instances, n_tokens, tokens_per_view).
   With --glyph-layout also cache/glyph_layout.png (the drawn strip) and glyph_layout.json.
@@ -234,7 +234,7 @@ def layout_summary(glyph_text, cfg, view_res, mode="channels", max_tokens=LAYOUT
     from unitex import glyph_tokens as gt
     text = gt.load_text(glyph_text)
     views = None
-    if cfg.infer_kind == "edges" and text is not None and text.get("front_image"):
+    if cfg.infer_kind in gla.VIEW_KINDS and text is not None and text.get("front_image"):
         views = [gt.front_view_image(text["front_image"], text.get("_dir"), view_res)] + [None] * 5
     strip, info = gla.layout_strip(text, view_res, cfg, rng=None, views=views)
     out = {"text_json": glyph_text if isinstance(glyph_text, str) else None, "mode": mode, "view_res": view_res,
@@ -740,8 +740,9 @@ def main(argv=None):
                    help="channels (default): layout channels of the target tokens through the LoRA's "
                         "glyph_layout_proj.safetensors. tokens: layout tokens on the glyph plane at the text's own "
                         "target tokens (implies --no-glyph-tokens)")
-    g.add_argument("--glyph-layout-kind", choices=("font", "edges"), default=None,
-                   help="LayoutConfig.infer_kind: font (default) or edges of the registered photo (front view)")
+    g.add_argument("--glyph-layout-kind", choices=("font", "edges", "crop"), default=None,
+                   help="LayoutConfig.infer_kind: font (default), or edges or crops of the registered photo "
+                        "(front view)")
     g.add_argument("--glyph-layout-set", action="append", default=None, metavar="KEY=VALUE",
                    help="LayoutConfig override, repeatable")
     g.add_argument("--no-glyph-tokens", action="store_true",

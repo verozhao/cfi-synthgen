@@ -11,7 +11,7 @@ index d4fa89b..d400e75 100644
  from matplotlib import pyplot as plt
  import numpy as np
 diff --git a/launch.py b/launch.py
-index 566ae4f..5e5bf3b 100644
+index 566ae4f..111d37b 100644
 --- a/launch.py
 +++ b/launch.py
 @@ -32,6 +32,7 @@ from torchvision.transforms.functional import crop
@@ -22,7 +22,7 @@ index 566ae4f..5e5bf3b 100644
  import diffusers
  from diffusers import (
      AutoencoderKL,
-@@ -800,6 +801,85 @@ def parse_args(input_args=None):
+@@ -800,6 +801,88 @@ def parse_args(input_args=None):
              " or to a folder containing files that 🤗 Datasets can understand."
          ),
      )
@@ -93,6 +93,9 @@ index 566ae4f..5e5bf3b 100644
 +                             "appended as tokens on the glyph plane at exactly those target tokens' (row, col)")
 +    parser.add_argument("--glyph_layout_max_tokens", type=int, default=4096,
 +                        help="tokens mode: at most this many layout tokens, the lines with the most tokens left out")
++    parser.add_argument("--glyph_layout_oracle", action="store_true",
++                        help="diagnostic, tokens mode: the layout tokens carry the clean target latent of the target "
++                             "tokens they sit on instead of the drawn layout (how fast aligned tokens can be learned)")
 +    parser.add_argument("--glyph_layout_config", type=str, default=None,
 +                        help="LayoutConfig as a JSON file or an inline JSON object")
 +    parser.add_argument("--glyph_layout_set", type=str, nargs="*", default=[],
@@ -108,7 +111,7 @@ index 566ae4f..5e5bf3b 100644
      if input_args is not None:
          args = parser.parse_args(input_args)
      else:
-@@ -835,6 +915,48 @@ def parse_args(input_args=None):
+@@ -835,6 +918,50 @@ def parse_args(input_args=None):
      assert len(args.multiscale_training_step_range) == 2, \
          f'multiscale_training error: {args.multiscale_training_step_range}'
  
@@ -153,11 +156,13 @@ index 566ae4f..5e5bf3b 100644
 +            raise ValueError("--glyph_layout_mode tokens replaces --glyph (both use the glyph plane)")
 +        if args.glyph_layout_max_tokens < 1:
 +            raise ValueError("--glyph_layout_max_tokens must be >= 1")
++    if args.glyph_layout_oracle and not (args.glyph_layout and args.glyph_layout_mode == "tokens"):
++        raise ValueError("--glyph_layout_oracle needs --glyph_layout --glyph_layout_mode tokens")
 +
      env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
      if env_local_rank != -1 and env_local_rank != args.local_rank:
          args.local_rank = env_local_rank
-@@ -902,7 +1024,28 @@ def main(args):
+@@ -902,7 +1029,29 @@ def main(args):
          transformers.utils.logging.set_verbosity_error()
          diffusers.utils.logging.set_verbosity_error()
      # dataset perparation
@@ -182,12 +187,13 @@ index 566ae4f..5e5bf3b 100644
 +                    f"glyph layout {args.glyph_layout_mode if args.glyph_layout else 'off'}"
 +                    + (f" (projection AdamW lr {args.glyph_layout_lr})" if args.glyph_layout_lr else "")
 +                    + (f" (at most {args.glyph_layout_max_tokens} tokens)"
-+                       if args.glyph_layout and args.glyph_layout_mode == "tokens" else ""))
++                       if args.glyph_layout and args.glyph_layout_mode == "tokens" else "")
++                    + (", ORACLE: clean target latents" if args.glyph_layout_oracle else ""))
 +    elif args.dataset_name_list is None:
          train_dataset = PBRTextureGenerationDataset(
              args.dataset_name, 
              MVDatasetConfig(
-@@ -928,6 +1071,7 @@ def main(args):
+@@ -928,6 +1077,7 @@ def main(args):
                  bump_background_color=args.background_color,
                  metallic_background_color=args.background_color,
                  roughness_background_color=args.background_color,
@@ -195,7 +201,7 @@ index 566ae4f..5e5bf3b 100644
                  skip_broken=True,
              ), 
              extra_dataset=ReconstructDataset(
-@@ -936,7 +1080,8 @@ def main(args):
+@@ -936,7 +1086,8 @@ def main(args):
                      image_ext='.mdb',
                      skip_broken=True,
                      rgb_background_color=args.background_color,
@@ -205,7 +211,7 @@ index 566ae4f..5e5bf3b 100644
                  ),
              ),
          )
-@@ -967,6 +1112,7 @@ def main(args):
+@@ -967,6 +1118,7 @@ def main(args):
                      bump_background_color=args.background_color,
                      metallic_background_color=args.background_color,
                      roughness_background_color=args.background_color,
@@ -213,7 +219,7 @@ index 566ae4f..5e5bf3b 100644
                      skip_broken=True,
                  ), 
                  extra_dataset=ReconstructDataset(
-@@ -974,7 +1120,8 @@ def main(args):
+@@ -974,7 +1126,8 @@ def main(args):
                      ReconstructDatasetConfig(
                          image_ext='.mdb',
                          rgb_background_color=args.background_color,
@@ -264,7 +270,7 @@ index c07b0a9..bfada15 100644
  
      def prepare_latents_and_image_ids(
 diff --git a/tasks/texturing/trainer.py b/tasks/texturing/trainer.py
-index 494a389..1f0dbb5 100644
+index 494a389..e04f26e 100644
 --- a/tasks/texturing/trainer.py
 +++ b/tasks/texturing/trainer.py
 @@ -80,6 +80,29 @@ from safetensors.torch import save_file, load_file
@@ -724,7 +730,7 @@ index 494a389..1f0dbb5 100644
 +        gla = glyph_layout()
 +        rng = glyph_tokens().glyph_rng(self.args.seed, global_step, micro_step, accelerator.process_index, 1)
 +        R = training_image.shape[-2]
-+        views = glyph_tokens().strip_to_views(training_image[0], R) if self.layout_cfg.p_edges > 0 else None
++        views = glyph_tokens().strip_to_views(training_image[0], R) if gla.needs_views(self.layout_cfg) else None
 +        strip, info = gla.layout_strip(texts[0], R, self.layout_cfg, rng=rng, views=views)
 +        self.last_layout_info = info
 +        if not self.layout_channels():
@@ -835,7 +841,7 @@ index 494a389..1f0dbb5 100644
                      if condition_latents is not None:
                          if self.args.random_drop_condition and 0.0 <= self.args.random_drop_condition_probability <= 1.0:
                              if random.random() < 1.0:
-@@ -1015,20 +1261,54 @@ class Trainer(PBRFluxPipeline):
+@@ -1015,20 +1261,60 @@ class Trainer(PBRFluxPipeline):
                                  random_drop_condition = False
                          latents = torch.cat([latents, condition_latents], dim=1)
                          latent_image_ids = torch.cat([latent_image_ids, condition_ids], dim=0)
@@ -854,6 +860,12 @@ index 494a389..1f0dbb5 100644
 +                        lay_latents, lay_ids = self.prepare_glyph_layout(batch, training_image, global_step, step, accelerator)
 +                        self.last_n_layout = lay_latents.shape[1]
 +                        if self.last_n_layout:
++                            if getattr(self.args, "glyph_layout_oracle", False):
++                                # diagnostic: the clean target latent of the target tokens the layout
++                                # tokens sit on (ids (1, row, col), row-major over (HL/2, WL/2))
++                                clean = self._pack_latents(model_input, BL, CL, HL, WL)
++                                idx = lay_ids[:, 1].long() * (WL // 2) + lay_ids[:, 2].long()
++                                lay_latents = clean[:, idx.to(clean.device)]
 +                            latents = torch.cat([latents, lay_latents.to(latents.dtype)], dim=1)
 +                            latent_image_ids = torch.cat([latent_image_ids, lay_ids.to(latent_image_ids)], dim=0)
                      # 4. predict
@@ -902,7 +914,7 @@ index 494a389..1f0dbb5 100644
                          
                      model_pred_mask = torch.ones_like(model_pred)
                      if self.args.random_drop_noise and 0.0 <= self.args.random_drop_noise_probability <= 1.0:
-@@ -1037,6 +1317,12 @@ class Trainer(PBRFluxPipeline):
+@@ -1037,6 +1323,12 @@ class Trainer(PBRFluxPipeline):
                              index_noise = index_noise.unsqueeze(0).unsqueeze(-1).repeat(model_pred_zero.shape[0], 1, model_pred_zero.shape[-1])
                              model_pred = model_pred_zero.scatter(1, index_noise, model_pred)
                              model_pred_mask = model_pred_zero.scatter(1, index_noise, torch.ones_like(model_pred))
@@ -915,7 +927,7 @@ index 494a389..1f0dbb5 100644
                      # model_pred = self._unpack_latents(
                      #     model_pred,
                      #     height=height,
-@@ -1056,6 +1342,13 @@ class Trainer(PBRFluxPipeline):
+@@ -1056,6 +1348,13 @@ class Trainer(PBRFluxPipeline):
                      width=model_input.shape[3] * vae_scale_factor,
                      vae_scale_factor=vae_scale_factor,
                      )
@@ -929,7 +941,7 @@ index 494a389..1f0dbb5 100644
                      # 5. flow matching loss
                      # these weighting schemes use a uniform timestep sampling
                      # and instead post-weight the loss
-@@ -1079,7 +1372,12 @@ class Trainer(PBRFluxPipeline):
+@@ -1079,7 +1378,12 @@ class Trainer(PBRFluxPipeline):
                          prior_loss = prior_loss.mean()
  
                      # Compute regular loss.
@@ -943,7 +955,7 @@ index 494a389..1f0dbb5 100644
  
                      if self.args.with_prior_preservation:
                          # Add the prior loss to the instance loss.
-@@ -1096,12 +1394,30 @@ class Trainer(PBRFluxPipeline):
+@@ -1096,12 +1400,30 @@ class Trainer(PBRFluxPipeline):
                          loss = loss + args.preconditioning_loss_weight * preconditioning_loss
  
                      accelerator.backward(loss)
@@ -974,7 +986,7 @@ index 494a389..1f0dbb5 100644
                      self.lr_scheduler.step()
                      self.optimizer.zero_grad()
                      # breakpoint()
-@@ -1142,6 +1458,17 @@ class Trainer(PBRFluxPipeline):
+@@ -1142,6 +1464,17 @@ class Trainer(PBRFluxPipeline):
  
  
                  logs = {"loss": loss.detach().item(), "lr": self.lr_scheduler.get_last_lr()[0]}
@@ -992,7 +1004,7 @@ index 494a389..1f0dbb5 100644
                  progress_bar.set_postfix(**logs)
                  accelerator.log(logs, step=global_step)
  
-@@ -1155,7 +1482,8 @@ class Trainer(PBRFluxPipeline):
+@@ -1155,7 +1488,8 @@ class Trainer(PBRFluxPipeline):
              self.save_lora_layers(accelerator, self.args.output_dir)
  
          # Final inference

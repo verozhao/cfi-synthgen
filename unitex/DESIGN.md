@@ -134,7 +134,9 @@ text are reported separately.
 - The text of every line is drawn dark on white into its view quad, stretched to fill it, in every
   view where the line is visible enough: a layout strip at the target's size (`unitex/glyph_layout.py`).
   Kind `font` draws the OCR text. Kind `edges` draws Canny edges of the view's own pixels inside the
-  quad (training: the target view, inference: the photo registered into the front view).
+  quad (training: the target view, inference: the photo registered into the front view). Kind `crop`
+  pastes those pixels themselves, in colour. Training degrades a crop like a registered photo: its
+  content shifted (`crop_shift`), blurred (`crop_blur`), contrast and brightness scaled (`crop_color`).
 - The strip is VAE-encoded (posterior mode), packed like the target, and the packed latent of a white
   strip is subtracted. Token (r, c) of the target gets those 64 numbers as extra input channels, the
   condition and glyph tokens get zeros. `x_embedder` is wrapped: the first 64 channels go through the
@@ -143,8 +145,9 @@ text are reported separately.
 - No position ids, no attention routing and no jitter: the layout sits on the target pixels it
   describes, at their size. This is how FLUX.1 Canny / Depth take their control image.
 - Training lines: every text.json line passing the filters (generated text included by default),
-  15% of lines and 10% of whole layouts dropped so the model keeps painting from the reference, 30%
-  of lines drawn as edges. With `--text_loss_weight` only drawn lines are weighted.
+  15% of lines and 10% of whole layouts dropped so the model keeps painting from the reference. Each
+  line's kind is one draw: edges with `p_edges` (0.3 by default), crop with `p_crop`, else font. With
+  `--text_loss_weight` only drawn lines are weighted.
 - The projection trains in its own AdamW (`--glyph_layout_lr`). Prodigy picks one step size for all
   its weights from the LoRA, about 1e-5 per weight per step on a warm start, so a projection that
   starts at zero stays too small to matter within a fine-tune.
@@ -157,3 +160,10 @@ text are reported separately.
   the target's own input embedding, which the frozen base reads as noisy latent. With a working
   learning rate that made small-text loss worse at low noise. At inference the layout tokens reach
   the texture pass as `glyph_latents` + `glyph_ids` (GLYPH_API 6).
+- Fine-tunes use AdamW at 1e-4. On a warm start Prodigy restarts its step size estimate at 1e-6. In
+  100 steps it moved the LoRA's effective weights by 0.04%, while AdamW moved them by 2.7%.
+- Tokens mode works when the layout looks like the text. A diagnostic (`--glyph_layout_oracle`) puts
+  the clean target latent of each layout token's own target token into it. Within 100 steps the
+  small-text loss with those tokens fell to about a quarter of the loss without them. Font and edges
+  ink gave no gain after 200 steps: it has to be turned into the label's own lettering and colours,
+  which a short fine-tune does not learn. A crop is the closest a real photo gets to the oracle.

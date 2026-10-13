@@ -191,6 +191,75 @@ def test_edges_come_from_the_view_inside_the_quad_only():
         gla.layout_strip(text, R, cfg, views=[view[:256, :256]] + [None] * 5)
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Crops
+# ────────────────────────────────────────────────────────────────────────────
+
+def _colour_view(R):
+    rng = np.random.default_rng(3)
+    return rng.integers(0, 256, (R, R, 3), dtype=np.uint8)
+
+
+def test_crop_copies_the_view_inside_the_quad_in_colour():
+    R = 512
+    view = _colour_view(R)
+    box = (150, 90, 250, 150)
+    text = _text([_item(0, "BAR", {"0": _view(_quad(*box))})])
+    cfg = gla.LayoutConfig(infer_kind="crop")
+    strip, info = gla.layout_strip(text, R, cfg, views=[view] + [None] * 5)
+    assert info["kinds"] == {"crop": 1} and strip.shape == (R, 6 * R, 3)
+    off = FULL_INDEX.index(0) * R
+    m = gla.quad_mask(_quad(*box), (R, R))
+    assert np.array_equal(strip[:, off:off + R][m], view[m])
+    assert (strip[:, off:off + R][~m] == gla.WHITE).all()
+    assert (np.delete(strip, np.s_[off:off + R], axis=1) == gla.WHITE).all()
+    # a crop line on a view without an image is drawn as font
+    _, info2 = gla.layout_strip(text, R, cfg, views=None)
+    assert info2["kinds"] == {"font": 1}
+
+
+def test_crop_degradations_stay_inside_the_quad_and_repeat_with_the_rng():
+    R = 512
+    view = np.full((R, R, 3), 200, np.uint8)
+    view[110:130, 160:240] = (20, 40, 160)
+    box = (150, 90, 250, 150)
+    text = _text([_item(0, "BAR", {"0": _view(_quad(*box))})])
+    cfg = gla.LayoutConfig(p_crop=1.0, p_edges=0.0, p_item_drop=0.0, p_all_drop=0.0,
+                           crop_shift=3.0, crop_blur=1.5, crop_color=0.2)
+    a, ia = gla.layout_strip(text, R, cfg, rng=np.random.default_rng(5), views=[view] + [None] * 5)
+    b, _ = gla.layout_strip(text, R, cfg, rng=np.random.default_rng(5), views=[view] + [None] * 5)
+    c, _ = gla.layout_strip(text, R, cfg, rng=np.random.default_rng(6), views=[view] + [None] * 5)
+    assert ia["kinds"] == {"crop": 1} and np.array_equal(a, b) and not np.array_equal(a, c)
+    off = FULL_INDEX.index(0) * R
+    m = gla.quad_mask(_quad(*box), (R, R))
+    assert (a[:, off:off + R][~m] == gla.WHITE).all()
+    clean, _ = gla.layout_strip(text, R, gla.LayoutConfig(infer_kind="crop"), views=[view] + [None] * 5)
+    assert not np.array_equal(a, clean)
+    # still the blue bar, near where it was
+    blue = a[:, off:off + R][..., 2].astype(int) - a[:, off:off + R][..., 0].astype(int) > 60
+    ys, xs = np.nonzero(blue)
+    assert len(ys) > 800 and abs(ys.mean() - 119.5) < 4 and abs(xs.mean() - 199.5) < 4
+
+
+def test_one_kind_draw_per_item():
+    text = _many()
+    base = dict(p_item_drop=0.3, p_all_drop=0.0)
+    e = gla.layout_lines(text, 512, gla.LayoutConfig(p_edges=0.5, **base), np.random.default_rng(11))
+    c = gla.layout_lines(text, 512, gla.LayoutConfig(p_edges=0.0, p_crop=0.5, **base), np.random.default_rng(11))
+    # the same lines, the same draws: edges with p_edges 0.5 are exactly crops with p_crop 0.5
+    assert [ln["item_id"] for ln in e] == [ln["item_id"] for ln in c]
+    assert [ln["kind"] == "edges" for ln in e] == [ln["kind"] == "crop" for ln in c]
+    assert {ln["kind"] for ln in c} == {"font", "crop"}
+    mix = gla.layout_lines(text, 512, gla.LayoutConfig(p_edges=0.5, p_crop=0.5, **base), np.random.default_rng(11))
+    assert [ln["kind"] for ln in mix] == ["edges" if ln["kind"] == "edges" else "crop" for ln in e]
+    with pytest.raises(ValueError):
+        gla.layout_config(None, ["p_edges=0.6", "p_crop=0.6"])
+    with pytest.raises(ValueError):
+        gla.layout_config(None, ["crop_blur=-1"])
+    assert gla.needs_views(gla.LayoutConfig(p_edges=0.0, p_crop=0.2))
+    assert not gla.needs_views(gla.LayoutConfig(p_edges=0.0, p_crop=0.0))
+
+
 def test_drawn_text_matches_the_text_token_mask():
     R = 1024
     text = _many(6)
