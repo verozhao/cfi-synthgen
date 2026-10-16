@@ -191,6 +191,36 @@ def test_edges_come_from_the_view_inside_the_quad_only():
         gla.layout_strip(text, R, cfg, views=[view[:256, :256]] + [None] * 5)
 
 
+def test_training_edges_are_found_on_degraded_pixels():
+    R = 512
+    view = np.full((R, R, 3), 230, np.uint8)
+    view[100:140, 100:300] = 20
+    view[210:250, 100:300] = 20
+    boxes = ((150, 90, 250, 150), (150, 200, 250, 260))
+    text = _text([_item(i, f"BAR {i}", {"0": _view(_quad(*b))}) for i, b in enumerate(boxes)])
+    views = [view] + [None] * 5
+    base = dict(p_edges=1.0, p_crop=0.0, p_item_drop=0.0, p_all_drop=0.0)
+    clean, _ = gla.layout_strip(text, R, gla.LayoutConfig(infer_kind="edges"), views=views)
+    # no crop_* set: training edges are the clean ones and they use no rng number
+    r1, r2 = np.random.default_rng(5), np.random.default_rng(5)
+    plain, info = gla.layout_strip(text, R, gla.LayoutConfig(**base), rng=r1, views=views)
+    gla.layout_lines(text, R, gla.LayoutConfig(**base), r2)
+    assert info["kinds"] == {"edges": 2} and np.array_equal(plain, clean) and r1.random() == r2.random()
+    # crop_* set: the edges follow the degraded pixels, repeat with the rng and stay inside the quads
+    cfg = gla.LayoutConfig(**base, crop_shift=3.0, crop_blur=1.5, crop_color=0.2)
+    strips = [gla.layout_strip(text, R, cfg, rng=np.random.default_rng(s), views=views)[0] for s in range(6)]
+    assert np.array_equal(strips[0], gla.layout_strip(text, R, cfg, rng=np.random.default_rng(0), views=views)[0])
+    assert len({s.tobytes() for s in strips}) > 1 and any(not np.array_equal(s, clean) for s in strips)
+    off = FULL_INDEX.index(0) * R
+    m = gla.quad_mask(_quad(*boxes[0]), (R, R)) | gla.quad_mask(_quad(*boxes[1]), (R, R))
+    for s in strips:
+        ink = _ink(s)[:, off:off + R]
+        assert not (ink & ~m).any()
+        ys = np.nonzero(ink[90:150])[0] + 90
+        # the first bar's top and bottom edges, moved by at most the shift plus a blurred pixel
+        assert len(ys) > 50 and np.abs(np.where(ys < 120, ys - 100, ys - 140)).max() <= 5
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Crops
 # ────────────────────────────────────────────────────────────────────────────

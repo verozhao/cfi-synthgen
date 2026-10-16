@@ -137,6 +137,7 @@ text are reported separately.
   quad (training: the target view, inference: the photo registered into the front view). Kind `crop`
   pastes those pixels themselves, in colour. Training degrades a crop like a registered photo: its
   content shifted (`crop_shift`), blurred (`crop_blur`), contrast and brightness scaled (`crop_color`).
+  When these are set, training edges are found on the degraded pixels too.
 - The strip is VAE-encoded (posterior mode), packed like the target, and the packed latent of a white
   strip is subtracted. Token (r, c) of the target gets those 64 numbers as extra input channels, the
   condition and glyph tokens get zeros. `x_embedder` is wrapped: the first 64 channels go through the

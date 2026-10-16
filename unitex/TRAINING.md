@@ -179,6 +179,9 @@ Other changes in the patch: position ids are built in fp32 everywhere (trainer c
   front-view lines get crops of the photo and other views fall back to font.
   `--glyph_layout_oracle` (diagnostic) feeds the clean target latents instead of the drawn layout,
   which shows how fast aligned layout tokens can be learned at all.
+- **Edge maps the same way.** `--glyph_layout_set p_edges=0.7 p_crop=0.0 crop_shift=1.0 crop_blur=0.75
+  crop_color=0.15` draws 70% of the training lines as Canny edges of the target view, found on the pixels
+  after the crop degradations, and the rest as font. Inference: `--glyph-layout-kind edges`.
 
 - **Warm start from the released LoRA** through `checkpoint-0` as above. It needs `--lora_rank 16
   --lora_alpha 16` and the default target modules (no `--lora_layers`), which match the 684 LoRA

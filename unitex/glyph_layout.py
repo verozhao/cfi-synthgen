@@ -23,8 +23,9 @@ Two ways in:
 Ink per line (`kind`):
   font   the line's OCR text drawn into its view quad, stretched to fill it (any view)
   edges  Canny edges of the view's own pixels inside the quad, drawn dark on white. Training: the
-         target view. Inference: the photo registered into the front view (text.json "front_image"),
-         so edges exist on the front view only and other views fall back to font.
+         target view, degraded like a crop first when crop_* are set. Inference: the photo registered
+         into the front view (text.json "front_image"), so edges exist on the front view only and other
+         views fall back to font.
   crop   the view's own pixels inside the quad, in colour, from the same images as edges. Training
          degrades them like a registered photo (shift, blur, contrast and brightness). An oracle check
          (layout tokens carrying the clean target latent) is learned within 100 steps, while font and
@@ -88,6 +89,7 @@ class LayoutConfig:
     crop_shift: float = 0.0          # training: crop content shifted by up to this many px per axis
     crop_blur: float = 0.0           # training: Gaussian blur of the crop, sigma uniform up to this
     crop_color: float = 0.0          # training: crop contrast and brightness scaled by up to this share
+                                     # (the three also degrade the pixels edges are found on)
     infer_kind: str = "font"         # inference: font, or edges / crop (front view, registered photo)
     pad_frac: float = 0.06           # ink margin inside the quad, as a fraction of its height
     font_path: str = None
@@ -269,35 +271,17 @@ def quad_mask(quad, shape):
     return m.astype(bool)
 
 
-def draw_edges(canvas, view, quad, cfg=None):
-    """Canny edges of view (uint8 RGB / gray at the canvas size) inside quad, drawn black."""
-    cfg = cfg or LayoutConfig()
-    q = np.asarray(quad, np.float64)
-    x0, y0, x1, y1 = _bbox(q, canvas.shape[:2], margin=4)
-    if x1 - x0 < 3 or y1 - y0 < 3:
-        return False
-    v = np.asarray(view)
-    if v.ndim == 3:
-        v = cv2.cvtColor(np.ascontiguousarray(v[..., :3]), cv2.COLOR_RGB2GRAY)
-    e = cv2.Canny(np.ascontiguousarray(v[y0:y1, x0:x1]), cfg.edge_low, cfg.edge_high, L2gradient=True) > 0
-    m = quad_mask(q, canvas.shape[:2])[y0:y1, x0:x1]
-    canvas[y0:y1, x0:x1][e & m] = 0
-    return True
+def _degrades(cfg):
+    """True when the config degrades view pixels in training (crop_shift, crop_blur or crop_color set)."""
+    return float(cfg.crop_shift) > 0 or float(cfg.crop_blur) > 0 or float(cfg.crop_color) > 0
 
 
-def draw_crop(canvas, view, quad, cfg=None, rng=None):
-    """The view's own pixels (uint8 RGB / gray at the canvas size) inside quad, pasted in colour on
-    an RGB canvas. With an rng (training) the crop is degraded like a registered photo: its content
-    shifted by up to crop_shift px per axis, blurred with sigma uniform up to crop_blur px, contrast
-    and brightness scaled by up to crop_color."""
-    cfg = cfg or LayoutConfig()
-    q = np.asarray(quad, np.float64)
-    H, W = canvas.shape[:2]
-    x0, y0, x1, y1 = _bbox(q, (H, W), margin=4)
-    if x1 - x0 < 3 or y1 - y0 < 3:
-        return False
-    v = np.asarray(view)
-    v = np.repeat(v[..., None], 3, axis=2) if v.ndim == 2 else v[..., :3]
+def _view_crop(v, box, H, cfg, rng):
+    """float32 pixels of the RGB view v inside box (x0, y0, x1, y1). With an rng (training) they are
+    degraded like a registered photo: the content shifted by up to crop_shift px per axis, blurred with
+    sigma uniform up to crop_blur px, contrast and brightness scaled by up to crop_color. Shifts and
+    blurs are px at 512, scaled to the view size H."""
+    x0, y0, x1, y1 = box
     dx = dy = 0
     sig = con = bri = 0.0
     if rng is not None:
@@ -314,6 +298,46 @@ def draw_crop(canvas, view, quad, cfg=None, rng=None):
     if con or bri:
         mean = crop.mean()
         crop = (crop - mean) * (1.0 + con) + mean + bri * 128.0
+    return crop
+
+
+def draw_edges(canvas, view, quad, cfg=None, rng=None):
+    """Canny edges of view (uint8 RGB / gray at the canvas size) inside quad, drawn black. With an rng
+    (training) and a config that degrades crops, the edges are found on the view pixels degraded the
+    way draw_crop degrades them, so training edges look like the edges of a registered photo. Without
+    degradations no rng number is used."""
+    cfg = cfg or LayoutConfig()
+    q = np.asarray(quad, np.float64)
+    x0, y0, x1, y1 = _bbox(q, canvas.shape[:2], margin=4)
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return False
+    v = np.asarray(view)
+    if rng is not None and _degrades(cfg):
+        v = np.repeat(v[..., None], 3, axis=2) if v.ndim == 2 else v[..., :3]
+        crop = _view_crop(v, (x0, y0, x1, y1), canvas.shape[0], cfg, rng)
+        g = cv2.cvtColor(np.clip(np.round(crop), 0, 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    else:
+        if v.ndim == 3:
+            v = cv2.cvtColor(np.ascontiguousarray(v[..., :3]), cv2.COLOR_RGB2GRAY)
+        g = np.ascontiguousarray(v[y0:y1, x0:x1])
+    e = cv2.Canny(g, cfg.edge_low, cfg.edge_high, L2gradient=True) > 0
+    m = quad_mask(q, canvas.shape[:2])[y0:y1, x0:x1]
+    canvas[y0:y1, x0:x1][e & m] = 0
+    return True
+
+
+def draw_crop(canvas, view, quad, cfg=None, rng=None):
+    """The view's own pixels (uint8 RGB / gray at the canvas size) inside quad, pasted in colour on
+    an RGB canvas. With an rng (training) the crop is degraded like a registered photo (_view_crop)."""
+    cfg = cfg or LayoutConfig()
+    q = np.asarray(quad, np.float64)
+    H, W = canvas.shape[:2]
+    x0, y0, x1, y1 = _bbox(q, (H, W), margin=4)
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return False
+    v = np.asarray(view)
+    v = np.repeat(v[..., None], 3, axis=2) if v.ndim == 2 else v[..., :3]
+    crop = _view_crop(v, (x0, y0, x1, y1), H, cfg, rng)
     m = quad_mask(q, (H, W))[y0:y1, x0:x1]
     canvas[y0:y1, x0:x1][m] = np.clip(np.round(crop), 0, 255).astype(np.uint8)[m]
     return True
@@ -325,7 +349,7 @@ def layout_strip(text, view_res, cfg=None, rng=None, views=None):
     views: 6 raw-ordered images at view_res (None entries allowed) for kinds edges and crop, e.g.
     glyph_tokens.strip_to_views(training_image) in training or [registered photo] + [None] * 5 at
     inference. An edges or crop line on a view without an image is drawn as font. rng (training)
-    also degrades the crops.
+    also degrades the crops, and the pixels edges are found on when crop_* are set.
     info: {"lines": [...], "n_lines", "kinds": {kind: n}, "per_view": {raw view: n},
            "drawn_text": text.json dict at view_res with only the drawn line views (text loss weight)}.
     """
@@ -341,7 +365,7 @@ def layout_strip(text, view_res, cfg=None, rng=None, views=None):
             raise ValueError(f"view {ln['raw_view']} is {np.asarray(img).shape[:2]}, expected ({R}, {R})")
         c = canv[ln["raw_view"]]
         if kind == "edges":
-            ok = draw_edges(c, img, ln["quad"], cfg)
+            ok = draw_edges(c, img, ln["quad"], cfg, rng)
         elif kind == "crop":
             ok = draw_crop(c, img, ln["quad"], cfg, rng)
         else:
