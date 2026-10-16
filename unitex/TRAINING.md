@@ -145,6 +145,7 @@ fixed_font_px=12 fixed_line_px=16 fixed_margin_px=0`. The trainer writes the res
 | `--ocr_loss_weight w` | 0 | adds w times the OCR loss (`unitex/ocr_loss.py`): at low noise a TrOCR model reads the small lines of the predicted clean image |
 | `--ocr_loss_config` / `--ocr_loss_set k=v ...` | none | OcrConfig (recognizer, noise limit, line heights and count, label check) |
 | `--ocr_loss_log_every N` | 0 | every N steps the predicted lines are read too and logged next to the clean readings in `ocr_rank<r>.jsonl` |
+| `--ocr_loss_grad_every N` | 0 | diagnostic, one process: every N steps the gradient norms of the flow loss and of the unweighted OCR term go to `ocr_rank<r>.jsonl` |
 
 Other changes in the patch: position ids are built in fp32 everywhere (trainer call sites and
 `_prepare_latent_image_ids` in both task pipelines), the loss slice is `model_pred[:, :n_noise]`,

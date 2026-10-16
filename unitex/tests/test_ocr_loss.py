@@ -60,7 +60,9 @@ def tiny_processor(size=32):
 
 def save_tiny_reader(path, seed=0, size=32):
     """The tiny model and a real TrOCRProcessor (ViT image processor, character tokenizer) saved to path, so
-    Reader(str(path)) and the trainer load it like a hub model."""
+    Reader(str(path)) and the trainer load it like a hub model. The weights are written with safetensors
+    directly: save_pretrained of transformers 4.52 needs torch 2.5 (torch.distributed.tensor.DTensor), and
+    it only loads .bin files with torch 2.6."""
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast, TrOCRProcessor, ViTImageProcessor
     vocab = {t: i for i, t in enumerate(SPECIALS + list(CHARS))}
@@ -72,7 +74,12 @@ def save_tiny_reader(path, seed=0, size=32):
     proc = TrOCRProcessor(image_processor=ViTImageProcessor(size={"height": size, "width": size},
                                                             image_mean=[0.5] * 3, image_std=[0.5] * 3),
                           tokenizer=fast)
-    tiny_trocr(seed, size).save_pretrained(str(path))
+    os.makedirs(str(path), exist_ok=True)
+    model = tiny_trocr(seed, size)
+    model.config.save_pretrained(str(path))
+    model.generation_config.save_pretrained(str(path))
+    from safetensors.torch import save_model
+    save_model(model, os.path.join(str(path), "model.safetensors"), metadata={"format": "pt"})
     proc.save_pretrained(str(path))
     return str(path)
 
@@ -221,6 +228,8 @@ def test_saved_tiny_reader_loads_by_path(tmp_path):
     r = ol.Reader(p)
     texts, ids = r.read(torch.rand(2, 3, 16, 64), max_tokens=5)
     assert len(texts) == 2 and (ids[:, 0] == 2).all() and r.size == (32, 32) and r.eos_id == 2
+    ref = tiny_trocr()
+    assert all(torch.equal(a, b) for a, b in zip(r.model.state_dict().values(), ref.state_dict().values()))
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -304,10 +313,11 @@ def test_real_trocr_reads_a_line_and_its_nll_follows_the_letters():
     x = _render_line("GLUTEN FREE")
     texts, ids = rd.read(x)
     assert ol.label_ok(texts[0], "GLUTEN FREE", 0.8), texts
-    blurred = torch.nn.functional.avg_pool2d(x, 9, stride=1, padding=4)
-    wrong = _render_line("BLUTEN FREE")
+    # wrong letters cost more than the right ones. Blur need not: TrOCR (trained on scanned receipts) can be
+    # surer of a blurred line, so sharpness has to come from the flow loss
     clean_nll = rd.nll(x, ids).item()
-    assert rd.nll(blurred, ids).item() > clean_nll and rd.nll(wrong, ids).item() > clean_nll
+    for wrong in ("BLUTEN FREE", "GLUTEN TREE", "GIUTEN FREE"):
+        assert rd.nll(_render_line(wrong), ids).item() > clean_nll, wrong
     # gradient descent on a noisy copy lowers the NLL of the clean reading
     noisy = (x + 0.35 * torch.randn_like(x)).clamp(0, 1).requires_grad_(True)
     opt = torch.optim.Adam([noisy], lr=0.01)

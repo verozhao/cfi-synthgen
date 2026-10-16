@@ -1016,7 +1016,13 @@ def test_ocr_loss(tmp_path, patched, pretrained, sample512):
     kh = torch.load(os.path.join(half["out_dir"], "text_loss.pt"))["keep"]
     assert torch.equal(kb, kh)
     assert os.path.exists(os.path.join(half["out_dir"], "ocr_loss_config.json"))
-    print(f"OCR step: {rows[0]['n_lines']} lines, {th['n_tokens'] - tb['n_tokens']} extra tokens, nll {nll:.3f}")
+    # the gradient norm diagnostic logs both norms and leaves the step as it was
+    probe = run_worker(tmp_path, patched, pretrained, sample512, argv=argv + ocr(0.5) + ["--ocr_loss_grad_every", "1"])
+    prow = [json.loads(s) for s in open(os.path.join(probe["out_dir"], "ocr_rank0.jsonl"))][0]
+    assert prow["grad_flow"] > 0 and prow["grad_ocr"] > 0
+    assert probe["losses"] == half["losses"] and probe["lora_after"] == half["lora_after"]
+    print(f"OCR step: {rows[0]['n_lines']} lines, {th['n_tokens'] - tb['n_tokens']} extra tokens, nll {nll:.3f}, "
+          f"gradient norms flow {prow['grad_flow']:.3g} OCR {prow['grad_ocr']:.3g}")
 
 
 def test_ocr_loss_argument_checks(patched, tmp_path):
@@ -1026,6 +1032,8 @@ def test_ocr_loss_argument_checks(patched, tmp_path):
              "negative": common + ["--dataset_impl", "cfi", "--ocr_loss_weight", "-1"],
              "not_cfi": common + ["--ocr_loss_weight", "0.1"],
              "log_alone": common + ["--dataset_impl", "cfi", "--ocr_loss_log_every", "5"],
+             "grad": common + ["--dataset_impl", "cfi", "--ocr_loss_weight", "0.1", "--ocr_loss_grad_every", "2"],
+             "grad_alone": common + ["--dataset_impl", "cfi", "--ocr_loss_grad_every", "2"],
              "batch": common + ["--dataset_impl", "cfi", "--ocr_loss_weight", "0.1", "--train_batch_size", "2"]}
     (tmp_path / "cases.json").write_text(json.dumps(cases))
     script = ("import json, sys\nimport launch\nout = {}\n"
@@ -1039,7 +1047,7 @@ def test_ocr_loss_argument_checks(patched, tmp_path):
     assert r.returncode == 0, r.stderr[-3000:]
     got = json.loads(r.stdout.strip().splitlines()[-1])
     assert got == {"ok": "ok", "off": "off", "negative": "ValueError", "not_cfi": "ValueError",
-                   "log_alone": "ValueError", "batch": "ValueError"}
+                   "log_alone": "ValueError", "grad": "ok", "grad_alone": "ValueError", "batch": "ValueError"}
 
 
 def test_glyph_layout_argument_checks(patched, tmp_path):
