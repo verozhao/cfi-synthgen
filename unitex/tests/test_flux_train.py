@@ -734,7 +734,8 @@ def worker(spec):
         if not (spec.get("pristine") and "validation_config" in str(e)):
             raise
         res["end_error"] = f"AttributeError: {e}"
-    res.update(losses=losses, calls=rec["calls"], lora_changed=bool((lora[0][1].detach() - before).abs().sum() > 0))
+    res.update(losses=losses, calls=rec["calls"], lora_changed=bool((lora[0][1].detach() - before).abs().sum() > 0),
+               lora_after=float(lora[0][1].detach().double().sum()))
     res["drawn_text"] = (getattr(trainer, "last_layout_info", None) or {}).get("drawn_text")
     lp = getattr(trainer.transformer.x_embedder, "layout_proj", None)
     if lp is not None:
@@ -981,6 +982,64 @@ def test_glyph_layout_tokens(tmp_path, patched, pretrained, sample512):
     assert not os.path.exists(os.path.join(run["out_dir"], "checkpoint-1", "glyph_layout_proj.safetensors"))
     assert not os.path.exists(os.path.join(run["out_dir"], "glyph_layout_proj.safetensors"))
     assert os.path.exists(os.path.join(run["out_dir"], "pytorch_lora_weights.safetensors"))
+
+
+def test_ocr_loss(tmp_path, patched, pretrained, sample512):
+    """--ocr_loss_weight with the tokens-mode layout: every token of the OCR lines' boxes goes into the forward
+    while the flow loss keeps exactly the tokens the drop kept, the loss is the flow loss plus the weight times
+    the mean NLL (two weights differ by exactly that on the first step), the OCR gradient reaches the LoRA, and
+    each step's readings go to ocr_rank0.jsonl. A tiny random TrOCR stands in for the recognizer
+    (min_label_ned 0 keeps every line)."""
+    sys.path.insert(0, os.path.dirname(THIS))
+    import test_ocr_loss as tol
+    reader_dir = tol.save_tiny_reader(tmp_path / "reader")
+    argv = ["--zero_text_embeds", "--glyph_layout", "--glyph_layout_mode", "tokens", "--glyph_layout_set",
+            "p_all_drop=0", "p_item_drop=0", "--text_loss_weight", "1"]
+
+    def ocr(w):
+        return ["--ocr_loss_weight", str(w), "--ocr_loss_log_every", "1", "--ocr_loss_set", f"model={json.dumps(reader_dir)}",
+                "max_sigma=1.0", "min_label_ned=0", "min_height=0", "max_height=1000", "max_aspect=1000"]
+    base = run_worker(tmp_path, patched, pretrained, sample512, argv=argv, capture_text_loss=True)
+    half = run_worker(tmp_path, patched, pretrained, sample512, argv=argv + ocr(0.5), capture_text_loss=True)
+    full = run_worker(tmp_path, patched, pretrained, sample512, argv=argv + ocr(1.0))
+    rows = [json.loads(s) for s in open(os.path.join(half["out_dir"], "ocr_rank0.jsonl"))]
+    assert len(rows) == 1 and rows[0]["step"] == 1 and rows[0]["n_kept"] == rows[0]["n_lines"] > 0
+    assert len(rows[0]["pred"]) == len(rows[0]["labels"]) == len(rows[0]["texts"]) == rows[0]["n_lines"]
+    assert all(np.isfinite(rows[0]["nll"])) and 0 <= rows[0]["sigma"] <= 1
+    nll = float(np.mean(rows[0]["nll"]))
+    assert full["losses"][0] - half["losses"][0] == pytest.approx(0.5 * nll, rel=1e-4)
+    assert half["lora_after"] != base["lora_after"] and half["lora_after"] != full["lora_after"]
+    tb = [c for c in base["calls"] if c["grad"]][0]
+    th = [c for c in half["calls"] if c["grad"]][0]
+    assert th["n_tokens"] > tb["n_tokens"] and th["n_layout"] == tb["n_layout"] > 0
+    kb = torch.load(os.path.join(base["out_dir"], "text_loss.pt"))["keep"]
+    kh = torch.load(os.path.join(half["out_dir"], "text_loss.pt"))["keep"]
+    assert torch.equal(kb, kh)
+    assert os.path.exists(os.path.join(half["out_dir"], "ocr_loss_config.json"))
+    print(f"OCR step: {rows[0]['n_lines']} lines, {th['n_tokens'] - tb['n_tokens']} extra tokens, nll {nll:.3f}")
+
+
+def test_ocr_loss_argument_checks(patched, tmp_path):
+    common = BASE_ARGV + ["--pretrained_model_name_or_path", "x", "--output_dir", "y"]
+    cases = {"ok": common + ["--dataset_impl", "cfi", "--ocr_loss_weight", "0.1", "--ocr_loss_log_every", "5"],
+             "off": common + ["--dataset_impl", "cfi"],
+             "negative": common + ["--dataset_impl", "cfi", "--ocr_loss_weight", "-1"],
+             "not_cfi": common + ["--ocr_loss_weight", "0.1"],
+             "log_alone": common + ["--dataset_impl", "cfi", "--ocr_loss_log_every", "5"],
+             "batch": common + ["--dataset_impl", "cfi", "--ocr_loss_weight", "0.1", "--train_batch_size", "2"]}
+    (tmp_path / "cases.json").write_text(json.dumps(cases))
+    script = ("import json, sys\nimport launch\nout = {}\n"
+              "for k, argv in json.load(open(sys.argv[1])).items():\n"
+              "    try:\n        a = launch.parse_args(argv)\n        out[k] = 'ok' if a.ocr_loss_weight else 'off'\n"
+              "    except ValueError as e:\n        out[k] = 'ValueError'\n"
+              "print(json.dumps(out))\n")
+    env = dict(os.environ, PYTHONPATH=patched + os.pathsep + REPO, USE_TF="0", CAUGHT_ALL_EXCEPTIONS="1")
+    r = subprocess.run([sys.executable, "-c", script, str(tmp_path / "cases.json")], capture_output=True, text=True,
+                       env=env, cwd=patched, timeout=600)
+    assert r.returncode == 0, r.stderr[-3000:]
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got == {"ok": "ok", "off": "off", "negative": "ValueError", "not_cfi": "ValueError",
+                   "log_alone": "ValueError", "batch": "ValueError"}
 
 
 def test_glyph_layout_argument_checks(patched, tmp_path):

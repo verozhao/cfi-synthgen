@@ -142,6 +142,9 @@ fixed_font_px=12 fixed_line_px=16 fixed_margin_px=0`. The trainer writes the res
 | `--glyph_layout_lr lr` | 0 | a separate AdamW with this learning rate for the layout projection (0 = it stays in the main optimizer) |
 | `--glyph_layout_mode {channels,tokens}` | channels | channels: the layout on extra input channels through the projection. tokens: the layout latent under the drawn lines appended as tokens on the glyph plane at those target tokens' (row, col), no projection |
 | `--glyph_layout_max_tokens N` | 4096 | tokens mode: at most N layout tokens, the lines with the most tokens left out |
+| `--ocr_loss_weight w` | 0 | adds w times the OCR loss (`unitex/ocr_loss.py`): at low noise a TrOCR model reads the small lines of the predicted clean image |
+| `--ocr_loss_config` / `--ocr_loss_set k=v ...` | none | OcrConfig (recognizer, noise limit, line heights and count, label check) |
+| `--ocr_loss_log_every N` | 0 | every N steps the predicted lines are read too and logged next to the clean readings in `ocr_rank<r>.jsonl` |
 
 Other changes in the patch: position ids are built in fp32 everywhere (trainer call sites and
 `_prepare_latent_image_ids` in both task pipelines), the loss slice is `model_pred[:, :n_noise]`,
@@ -182,6 +185,13 @@ Other changes in the patch: position ids are built in fp32 everywhere (trainer c
 - **Edge maps the same way.** `--glyph_layout_set p_edges=0.7 p_crop=0.0 crop_shift=1.0 crop_blur=0.75
   crop_color=0.15` draws 70% of the training lines as Canny edges of the target view, found on the pixels
   after the crop degradations, and the rest as font. Inference: `--glyph-layout-kind edges`.
+- **OCR loss.** `--ocr_loss_weight w` adds a recognizer's loss on the text itself. At steps with noise
+  level up to `max_sigma` (0.5) it takes up to 6 lines drawn in the layout, 12 to 64 px tall at 1024 and
+  at most 24 times as long as tall. Every target token of their boxes is kept in the noise drop (the flow
+  loss still sees only the tokens the drop kept), the predicted clean latent of each box goes through the
+  VAE decoder, and TrOCR's cross entropy of its reading of the clean target box is the loss. Lines TrOCR
+  cannot read in the clean target are left out. `ocr_rank<r>.jsonl` holds every step's lines, readings and
+  losses.
 
 - **Warm start from the released LoRA** through `checkpoint-0` as above. It needs `--lora_rank 16
   --lora_alpha 16` and the default target modules (no `--lora_layers`), which match the 684 LoRA
