@@ -11,7 +11,7 @@ index d4fa89b..d400e75 100644
  from matplotlib import pyplot as plt
  import numpy as np
 diff --git a/launch.py b/launch.py
-index 566ae4f..92ca425 100644
+index 566ae4f..3c9a405 100644
 --- a/launch.py
 +++ b/launch.py
 @@ -32,6 +32,7 @@ from torchvision.transforms.functional import crop
@@ -114,7 +114,7 @@ index 566ae4f..92ca425 100644
 +    parser.add_argument("--ocr_loss_config", type=str, default=None,
 +                        help="OcrConfig as a JSON file or an inline JSON object")
 +    parser.add_argument("--ocr_loss_set", type=str, nargs="*", default=[],
-+                        help="OcrConfig overrides key=value, e.g. max_sigma=0.4 model=microsoft/trocr-base-printed")
++                        help="OcrConfig overrides key=value, e.g. max_sigma=0.3 model=microsoft/trocr-base-printed")
 +    parser.add_argument("--ocr_loss_log_every", type=int, default=0,
 +                        help="every N steps the predicted lines are read too, logged next to the clean readings "
 +                             "(ocr_rank<r>.jsonl, 0 = off)")

@@ -60,7 +60,7 @@ class OcrConfig:
     """Which lines the OCR loss reads and how. Heights are px at 1024 per view (scaled with the
     resolution)."""
     model: str = "microsoft/trocr-small-printed"
-    max_sigma: float = 0.5           # the loss only where the one-step prediction can show letters
+    max_sigma: float = 0.4           # above it TrOCR cannot read the one-step prediction (pilot)
     min_height: float = 12.0
     max_height: float = 64.0
     max_aspect: float = 24.0         # length / height: the recognizer squeezes every line to a square

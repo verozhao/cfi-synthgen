@@ -145,8 +145,8 @@ def test_token_box_and_keep_mask():
 
 
 def test_config_parsing():
-    cfg = ol.ocr_config('{"max_lines": 3}', ["max_sigma=0.4", "model=\"some/model\""])
-    assert cfg.max_lines == 3 and cfg.max_sigma == 0.4 and cfg.model == "some/model"
+    cfg = ol.ocr_config('{"max_lines": 3}', ["max_sigma=0.3", "model=\"some/model\""])
+    assert cfg.max_lines == 3 and cfg.max_sigma == 0.3 and cfg.model == "some/model"
     for bad in (["nope=1"], ["max_sigma=0"], ["min_height=70"], ["max_lines=0"], ["min_label_ned=2"]):
         with pytest.raises(ValueError):
             ol.ocr_config(None, bad)
