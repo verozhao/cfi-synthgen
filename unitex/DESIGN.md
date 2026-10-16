@@ -228,8 +228,9 @@ text are reported separately.
   gradients (checkpointed per block). The line's quad, padded by 15% of its height, is resampled into a
   straight line image and resized for the recognizer.
 - Label: TrOCR's greedy reading of the same box of the clean target latent, decoded the same way, as its
-  own token ids. A line whose reading does not match its text.json text (case-folded NED below 0.8) is left
-  out, since the recognizer cannot read it even from the right latent. Taking the label after the VAE asks
+  own token ids. A line whose reading does not match its text.json text is left out (NED below 0.8, case
+  folded and with spaces removed, since texture OCR often runs words together). The recognizer cannot read
+  such a line even from the right latent. Taking the label after the VAE asks
   for nothing the VAE cannot show, and taking TrOCR's own tokens leaves no tokenizer or letter case
   convention to disagree with.
 - Loss: the mean over the kept lines of the label's per-token cross entropy given the predicted line

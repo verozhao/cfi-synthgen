@@ -219,6 +219,8 @@ def test_reader_read_targets_and_nll(reader):
 def test_label_ok():
     assert ol.label_ok("Gluten Free", "GLUTEN FREE", 0.8)
     assert ol.label_ok("GLUTEN FRE", "GLUTEN FREE", 0.8) and not ol.label_ok("BLUTEN", "GLUTEN FREE", 0.8)
+    # texture OCR runs words together: spaces do not count
+    assert ol.label_ok("BLATAS DE 12 OZ", "8LATASDE12OZ", 0.8) and ol.label_ok("NET WT 18.6 OZ", "NETWT18.6OZ", 1.0)
     assert not ol.label_ok("", "GLUTEN", 0.5) and not ol.label_ok("x", "", 0.5)
     assert ol.label_ok("", "anything", 0.0)
 

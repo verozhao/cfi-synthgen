@@ -283,11 +283,12 @@ class Reader:
 
 
 def label_ok(reading, text, min_ned):
-    """The recognizer's reading of a clean line agrees with the line's text (normalized and case-folded,
-    NED at least min_ned). min_ned 0 accepts every reading."""
+    """The recognizer's reading of a clean line agrees with the line's text: NED at least min_ned after both
+    are normalized (case-folded, punctuation dropped) and their spaces removed, since text.json lines from
+    texture OCR often run words together. min_ned 0 accepts every reading."""
     if float(min_ned) <= 0:
         return True
-    r, t = tm.normalize(reading), tm.normalize(text)
+    r, t = (tm.normalize(x).replace(" ", "") for x in (reading, text))
     return bool(r) and bool(t) and tm.ned(t, r) >= float(min_ned)
 
 
