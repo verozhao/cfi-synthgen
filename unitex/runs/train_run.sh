@@ -1,7 +1,7 @@
 #!/bin/bash
 # usage: train_run.sh <gpu> <run_name> <dataset_root[,dataset_root2]> <max_train_steps> <grad_accum> <ckpt_every>
 set -u
-source /mnt/nvme1n1/veronica_unitex/env.sh
+source ${UNITEX_ROOT:?set UNITEX_ROOT to the server work folder}/env.sh
 GPU=$1; NAME=$2; DATA=$3; STEPS=$4; ACC=$5; CKPT=$6
 FLUX=$(ls -d $R/cache/hf/hub/models--black-forest-labs--FLUX.1-dev/snapshots/*/ | head -1)
 LORA=$(ls $R/cache/hf/hub/models--lyxun--UniTEX/snapshots/*/mv_lora_weights.safetensors | head -1)

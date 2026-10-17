@@ -2,7 +2,7 @@
 # 1024 px training sets with the same uids and text.json as the 512 runs. Cameras are the same
 # (mvgen, same yaw policy), so a 512 text.json is valid for the 1024 render: it records res 512 and
 # unitex.glyph_tokens rescales it to the training view_res.
-source /mnt/nvme1n1/veronica_unitex/env.sh
+source ${UNITEX_ROOT:?set UNITEX_ROOT to the server work folder}/env.sh
 set -e
 for name in ${NAMES:-mv_cfi mv_gso}; do
   src=$R/data/$name; dst=$R/data/${name}_1024

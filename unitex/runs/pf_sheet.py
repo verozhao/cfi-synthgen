@@ -1,8 +1,8 @@
 """Contact sheet of photo_front.png panels: python pf_sheet.py <run_name> <out.jpg> [width]"""
-import json, pathlib, sys
+import json, os, pathlib, sys
 from PIL import Image, ImageDraw
 
-R = pathlib.Path("/mnt/nvme1n1/veronica_unitex")
+R = pathlib.Path(os.environ.get("UNITEX_ROOT") or sys.exit("set UNITEX_ROOT to the server work folder"))
 run, out = sys.argv[1], sys.argv[2]
 W = int(sys.argv[3]) if len(sys.argv) > 3 else 1200
 rows = []

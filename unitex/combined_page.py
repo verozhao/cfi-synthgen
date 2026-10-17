@@ -8,7 +8,7 @@ embedded, so the single .html opens anywhere.
   3. table scenes: synthgen.py scenes with the same seed, products, placements, cameras, lighting and
      table texture for every model, so only the product textures differ
 
-Usage (thanos6, R=/mnt/nvme1n1/veronica_unitex):
+Usage (thanos6, R=$UNITEX_ROOT, the server work folder):
   python unitex/combined_page.py --views $R/compare/views --scenes $R/unitex_compare/scenes \\
       --titles $R/compare/titles --out $R/compare/UniTEX_text_comparison.html
 """
