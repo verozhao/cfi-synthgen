@@ -214,6 +214,37 @@ text are reported separately.
   most one grey level. A difference of one line between runs is noise.
 - Lighting features finer than S, such as small glints, are kept from the lit view.
 
+## Full eval (28 products)
+
+- All 28 eval products, none of them a training product. They hold 277 ground-truth lines. Of these, 169
+  are under 16 px. The view stages are scored at each line's photo-registered spot as in step 5. The
+  baked asset and the baseline are front renders, scored through the refined box fit.
+- The crop run uses `layouttokC_1024_ft500`, crops of the registered photo and `--delight-shading 4`.
+  Every product got a layout, and all but one got photo crops. On the 6 test products the run reads
+  exactly the lines the earlier crop run read, before and after the delight pass.
+- Lines read out of 277. In brackets, those under 16 px:
+
+| run | lit | final view | baked asset |
+|---|---|---|---|
+| `g1024_final` (glyph tokens LoRA at 1024) | 122 (35) | 108 (23) | 104 (22) |
+| `g1024_final`, delight fix applied offline | 122 (35) | 126 (38) | |
+| crop layout with `--delight-shading 4` | 154 (57) | 152 (58) | 146 (57) |
+| current Gemini pipeline (`baseline`) | | | 157 (86) |
+
+- In the final view the crop run reads 45 lines that `g1024_final` misses and misses 1 that it reads.
+  The sign test gives p 1.3e-12. Most of them, 35, are under 16 px.
+- The delight fix alone does not explain it. Against `g1024_final` with the same fix applied offline,
+  the crop run still gains 28 lines and loses 2. The sign test gives p 9e-7.
+- With the fix the delight pass keeps the letters. The crop run's final view gains 3 lines over its
+  lit view and loses 5. The raw delight output at 512 reads only 114.
+- Baking costs a few lines. The crop run's baked asset gains 8 lines over its final view and loses 14.
+  That difference is not significant (p 0.29). `g1024_final` gains 7 and loses 11.
+- Against the current Gemini pipeline the gap is small text. The baked crop run reads 146 lines and the
+  baseline 157. Ours reads 45 lines that the baseline misses, and the baseline reads 56 that ours
+  misses. That difference is not significant (p 0.32). On small lines the baseline reads 86 and ours 57.
+  On the larger lines ours reads 89 and the baseline 71.
+- So the remaining gap is small text, which the OCR loss (step 7) targets.
+
 ## OCR loss (step 7)
 
 - `unitex/ocr_loss.py`, trainer flag `--ocr_loss_weight`. A pretrained text recognizer (TrOCR) reads the
