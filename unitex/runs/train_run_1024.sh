@@ -6,7 +6,8 @@
 # Optional env: CFI (cfi-synthgen copy), TRAIN_REPO (patched UniTEX-FLUX copy), EXTRA_ARGS (more
 # launch.py flags, e.g. --cfi_ref_text_dir D --cfi_ref_text_blur 0.5), GLYPH_ARGS (the glyph token
 # flags, default appended glyph tokens from data/glyph_train.json; empty turns them off, e.g. for a
-# --glyph_layout run).
+# --glyph_layout run), EXTRA_PYTHONPATH (put before the cfi-synthgen copy, e.g. a newer timm for the
+# TrOCR model of --ocr_loss_weight, which transformers 4.52 cannot build next to timm 0.6).
 set -u
 source /mnt/nvme1n1/veronica_unitex/env.sh
 GPUS=$1; NAME=$2; DATA=$3; STEPS=$4; ACC=$5; CKPT=$6; INIT=$7; PORT=${8:-29517}
@@ -17,7 +18,7 @@ export NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 CFI=${CFI:-$R/repos/cfi-synthgen}
 TRAIN_REPO=${TRAIN_REPO:-$R/repos/train/UniTEX-FLUX}
-export CFI_ROOT=$CFI PYTHONPATH=$CFI
+export CFI_ROOT=$CFI PYTHONPATH=${EXTRA_PYTHONPATH:+$EXTRA_PYTHONPATH:}$CFI
 OUT=$R/runs/$NAME
 mkdir -p $OUT/checkpoint-0
 if [ ! -f $OUT/checkpoint-0/pytorch_lora_weights.safetensors ]; then

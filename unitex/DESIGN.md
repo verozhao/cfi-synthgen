@@ -213,3 +213,37 @@ text are reported separately.
 - OCR noise: the stylised Lucky Charms logo reads charms or SulEUD in two images that differ by at
   most one grey level. A difference of one line between runs is noise.
 - Lighting features finer than S, such as small glints, are kept from the lit view.
+
+## OCR loss (step 7)
+
+- `unitex/ocr_loss.py`, trainer flag `--ocr_loss_weight`. A pretrained text recognizer (TrOCR) reads the
+  text lines of the predicted clean image during training. The loss is its cross entropy of the right
+  reading, so the LoRA gets a signal on the letters themselves and not only on their pixels.
+- Lines: at steps whose noise level is at most `max_sigma` (0.4), up to `max_lines` (6) lines drawn in the
+  sample's layout, 12 to 64 px tall at 1024 and at most 24 times as long as tall. With the reference text
+  blurred, a line that is not drawn cannot be known, so only drawn lines are read.
+- Every target token of a line's box (its quad's bounding box plus 2 tokens) is kept in the noise drop, so
+  the step predicts the whole line. Those extra tokens stay out of the flow matching loss.
+- The predicted clean latent `x0 = x_t - sigma * v` of each box goes through the frozen VAE decoder with
+  gradients (checkpointed per block). The line's quad, padded by 15% of its height, is resampled into a
+  straight line image and resized for the recognizer.
+- Label: TrOCR's greedy reading of the same box of the clean target latent, decoded the same way, as its
+  own token ids. A line whose reading does not match its text.json text is left out (NED below 0.8, case
+  folded and with spaces removed, since texture OCR often runs words together). The recognizer cannot read
+  such a line even from the right latent. Taking the label after the VAE asks for nothing the VAE cannot
+  show, and taking TrOCR's own tokens leaves no tokenizer or letter case convention to disagree with.
+- Loss: the mean over the kept lines of the label's per-token cross entropy given the predicted line
+  image (teacher forcing).
+- Reader: `microsoft/trocr-small-printed`. Both printed TrOCR models read about a quarter of 5568
+  VAE-decoded training lines. The base model reads 19 more of them at 9 times the time per line. Both
+  rate a render with one wrong letter worse than the right one on every test line they read. Blur raises
+  the loss on only some lines, so sharpness stays the flow loss's job. The stage 1 checkpoints were left
+  out because their weights need torch 2.6 to load.
+- Pilot: 60 steps on a single GPU at weight 1, with the gradient norms of both terms at every OCR step
+  (`--ocr_loss_grad_every 1`). 114 of 161 lines passed the label check. TrOCR's loss on the predicted
+  lines grows with the noise level. Its median rises from 0.17 at the lowest noise to 2.8 at the
+  highest, and above sigma 0.4 none of the logged predicted lines read right. The OCR gradient grows the
+  same way. It is tens of times the flow loss gradient around sigma 0.1 and hundreds of times above 0.4.
+  A recognizer's gradient on a line it cannot read says little about the letters and would outweigh the
+  flow loss, so `max_sigma` is 0.4. The run weight 0.007 puts the median OCR gradient below that limit
+  at half the flow gradient. Memory peaked at 20 GB per GPU.

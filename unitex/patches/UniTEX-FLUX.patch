@@ -11,7 +11,7 @@ index d4fa89b..d400e75 100644
  from matplotlib import pyplot as plt
  import numpy as np
 diff --git a/launch.py b/launch.py
-index 566ae4f..111d37b 100644
+index 566ae4f..3c9a405 100644
 --- a/launch.py
 +++ b/launch.py
 @@ -32,6 +32,7 @@ from torchvision.transforms.functional import crop
@@ -22,7 +22,7 @@ index 566ae4f..111d37b 100644
  import diffusers
  from diffusers import (
      AutoencoderKL,
-@@ -800,6 +801,88 @@ def parse_args(input_args=None):
+@@ -800,6 +801,103 @@ def parse_args(input_args=None):
              " or to a folder containing files that 🤗 Datasets can understand."
          ),
      )
@@ -107,11 +107,26 @@ index 566ae4f..111d37b 100644
 +                        help="learning rate of a separate AdamW for the layout projection (0 = it trains in the main "
 +                             "optimizer). Prodigy sizes its steps for the LoRA, about 1e-5 per weight per step on a "
 +                             "warm start, which leaves a projection that starts at zero near zero")
++    parser.add_argument("--ocr_loss_weight", type=float, default=0.0,
++                        help="weight of the OCR loss (unitex.ocr_loss): at low noise a TrOCR model reads the small "
++                             "text lines of the predicted clean image, the loss is its cross entropy of the reading "
++                             "of the clean target (0 = off)")
++    parser.add_argument("--ocr_loss_config", type=str, default=None,
++                        help="OcrConfig as a JSON file or an inline JSON object")
++    parser.add_argument("--ocr_loss_set", type=str, nargs="*", default=[],
++                        help="OcrConfig overrides key=value, e.g. max_sigma=0.3 model=microsoft/trocr-base-printed")
++    parser.add_argument("--ocr_loss_log_every", type=int, default=0,
++                        help="every N steps the predicted lines are read too, logged next to the clean readings "
++                             "(ocr_rank<r>.jsonl, 0 = off)")
++    parser.add_argument("--ocr_loss_grad_every", type=int, default=0,
++                        help="diagnostic for choosing --ocr_loss_weight: every N steps the gradient norms of the flow "
++                             "loss and of the unweighted OCR term over the trained weights go to ocr_rank<r>.jsonl "
++                             "(two more backward passes, single process only, 0 = off)")
 +
      if input_args is not None:
          args = parser.parse_args(input_args)
      else:
-@@ -835,6 +918,50 @@ def parse_args(input_args=None):
+@@ -835,6 +933,63 @@ def parse_args(input_args=None):
      assert len(args.multiscale_training_step_range) == 2, \
          f'multiscale_training error: {args.multiscale_training_step_range}'
  
@@ -158,11 +173,24 @@ index 566ae4f..111d37b 100644
 +            raise ValueError("--glyph_layout_max_tokens must be >= 1")
 +    if args.glyph_layout_oracle and not (args.glyph_layout and args.glyph_layout_mode == "tokens"):
 +        raise ValueError("--glyph_layout_oracle needs --glyph_layout --glyph_layout_mode tokens")
++    if args.ocr_loss_weight < 0:
++        raise ValueError("--ocr_loss_weight must be >= 0")
++    if args.ocr_loss_weight > 0:
++        if args.dataset_impl != "cfi":
++            raise ValueError("--ocr_loss_weight needs --dataset_impl cfi (text_json per sample)")
++        if args.train_batch_size != 1:
++            raise ValueError("--ocr_loss_weight needs --train_batch_size=1 (one set of lines per step)")
++        if args.with_prior_preservation:
++            raise ValueError("--ocr_loss_weight does not support --with_prior_preservation")
++    if args.ocr_loss_log_every < 0 or (args.ocr_loss_log_every and not args.ocr_loss_weight):
++        raise ValueError("--ocr_loss_log_every needs --ocr_loss_weight and must be >= 0")
++    if args.ocr_loss_grad_every < 0 or (args.ocr_loss_grad_every and not args.ocr_loss_weight):
++        raise ValueError("--ocr_loss_grad_every needs --ocr_loss_weight and must be >= 0")
 +
      env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
      if env_local_rank != -1 and env_local_rank != args.local_rank:
          args.local_rank = env_local_rank
-@@ -902,7 +1029,29 @@ def main(args):
+@@ -902,7 +1057,30 @@ def main(args):
          transformers.utils.logging.set_verbosity_error()
          diffusers.utils.logging.set_verbosity_error()
      # dataset perparation
@@ -188,12 +216,13 @@ index 566ae4f..111d37b 100644
 +                    + (f" (projection AdamW lr {args.glyph_layout_lr})" if args.glyph_layout_lr else "")
 +                    + (f" (at most {args.glyph_layout_max_tokens} tokens)"
 +                       if args.glyph_layout and args.glyph_layout_mode == "tokens" else "")
-+                    + (", ORACLE: clean target latents" if args.glyph_layout_oracle else ""))
++                    + (", ORACLE: clean target latents" if args.glyph_layout_oracle else "")
++                    + (f", OCR loss weight {args.ocr_loss_weight}" if args.ocr_loss_weight else ""))
 +    elif args.dataset_name_list is None:
          train_dataset = PBRTextureGenerationDataset(
              args.dataset_name, 
              MVDatasetConfig(
-@@ -928,6 +1077,7 @@ def main(args):
+@@ -928,6 +1106,7 @@ def main(args):
                  bump_background_color=args.background_color,
                  metallic_background_color=args.background_color,
                  roughness_background_color=args.background_color,
@@ -201,7 +230,7 @@ index 566ae4f..111d37b 100644
                  skip_broken=True,
              ), 
              extra_dataset=ReconstructDataset(
-@@ -936,7 +1086,8 @@ def main(args):
+@@ -936,7 +1115,8 @@ def main(args):
                      image_ext='.mdb',
                      skip_broken=True,
                      rgb_background_color=args.background_color,
@@ -211,7 +240,7 @@ index 566ae4f..111d37b 100644
                  ),
              ),
          )
-@@ -967,6 +1118,7 @@ def main(args):
+@@ -967,6 +1147,7 @@ def main(args):
                      bump_background_color=args.background_color,
                      metallic_background_color=args.background_color,
                      roughness_background_color=args.background_color,
@@ -219,7 +248,7 @@ index 566ae4f..111d37b 100644
                      skip_broken=True,
                  ), 
                  extra_dataset=ReconstructDataset(
-@@ -974,7 +1126,8 @@ def main(args):
+@@ -974,7 +1155,8 @@ def main(args):
                      ReconstructDatasetConfig(
                          image_ext='.mdb',
                          rgb_background_color=args.background_color,
@@ -270,10 +299,10 @@ index c07b0a9..bfada15 100644
  
      def prepare_latents_and_image_ids(
 diff --git a/tasks/texturing/trainer.py b/tasks/texturing/trainer.py
-index 494a389..e04f26e 100644
+index 494a389..ef523e6 100644
 --- a/tasks/texturing/trainer.py
 +++ b/tasks/texturing/trainer.py
-@@ -80,6 +80,29 @@ from safetensors.torch import save_file, load_file
+@@ -80,6 +80,40 @@ from safetensors.torch import save_file, load_file
  from pipeline import PBRFluxPipeline, PBRFluxPriorReduxPipeline
  from attention_processor import NativeFluxAttnProcessor2_0, RandomDropFluxAttnProcessor2_0
  
@@ -300,10 +329,21 @@ index 494a389..e04f26e 100644
 +        _glyph_layout = gla
 +    return _glyph_layout
 +
++
++_ocr_loss = None
++
++
++def ocr_loss():
++    global _ocr_loss
++    if _ocr_loss is None:
++        from unitex import ocr_loss as ol
++        _ocr_loss = ol
++    return _ocr_loss
++
  def get_mha_processor(args, device='cuda'):
      text_tokens = 512
      if args.six_views_or_four_views:
-@@ -120,6 +143,29 @@ class Trainer(PBRFluxPipeline):
+@@ -120,6 +154,39 @@ class Trainer(PBRFluxPipeline):
          dataloader):
          super().__init__(scheduler, vae, text_encoder, tokenizer, text_encoder_2, tokenizer_2, transformer)
          self.args = args
@@ -330,10 +370,20 @@ index 494a389..e04f26e 100644
 +                os.makedirs(args.output_dir, exist_ok=True)
 +                with open(os.path.join(args.output_dir, "glyph_layout_config.json"), "w") as f:
 +                    json.dump(glyph_layout().layout_config_dict(self.layout_cfg), f, indent=1)
++        self.ocr_cfg = None
++        self.ocr_reader = None
++        self.last_ocr = None
++        if getattr(args, "ocr_loss_weight", 0.0) > 0:
++            self.ocr_cfg = ocr_loss().ocr_config(getattr(args, "ocr_loss_config", None),
++                                                 getattr(args, "ocr_loss_set", None) or ())
++            if accelerator.is_main_process and args.output_dir is not None:
++                os.makedirs(args.output_dir, exist_ok=True)
++                with open(os.path.join(args.output_dir, "ocr_loss_config.json"), "w") as f:
++                    json.dump(ocr_loss().ocr_config_dict(self.ocr_cfg), f, indent=1)
          # set parameters in all models as false
          self.set_requires_grad()
          # set all parameters as half precision
-@@ -140,54 +186,69 @@ class Trainer(PBRFluxPipeline):
+@@ -140,54 +207,69 @@ class Trainer(PBRFluxPipeline):
          accelerator, 
          logger,
          train_dataloader):
@@ -440,7 +490,7 @@ index 494a389..e04f26e 100644
  
  
          ## add random drop technique for diffusion training acceleration![paper novelty!]
-@@ -210,12 +271,20 @@ class Trainer(PBRFluxPipeline):
+@@ -210,12 +292,20 @@ class Trainer(PBRFluxPipeline):
  
          return Trainer(scheduler, vae, text_encoder, tokenizer, text_encoder_2, tokenizer_2, transformer, args, accelerator, logger, train_dataloader)
  
@@ -463,7 +513,7 @@ index 494a389..e04f26e 100644
  
      
      def set_weight_type_and_device(self, accelerator):
-@@ -234,9 +303,12 @@ class Trainer(PBRFluxPipeline):
+@@ -234,9 +324,21 @@ class Trainer(PBRFluxPipeline):
              weight_dtype = torch.bfloat16
          self.weight_dtype = weight_dtype
          self.vae.to(accelerator.device, dtype=self.weight_dtype)
@@ -476,10 +526,19 @@ index 494a389..e04f26e 100644
 +            self.text_encoder.to(accelerator.device, dtype=self.weight_dtype)
 +        if self.text_encoder_2 is not None:
 +            self.text_encoder_2.to(accelerator.device)
++        if self.ocr_cfg is not None:
++            # frozen fp32 recognizer on every rank, loaded without touching the random streams of training.
++            # The VAE decoder runs with gradients for the OCR loss, checkpointed per block (it only
++            # checkpoints when gradients are on, so encoding is unchanged)
++            dev = accelerator.device
++            cuda = [dev.index if dev.index is not None else torch.cuda.current_device()] if dev.type == "cuda" else []
++            with torch.random.fork_rng(devices=cuda):
++                self.ocr_reader = ocr_loss().Reader(self.ocr_cfg.model, device=dev)
++            self.vae.enable_gradient_checkpointing()
  
  
      def prepare_training(self, accelerator, logger):
-@@ -265,6 +337,8 @@ class Trainer(PBRFluxPipeline):
+@@ -265,6 +367,8 @@ class Trainer(PBRFluxPipeline):
          self.transformer, self.optimizer, self.train_dataloader, self.lr_scheduler = accelerator.prepare(
              self.transformer, self.optimizer, self.train_dataloader, self.lr_scheduler
          )
@@ -488,7 +547,7 @@ index 494a389..e04f26e 100644
  
          # We need to recalculate our total training steps as the size of the training dataloader may have changed.
          self.num_update_steps_per_epoch = math.ceil(len(self.train_dataloader) / self.args.gradient_accumulation_steps)
-@@ -295,34 +369,59 @@ class Trainer(PBRFluxPipeline):
+@@ -295,34 +399,59 @@ class Trainer(PBRFluxPipeline):
                  "ff_context.net.2",
              ]
  
@@ -570,7 +629,7 @@ index 494a389..e04f26e 100644
          transformer_parameters_with_lr = {
              "params": transformer_lora_parameters, 
              "lr": self.args.learning_rate,
-@@ -447,8 +546,24 @@ class Trainer(PBRFluxPipeline):
+@@ -447,8 +576,24 @@ class Trainer(PBRFluxPipeline):
                  transformer_state_dict = {
                      f'{k.replace("transformer.", "")}': v for k, v in lora_state_dict.items() if k.startswith("transformer.")
                  }
@@ -597,7 +656,7 @@ index 494a389..e04f26e 100644
  
                  if incompatible_keys is not None:
                      # check only for unexpected keys
-@@ -488,7 +603,10 @@ class Trainer(PBRFluxPipeline):
+@@ -488,7 +633,10 @@ class Trainer(PBRFluxPipeline):
                  save_directory=save_path,
                  transformer_lora_layers=transformer_lora_layers,
                  text_encoder_lora_layers=None,
@@ -609,7 +668,7 @@ index 494a389..e04f26e 100644
  
      def inference(self, steps, accelerator, logger, load_path=None, output_dir=None):
          # Final inference
-@@ -505,8 +623,8 @@ class Trainer(PBRFluxPipeline):
+@@ -505,8 +653,8 @@ class Trainer(PBRFluxPipeline):
              pipeline = PBRFluxPipeline.from_pretrained(
                          self.args.pretrained_model_name_or_path,
                          vae=self.vae,
@@ -620,7 +679,7 @@ index 494a389..e04f26e 100644
                          transformer=accelerator.unwrap_model(self.transformer).eval(),
                          redux_pipeline=None,
                          revision=self.args.revision,
-@@ -594,10 +712,11 @@ class Trainer(PBRFluxPipeline):
+@@ -594,10 +742,11 @@ class Trainer(PBRFluxPipeline):
                              image = [Image.open(im).convert('RGB') for im in image]
                              images += [im for im in image]
                      # NOTE: hardcode here
@@ -634,7 +693,7 @@ index 494a389..e04f26e 100644
                      pipeline_args["control_image"] = image
                  if args.redux_image:
                      image = validation_prompt_item['image']
-@@ -725,9 +844,17 @@ class Trainer(PBRFluxPipeline):
+@@ -725,9 +874,17 @@ class Trainer(PBRFluxPipeline):
              num_images_per_prompt: int = 1,
              text_input_ids_list=None):
          
@@ -653,7 +712,7 @@ index 494a389..e04f26e 100644
              dtype = self.text_encoder.dtype
  
              pooled_prompt_embeds = self._encode_prompt_with_clip(
-@@ -749,7 +876,7 @@ class Trainer(PBRFluxPipeline):
+@@ -749,7 +906,7 @@ class Trainer(PBRFluxPipeline):
  
              prompt_embeds = prompt_embeds.to(device, dtype=weight_dtype)
              pooled_prompt_embeds = pooled_prompt_embeds.to(device, dtype=weight_dtype)
@@ -662,7 +721,7 @@ index 494a389..e04f26e 100644
  
          return prompt_embeds, pooled_prompt_embeds, text_ids
          
-@@ -761,7 +888,116 @@ class Trainer(PBRFluxPipeline):
+@@ -761,7 +918,140 @@ class Trainer(PBRFluxPipeline):
  
  
      def _encode_vae_image():
@@ -742,6 +801,30 @@ index 494a389..e04f26e 100644
 +            return lat, ids
 +        return gla.encode_layout(strip, self.vae, device=accelerator.device, dtype=self.weight_dtype)
 +
++    def prepare_ocr_lines(self, batch, global_step, micro_step, accelerator, view_res):
++        """--ocr_loss_weight: the lines the OCR loss reads this step (unitex.ocr_loss.ocr_lines). With
++        --glyph_layout the lines drawn in this sample's layout (built before the noise drop), else every
++        text.json line unless the reference text was blurred, when the letters cannot be known."""
++        if getattr(self.args, "glyph_layout", False):
++            text = (self.last_layout_info or {}).get("drawn_text")
++        else:
++            texts = batch.get("text_json") if isinstance(batch, dict) else None
++            blurred = int(batch["ref_text_blurred"][0]) if "ref_text_blurred" in batch else 0
++            text = None if blurred or not texts else texts[0]
++        rng = glyph_tokens().glyph_rng(self.args.seed, global_step, micro_step, accelerator.process_index, 2)
++        return ocr_loss().ocr_lines(text, view_res, self.ocr_cfg, rng)
++
++    def ocr_grad_norms(self, flow_loss, ocr_term):
++        """--ocr_loss_grad_every: gradient norms over the trained weights of the flow loss and of the unweighted
++        OCR term, for choosing --ocr_loss_weight. Two more backward passes that keep the graph and leave the
++        weights' .grad alone, so the step itself is unchanged."""
++        params = [p for p in self.transformer.parameters() if p.requires_grad]
++        out = {}
++        for k, l in (("grad_flow", flow_loss), ("grad_ocr", ocr_term)):
++            gs = torch.autograd.grad(l, params, retain_graph=True, allow_unused=True)
++            out[k] = float(torch.sqrt(sum(g.detach().float().pow(2).sum() for g in gs if g is not None)))
++        return out
++
 +    def layout_probe(self, model_pred, transformer_kwargs, hidden_states, n_noise, target_packed, keep_index,
 +                     sigmas, view_res, accelerator):
 +        """--glyph_layout_probe_every: the loss on the kept target tokens of drawn small lines, with the
@@ -780,7 +863,7 @@ index 494a389..e04f26e 100644
      def train(self, accelerator, logger):
          # We need to initialize the trackers we use, and also store our configuration.
          # The trackers initializes automatically on the main process.
-@@ -865,7 +1101,8 @@ class Trainer(PBRFluxPipeline):
+@@ -865,7 +1155,8 @@ class Trainer(PBRFluxPipeline):
  
                      # Add noise according to flow matching.
                      # zt = (1 - texp) * x + texp * z1
@@ -790,7 +873,7 @@ index 494a389..e04f26e 100644
                      noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
                      BL, CL, HL, WL = noisy_model_input.shape
                      latents = self._pack_latents(
-@@ -880,7 +1117,7 @@ class Trainer(PBRFluxPipeline):
+@@ -880,7 +1171,7 @@ class Trainer(PBRFluxPipeline):
                          HL // 2,
                          WL // 2,
                          accelerator.device,
@@ -799,7 +882,7 @@ index 494a389..e04f26e 100644
                          offset_x=0,
                          offset_y=0,
                          offset_z=0,
-@@ -921,7 +1158,7 @@ class Trainer(PBRFluxPipeline):
+@@ -921,7 +1212,7 @@ class Trainer(PBRFluxPipeline):
                              HDL // 2, 
                              WDL // 2, 
                              accelerator.device,
@@ -808,7 +891,7 @@ index 494a389..e04f26e 100644
                              offset_x=WL // 2,
                              offset_y=HL // 2,
                              offset_z=0,
-@@ -964,7 +1201,7 @@ class Trainer(PBRFluxPipeline):
+@@ -964,7 +1255,7 @@ class Trainer(PBRFluxPipeline):
                              HCL // 2, 
                              WCL // 2, 
                              accelerator.device,
@@ -817,7 +900,25 @@ index 494a389..e04f26e 100644
                              offset_x=0,
                              offset_y=HL // 2,
                              offset_z=0,
-@@ -996,13 +1233,22 @@ class Trainer(PBRFluxPipeline):
+@@ -992,17 +1283,44 @@ class Trainer(PBRFluxPipeline):
+                     else:
+                         prompt_image_embeds = prompt_embeds
+                         text_image_ids = text_ids
++                    # --ocr_loss_weight: at low noise the lines the OCR loss reads, chosen before the noise drop
++                    # so that they keep every target token. With a layout they are its drawn lines, so the
++                    # layout is built here (it draws from its own rng, not the drop's or the conditions')
++                    early_layout = None
++                    ocr_lines, ocr_keep, ocr_only = [], None, None
++                    if self.ocr_cfg is not None and float(sigmas.view(-1)[0]) <= float(self.ocr_cfg.max_sigma):
++                        if getattr(self.args, "glyph_layout", False):
++                            early_layout = self.prepare_glyph_layout(batch, training_image, global_step, step, accelerator)
++                        ocr_lines = self.prepare_ocr_lines(batch, global_step, step, accelerator, pixel_values.shape[-2])
++                        if ocr_lines:
++                            ocr_keep = ocr_loss().ocr_keep_mask(
++                                ocr_lines, pixel_values.shape[-2], int(self.ocr_cfg.margin_tokens)).to(accelerator.device)
++                            if ocr_keep.numel() != latents.shape[1]:
++                                raise ValueError(f"OCR keep mask has {ocr_keep.numel()} tokens, the target has {latents.shape[1]}")
+                     # using random drop tricks
                      if self.args.random_drop_noise and 0.0 <= self.args.random_drop_noise_probability <= 1.0:
                          if random.random() < 1.0:
                              random_drop_noise = True
@@ -831,6 +932,10 @@ index 494a389..e04f26e 100644
 +                                mask_noise = rand_noise <= keep_prob.to(device=rand_noise.device, dtype=rand_noise.dtype)
 +                            else:
 +                                mask_noise = (rand_noise <= 1.0 - self.args.random_drop_noise_probability)
++                            if ocr_keep is not None:
++                                # every token of the OCR lines goes in, the flow loss keeps only the drop's
++                                ocr_only = ocr_keep & ~mask_noise
++                                mask_noise = mask_noise | ocr_keep
                              index_noise = torch.where(mask_noise)[0]
                              model_pred_zero = torch.zeros_like(latents)
                              latents = latents[:, index_noise, :]
@@ -841,7 +946,7 @@ index 494a389..e04f26e 100644
                      if condition_latents is not None:
                          if self.args.random_drop_condition and 0.0 <= self.args.random_drop_condition_probability <= 1.0:
                              if random.random() < 1.0:
-@@ -1015,20 +1261,60 @@ class Trainer(PBRFluxPipeline):
+@@ -1015,20 +1333,62 @@ class Trainer(PBRFluxPipeline):
                                  random_drop_condition = False
                          latents = torch.cat([latents, condition_latents], dim=1)
                          latent_image_ids = torch.cat([latent_image_ids, condition_ids], dim=0)
@@ -857,7 +962,8 @@ index 494a389..e04f26e 100644
 +                    # --glyph_layout_mode tokens: layout tokens last, never dropped, cut off before the loss
 +                    self.last_n_layout = 0
 +                    if getattr(self.args, "glyph_layout", False) and not self.layout_channels():
-+                        lay_latents, lay_ids = self.prepare_glyph_layout(batch, training_image, global_step, step, accelerator)
++                        lay_latents, lay_ids = early_layout if early_layout is not None else \
++                            self.prepare_glyph_layout(batch, training_image, global_step, step, accelerator)
 +                        self.last_n_layout = lay_latents.shape[1]
 +                        if self.last_n_layout:
 +                            if getattr(self.args, "glyph_layout_oracle", False):
@@ -891,7 +997,8 @@ index 494a389..e04f26e 100644
 +                    if self.layout_channels():
 +                        # --glyph_layout: 64 layout channels next to the 64 latent channels. Each kept
 +                        # target token gets the layout under it, conditions and glyph tokens get zeros.
-+                        layout = self.prepare_glyph_layout(batch, training_image, global_step, step, accelerator)
++                        layout = early_layout if early_layout is not None else \
++                            self.prepare_glyph_layout(batch, training_image, global_step, step, accelerator)
 +                        layout = glyph_layout().layout_tokens_full(layout, latents.shape[1], layout_keep)
 +                        hidden_states = torch.cat([latents, layout.to(latents.dtype).expand(latents.shape[0], -1, -1)], dim=-1)
 +                    transformer_kwargs = dict(
@@ -914,10 +1021,12 @@ index 494a389..e04f26e 100644
                          
                      model_pred_mask = torch.ones_like(model_pred)
                      if self.args.random_drop_noise and 0.0 <= self.args.random_drop_noise_probability <= 1.0:
-@@ -1037,6 +1323,12 @@ class Trainer(PBRFluxPipeline):
+@@ -1037,6 +1397,14 @@ class Trainer(PBRFluxPipeline):
                              index_noise = index_noise.unsqueeze(0).unsqueeze(-1).repeat(model_pred_zero.shape[0], 1, model_pred_zero.shape[-1])
                              model_pred = model_pred_zero.scatter(1, index_noise, model_pred)
                              model_pred_mask = model_pred_zero.scatter(1, index_noise, torch.ones_like(model_pred))
++                            if ocr_only is not None:
++                                model_pred_mask[:, ocr_only] = 0
 +                    # --text_loss_weight: one weight per target token over the full strip, unpacked like model_pred
 +                    token_weight = None
 +                    if getattr(self.args, "text_loss_weight", 0.0) > 0:
@@ -927,7 +1036,7 @@ index 494a389..e04f26e 100644
                      # model_pred = self._unpack_latents(
                      #     model_pred,
                      #     height=height,
-@@ -1056,6 +1348,13 @@ class Trainer(PBRFluxPipeline):
+@@ -1056,6 +1424,26 @@ class Trainer(PBRFluxPipeline):
                      width=model_input.shape[3] * vae_scale_factor,
                      vae_scale_factor=vae_scale_factor,
                      )
@@ -938,10 +1047,23 @@ index 494a389..e04f26e 100644
 +                            width=model_input.shape[3] * vae_scale_factor,
 +                            vae_scale_factor=vae_scale_factor,
 +                        )
++                    # --ocr_loss_weight: the recognizer reads the lines of the predicted clean latent
++                    # x0 = x_t - sigma * v (every token of their boxes was kept above)
++                    ocr_term = None
++                    self.last_ocr = None
++                    if ocr_lines:
++                        log_every = getattr(self.args, "ocr_loss_log_every", 0)
++                        read_pred = bool(log_every) and (global_step + 1) % log_every == 0
++                        x0 = noisy_model_input - sigmas * model_pred
++                        ocr_term, self.last_ocr = ocr_loss().ocr_loss(
++                            ocr_lines, x0, model_input, self.vae, self.ocr_reader, pixel_values.shape[-2],
++                            self.ocr_cfg, read_pred=read_pred)
++                        self.last_ocr.update(step=global_step + 1, rank=accelerator.process_index,
++                                             sigma=float(sigmas.view(-1)[0]), texts=[ln["text"] for ln in ocr_lines])
                      # 5. flow matching loss
                      # these weighting schemes use a uniform timestep sampling
                      # and instead post-weight the loss
-@@ -1079,7 +1378,12 @@ class Trainer(PBRFluxPipeline):
+@@ -1079,7 +1467,19 @@ class Trainer(PBRFluxPipeline):
                          prior_loss = prior_loss.mean()
  
                      # Compute regular loss.
@@ -952,13 +1074,23 @@ index 494a389..e04f26e 100644
 +                        # the same masked loss as a weighted mean: small text boxes count 1 + text_loss_weight
 +                        loss = glyph_tokens().weighted_flow_loss(model_pred, target, model_pred_mask, weighting, token_weight)
 +                        self.last_text_share = glyph_tokens().text_loss_share(model_pred_mask, token_weight)
++                    if ocr_term is not None:
++                        grad_every = getattr(self.args, "ocr_loss_grad_every", 0)
++                        if grad_every and (global_step + 1) % grad_every == 0:
++                            if accelerator.num_processes > 1:
++                                raise ValueError("--ocr_loss_grad_every runs in a single process only")
++                            self.last_ocr.update(self.ocr_grad_norms(loss, ocr_term))
++                        loss = loss + float(self.args.ocr_loss_weight) * ocr_term.to(loss.dtype)
  
                      if self.args.with_prior_preservation:
                          # Add the prior loss to the instance loss.
-@@ -1096,12 +1400,30 @@ class Trainer(PBRFluxPipeline):
+@@ -1096,12 +1496,33 @@ class Trainer(PBRFluxPipeline):
                          loss = loss + args.preconditioning_loss_weight * preconditioning_loss
  
                      accelerator.backward(loss)
++                    if self.last_ocr is not None and self.args.output_dir:
++                        with open(os.path.join(self.args.output_dir, f"ocr_rank{accelerator.process_index}.jsonl"), "a") as f:
++                            f.write(json.dumps(self.last_ocr) + "\n")
 +                    probe_every = getattr(self.args, "glyph_layout_probe_every", 0)
 +                    self.last_probe = None
 +                    if probe_every and accelerator.sync_gradients and (global_step + 1) % probe_every == 0:
@@ -986,7 +1118,7 @@ index 494a389..e04f26e 100644
                      self.lr_scheduler.step()
                      self.optimizer.zero_grad()
                      # breakpoint()
-@@ -1142,6 +1464,17 @@ class Trainer(PBRFluxPipeline):
+@@ -1142,6 +1563,21 @@ class Trainer(PBRFluxPipeline):
  
  
                  logs = {"loss": loss.detach().item(), "lr": self.lr_scheduler.get_last_lr()[0]}
@@ -1001,10 +1133,14 @@ index 494a389..e04f26e 100644
 +                    if self.last_probe is not None:
 +                        logs["probe_with"] = round(self.last_probe["with"], 4)
 +                        logs["probe_without"] = round(self.last_probe["without"], 4)
++                if self.ocr_cfg is not None:
++                    logs["ocr_lines"] = (self.last_ocr or {}).get("n_kept", 0)
++                    if (self.last_ocr or {}).get("nll"):
++                        logs["ocr_nll"] = round(sum(self.last_ocr["nll"]) / len(self.last_ocr["nll"]), 4)
                  progress_bar.set_postfix(**logs)
                  accelerator.log(logs, step=global_step)
  
-@@ -1155,7 +1488,8 @@ class Trainer(PBRFluxPipeline):
+@@ -1155,7 +1591,8 @@ class Trainer(PBRFluxPipeline):
              self.save_lora_layers(accelerator, self.args.output_dir)
  
          # Final inference
