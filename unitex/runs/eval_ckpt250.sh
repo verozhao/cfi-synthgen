@@ -1,7 +1,7 @@
 #!/bin/bash
 # Extra early look: checkpoint 250 of the 1024 run on the six progress SKUs, GPU 0, while GPU 0 would
 # otherwise wait for checkpoint 500. Same settings as orchestrate_1024.sh, separate page.
-source /mnt/nvme1n1/veronica_unitex/env.sh
+source ${UNITEX_ROOT:?set UNITEX_ROOT to the server work folder}/env.sh
 cd $R
 RUN=trainAB_1024_pos05; N=250; run=g1024_ckpt$N
 REPO=$R/repos/cfi-synthgen

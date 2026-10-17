@@ -1,6 +1,6 @@
 # Stage 2: GlyphAnchor inside UniTEX, integration status
 
-Step 2 of the advisor's plan: put GlyphAnchor glyph tokens into UniTEX-FLUX LoRA training and into
+Step 2 of the plan: put GlyphAnchor glyph tokens into UniTEX-FLUX LoRA training and into
 UniTEX inference. Every piece is built, and the whole chain ran end to end on a CPU laptop with a
 tiny random FLUX (2026-10-01). Nothing has run on a GPU or with real FLUX.1-dev weights yet.
 File formats are in `DESIGN.md`. The training runbook with every flag is in `TRAINING.md`.
@@ -219,7 +219,8 @@ There are no tests at the repo root.
 ## First real training run (thanos6, 2026-10-02 to 10-03)
 
 Scripts: `unitex/runs/` (`orchestrate_thanos6.sh` ran everything unattended, `train_run.sh` is one
-training run, `make_train_A.sh` builds set A without the eval twins).
+training run, `make_train_A.sh` builds set A without the eval twins). They read the server work
+folder, the one holding `env.sh`, from `UNITEX_ROOT`.
 
 - 4-bit FLUX base (`--quantize_base nf4`, fits one 24 GB RTX 4090, about 4.5 s per sample), warm
   start from the released UniTEX texture LoRA, 1000 steps x 4 samples, glyph filter

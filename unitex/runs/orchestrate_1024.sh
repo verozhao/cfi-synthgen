@@ -1,8 +1,8 @@
 #!/bin/bash
 # 1024 px run on thanos6, unattended. Writes only inside $R. GPUs 1 to 3 train (DDP), GPU 0 (shared
-# with Kiran's 53 MiB web app, which is never touched) evaluates checkpoints. Every launch waits for
+# with another user's 53 MiB web app, which is never touched) evaluates checkpoints. Every launch waits for
 # tmp/gpu_ok.sh. Existing runs and eval outputs are never modified: everything new has a new name.
-source /mnt/nvme1n1/veronica_unitex/env.sh
+source ${UNITEX_ROOT:?set UNITEX_ROOT to the server work folder}/env.sh
 cd $R
 LOG=$R/logs/orchestrate_1024.log
 REPO=$R/repos/cfi-synthgen

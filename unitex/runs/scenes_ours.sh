@@ -1,8 +1,8 @@
 #!/bin/bash
 # Table scenes for our final pipeline (1024 glyph LoRA + photo front), same settings as tmp/scenes.sh
 # (seed 0, 3 scenes x 6 products, 4 cameras, 1536 px, studio HDRI, table textures). CPU only: the
-# GPUs run Anudeep's ShapeGen servers and are not ours to use. Low priority.
-source /mnt/nvme1n1/veronica_unitex/env.sh
+# GPUs run other people's ShapeGen servers and are not ours to use. Low priority.
+source ${UNITEX_ROOT:?set UNITEX_ROOT to the server work folder}/env.sh
 M=g1024_final_photofront
 A=$R/unitex_compare/assets/$M
 mkdir -p $A

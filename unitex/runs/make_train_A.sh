@@ -1,4 +1,4 @@
-R=/mnt/nvme1n1/veronica_unitex
+R=${UNITEX_ROOT:?set UNITEX_ROOT to the server work folder}
 # twins of eval products (same product line / label design) found by leak_check.py, kept out of training
 cat > $R/data/eval_siblings.txt <<EOF
 002e90258258

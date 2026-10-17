@@ -1,7 +1,7 @@
 #!/bin/bash
 # Unattended run of the rest of step 2 on thanos6. Writes only inside $R. Starts a GPU job only on
 # a GPU that is completely free (no process of anyone, under 30 MiB used), and waits otherwise.
-source /mnt/nvme1n1/veronica_unitex/env.sh
+source ${UNITEX_ROOT:?set UNITEX_ROOT to the server work folder}/env.sh
 cd $R
 LOG=$R/logs/orchestrate.log
 REPO=$R/repos/cfi-synthgen

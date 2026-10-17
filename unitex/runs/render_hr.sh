@@ -2,7 +2,7 @@
 # High-resolution front views for the zoomable comparison page. Writes only to compare/views_hr/
 # (new folder); compare/views/ and every existing page stay as they are. Same mvgen views command as
 # the existing pages (same cameras, unlit), front camera only, 1536 px instead of 768. CPU only.
-source /mnt/nvme1n1/veronica_unitex/env.sh
+source ${UNITEX_ROOT:?set UNITEX_ROOT to the server work folder}/env.sh
 OUT=$R/compare/views_hr
 LST=$R/tmp/views_hr
 mkdir -p $OUT $LST

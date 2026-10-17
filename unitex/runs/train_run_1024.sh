@@ -9,7 +9,7 @@
 # --glyph_layout run), EXTRA_PYTHONPATH (put before the cfi-synthgen copy, e.g. a newer timm for the
 # TrOCR model of --ocr_loss_weight, which transformers 4.52 cannot build next to timm 0.6).
 set -u
-source /mnt/nvme1n1/veronica_unitex/env.sh
+source ${UNITEX_ROOT:?set UNITEX_ROOT to the server work folder}/env.sh
 GPUS=$1; NAME=$2; DATA=$3; STEPS=$4; ACC=$5; CKPT=$6; INIT=$7; PORT=${8:-29517}
 GLYPH_ARGS=${GLYPH_ARGS-"--glyph --glyph_config $R/data/glyph_train.json"}
 NP=$(echo $GPUS | tr ',' '\n' | grep -c .)

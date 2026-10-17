@@ -2,7 +2,7 @@
 # usage: photofront_all.sh <gpu>
 # Photo front on the 28 eval SKUs for stock UniTEX and the A+B glyph LoRA (new run dirs, the
 # source runs are read only), views with the cameras of the earlier pages, comparison page.
-source /mnt/nvme1n1/veronica_unitex/env.sh
+source ${UNITEX_ROOT:?set UNITEX_ROOT to the server work folder}/env.sh
 GPU=${1:-0}
 REPO=$R/repos/cfi-synthgen
 cd $REPO

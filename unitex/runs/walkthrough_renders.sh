@@ -1,7 +1,7 @@
 #!/bin/bash
 # Views of the baked meshes before LTM (cache/wo_LTM) and after (cache/w_LTM) for the walkthrough page.
 # New folder walkthrough/renders/, existing outputs untouched. CPU only.
-source /mnt/nvme1n1/veronica_unitex/env.sh
+source ${UNITEX_ROOT:?set UNITEX_ROOT to the server work folder}/env.sh
 OUT=$R/walkthrough/renders
 mkdir -p $OUT
 cd $R/repos/cfi-synthgen
