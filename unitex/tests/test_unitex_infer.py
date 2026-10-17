@@ -20,6 +20,7 @@ Run: python -m pytest unitex/tests/test_unitex_infer.py -v      (INFER_TEST_SLOW
 """
 
 import ast
+import contextlib
 import importlib.util
 import json
 import os
@@ -38,6 +39,7 @@ sys.path.insert(0, REPO)
 sys.path.insert(1, os.path.join(REPO, "unitex"))
 from unitex import glyph as gl
 from unitex import glyph_ids as gid
+from unitex import glyph_layout as gla
 from unitex import glyph_tokens as gt
 import run_unitex  # noqa: E402  (unitex/run_unitex.py, a script)
 
@@ -302,6 +304,56 @@ def test_b_glyph_input_validation(pipes):
 # (c) 1024 px per view: fp32 ids, no collisions
 # ────────────────────────────────────────────────────────────────────────────
 
+@contextlib.contextmanager
+def _wrapped(tr, weight=None):
+    """The session's tiny transformer with its x_embedder wrapped for layout channels, restored after."""
+    orig = tr.x_embedder
+    try:
+        yield gla.wrap_x_embedder(tr, weight, dtype=torch.bfloat16)
+    finally:
+        tr.x_embedder = orig
+
+
+def _layout(R, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(1, _n_tokens(R)[0], 64, generator=g).to(torch.bfloat16)
+
+
+def test_b_glyph_layout_zero_projection_changes_nothing(pipes, tiny):
+    base = _run(pipes["patched"], 64)
+    with _wrapped(tiny[0]):
+        lay = _run(pipes["patched"], 64, glyph_layout=_layout(64))
+        plain = _run(pipes["patched"], 64)
+    assert np.array_equal(base, lay) and np.array_equal(base, plain)
+
+
+def test_b_glyph_layout_channels_reach_the_target_tokens_only(pipes, tiny):
+    R = 64
+    nn, nc, nd = _n_tokens(R)
+    lay = _layout(R)
+    w = torch.randn(tiny[0].x_embedder.out_features, 64, generator=torch.Generator().manual_seed(1)) * 0.05
+    base = _run(pipes["patched"], R)
+    with _wrapped(tiny[0], w):
+        with Capture(tiny[0]) as cp:
+            out = _run(pipes["patched"], R, glyph_layout=lay)
+    hs = cp.calls[0]["hidden_states"]
+    assert len(cp.calls) == 2 and hs.shape == (1, nn + nc + nd, 128)
+    assert torch.equal(hs[:, :nn, 64:], lay) and not hs[:, nn:, 64:].any()
+    assert torch.equal(cp.calls[1]["hidden_states"][..., 64:], hs[..., 64:])      # the same layout every step
+    assert pipes["patched"]._last_layout_tokens == nn
+    assert not np.array_equal(out, base)
+
+
+def test_b_glyph_layout_validation(pipes, tiny):
+    with pytest.raises(ValueError, match="wrapped"):
+        _run(pipes["patched"], 64, glyph_layout=_layout(64))
+    with _wrapped(tiny[0]):
+        with pytest.raises(ValueError, match="does not match"):
+            _run(pipes["patched"], 64, glyph_layout=_layout(64)[:, :-1])
+        _run(pipes["patched"], 64)
+        assert pipes["patched"]._last_layout_tokens == 0
+
+
 def _unique_rows(t):
     return torch.unique(t, dim=0).shape[0]
 
@@ -350,7 +402,7 @@ def test_c_view_res_1024_ids_unique_in_fp32(pipes, tiny, eval2):
 # ────────────────────────────────────────────────────────────────────────────
 
 CLASSES = ("RGBTextureFullPipelineBase", "RGBTextureFullPipeline", "CustomRGBTextureFullPipeline")
-HELPERS = ("add_detail",)          # module-level functions the patch adds (numpy / PIL only)
+HELPERS = ("add_detail", "shading_detail")    # module-level functions the patch adds (numpy / PIL / torch)
 
 
 class FakeExporter:
@@ -423,7 +475,7 @@ def unitex_classes(src_dir, flux=None):
           "build_rembg": lambda: None, "VideoExporter": FakeExporter,
           "NVDiffRendererInverse": lambda device=None: None, "TSDSRPipeline": None}
     exec(compile(ast.Module(body=body, type_ignores=[]), path, "exec"), ns)
-    return types.SimpleNamespace(**{k: ns[k] for k in CLASSES})
+    return types.SimpleNamespace(**{k: ns[k] for k in CLASSES + HELPERS if k in ns})
 
 
 def _grids(d, R, seed=0):
@@ -497,6 +549,60 @@ def test_delight_res_runs_delight_smaller_and_restores_detail(repos, tmp_path):
         grids[name] = np.asarray(Image.open(d / "mv_rgb.png"))
     assert grids["low"].shape == grids["full"].shape == (128, 192, 3)
     assert np.abs(grids["low"].astype(int) - grids["full"].astype(int)).max() <= 1
+
+
+def test_shading_detail_keeps_the_texture_pass_letters_and_the_delight_shading(repos):
+    """lit = albedo x smooth shading, the delight pass gives the albedo at half resolution with its letters
+    redrawn 3 px off: the merge is the albedo with the lit letters, add_detail keeps the redrawn ones."""
+    C = unitex_classes(repos["patched"])
+    R, V = 64, 6
+    rng = np.random.default_rng(0)
+    albedo = np.where(rng.random((R // 4, V * R // 4)) < 0.4, 40.0, 220.0).repeat(4, 0).repeat(4, 1)[..., None] \
+        * np.ones(3)
+    x = np.arange(V * R) % R / (R - 1)
+    shade = (0.55 + 0.4 * x)[None, :, None] * np.ones((R, 1, 3))
+    lit = Image.fromarray(np.rint(albedo * shade).astype(np.uint8))
+    redrawn = np.roll(albedo, 3, axis=1).astype(np.uint8)
+    delit = Image.fromarray(redrawn).resize((V * R // 2, R // 2), Image.LANCZOS)
+    out = np.asarray(C.shading_detail(delit, lit, 4.0), dtype=np.float32)
+    old = np.asarray(C.add_detail(delit, lit), dtype=np.float32)
+    inner = (slice(8, -8), np.concatenate([np.arange(v * R + 8, (v + 1) * R - 8) for v in range(V)]))
+    err_new = np.abs(out - albedo)[inner].mean()
+    err_old = np.abs(old - albedo)[inner].mean()
+    err_lit = np.abs(np.asarray(lit, dtype=np.float32) - albedo)[inner].mean()
+    assert err_new < 0.4 * err_old and err_new < 0.6 * err_lit, (err_new, err_old, err_lit)
+    # the same image as delight output changes nothing, at any sigma
+    for s in (0.5, 4.0):
+        assert np.array_equal(np.asarray(C.shading_detail(lit, lit, s)), np.asarray(lit))
+
+
+@pytest.mark.parametrize("delight_res", [None, 32])
+def test_delight_shading_replaces_add_detail_only_when_set(repos, tmp_path, delight_res):
+    """A 64 run with delight_shading 4 (px at 512, so 0.5 px at 64): the raw delight output is saved and
+    mv_rgb is shading_detail of it and the lit strip. A pass-through FLUX at the same resolution gives
+    back the lit strip unchanged."""
+    C = unitex_classes(repos["patched"])
+    grids = {}
+    for name, extra in (("off", {}), ("on", {"delight_shading": 4.0})):
+        d = tmp_path / name
+        d.mkdir()
+        kw = {} if delight_res is None else {"delight_res": delight_res}
+        pipe = C.CustomRGBTextureFullPipeline(seed=0, view_res=64, **kw, **extra)
+        pipe.infer_mv(str(d), *_grids(str(d), 64))
+        Rd = delight_res or 64
+        assert (d / f"mv_rgb_delit_{Rd}.png").exists() == (name == "on" or delight_res is not None)
+        grids[name] = np.asarray(Image.open(d / "mv_rgb.png"))
+        if name == "on":
+            want = C.shading_detail(Image.open(d / f"mv_rgb_delit_{Rd}.png"), Image.open(d / "mv_rgb_w_light.png"),
+                                    0.5)
+            t = np.array(want).reshape(64, 6, 64, -1)
+            t[:, 5] = t[::-1, 5, ::-1]
+            want = t.transpose(1, 0, 2, 3)[[0, 2, 4, 3, 1, 5]].reshape(2, 3, 64, 64, -1).transpose(0, 2, 1, 3, 4)
+            assert np.array_equal(grids[name], want.reshape(128, 192, -1))
+    if delight_res is None:
+        assert np.array_equal(grids["on"], grids["off"])
+    with pytest.raises(ValueError, match="delight_shading"):
+        C.CustomRGBTextureFullPipeline(seed=0, view_res=64, delight_shading=0)
 
 
 @pytest.mark.parametrize("pos_scale", [None, 0.5])
@@ -621,6 +727,104 @@ def test_infer_mv_with_the_tiny_flux_pipeline(repos, pipes, eval2, tmp_path):
     assert a.shape == (1024, 1536, 3)
 
 
+class LayoutFlux(FakeFlux):
+    """FakeFlux with a VAE (infer_mv encodes the layout with pipeline.vae) that reports the layout
+    channels or layout tokens (glyph_latents) it took, or none when ignore is set."""
+
+    def __init__(self, vae, ignore=False):
+        super().__init__()
+        self.vae, self.ignore, self._last_layout_tokens = vae, ignore, 0
+
+    def __call__(self, **kw):
+        lay = kw.get("glyph_layout")
+        self._last_layout_tokens = 0 if lay is None or self.ignore else int(lay.shape[1])
+        out = super().__call__(**kw)
+        if kw.get("glyph_latents") is not None:
+            self._last_n_glyph_tokens = 0 if self.ignore else int(kw["glyph_latents"].shape[1])
+        return out
+
+
+@pytest.mark.parametrize("tokens", [True, False])
+def test_glyph_layout_goes_to_the_texture_pass_only(repos, tiny, eval2, tmp_path, tokens):
+    flux = LayoutFlux(tiny[1])
+    C = unitex_classes(repos["patched"], flux=flux)
+    pipe = C.CustomRGBTextureFullPipeline(seed=0, glyph_layout=True, glyph_tokens=tokens, glyph_delight=True)
+    pipe.infer_mv(str(tmp_path), *_grids(str(tmp_path), 512), glyph_text=_text(eval2))
+    tex, dl = [c[1] for c in flux.calls if c[0] == "call"]
+    n = _n_tokens(512)[0]
+    assert tex["glyph_layout"].shape == (1, n, 64) and "glyph_layout" not in dl
+    assert ("glyph_instances" in tex) == tokens and ("glyph_instances" in dl) == tokens
+    info = json.load(open(tmp_path / "glyph_layout.json"))
+    assert info == json.loads(json.dumps(pipe.last_layout_info))
+    assert info["n_lines"] > 0 and info["n_tokens"] == n and 0 < info["strong_tokens"] < n // 4
+    assert Image.open(tmp_path / "glyph_layout.png").size == (6 * 512, 512)
+    assert (tmp_path / "glyph_tokens.json").exists() == tokens
+    # run_unitex --dry-run draws the same lines without UniTEX
+    _, dry = run_unitex.layout_summary(_text(eval2), gla.LayoutConfig(), 512)
+    assert dry["lines"] == info["lines"] and dry["per_view"] == info["per_view"]
+    # a texture pass that does not take the layout is an error, not a silent stock run
+    C2 = unitex_classes(repos["patched"], flux=LayoutFlux(tiny[1], ignore=True))
+    pipe2 = C2.CustomRGBTextureFullPipeline(seed=0, glyph_layout=True)
+    with pytest.raises(RuntimeError, match="glyph layout"):
+        pipe2.infer_mv(str(tmp_path), *_grids(str(tmp_path), 512), glyph_text=_text(eval2))
+
+
+def test_glyph_layout_tokens_go_to_the_texture_pass_only(repos, tiny, eval2, tmp_path):
+    """Tokens mode: the layout tokens reach the texture pass as glyph_latents + glyph_ids (no layout
+    channels, no GlyphAnchor tokens), ids on the glyph plane at the target tokens under the drawn lines."""
+    flux = LayoutFlux(tiny[1])
+    C = unitex_classes(repos["patched"], flux=flux)
+    assert C.CustomRGBTextureFullPipeline.GLYPH_API >= 6
+    pipe = C.CustomRGBTextureFullPipeline(seed=0, glyph_layout=True, glyph_tokens=False, glyph_delight=True,
+                                          glyph_layout_mode="tokens")
+    pipe.infer_mv(str(tmp_path), *_grids(str(tmp_path), 512), glyph_text=_text(eval2))
+    tex, dl = [c[1] for c in flux.calls if c[0] == "call"]
+    info = json.load(open(tmp_path / "glyph_layout.json"))
+    n = info["n_tokens"]
+    assert info["mode"] == "tokens" and n > 0 and info["token_lines"] == info["n_lines"] > 0
+    assert tex["glyph_latents"].shape == (1, n, 64) and tex["glyph_ids"].shape == (n, 3)
+    assert "glyph_layout" not in tex and "glyph_instances" not in tex
+    assert not any(k.startswith("glyph") for k in dl)
+    strip, li = gla.layout_strip(_text(eval2), 512, gla.LayoutConfig())
+    idx, _ = gla.layout_token_index(li, 4096)
+    assert torch.equal(tex["glyph_ids"].cpu(), gla.layout_token_ids(idx, 512))
+    assert not (tmp_path / "glyph_tokens.json").exists()
+    # run_unitex --dry-run counts the same tokens without UniTEX
+    _, dry = run_unitex.layout_summary(_text(eval2), gla.LayoutConfig(), 512, "tokens")
+    assert dry["n_tokens"] == n and dry["token_lines"] == info["token_lines"] and dry["lines"] == info["lines"]
+    # layout tokens and GlyphAnchor tokens together are refused, so is an unknown mode
+    with pytest.raises(ValueError, match="glyph_tokens=False"):
+        C.CustomRGBTextureFullPipeline(seed=0, glyph_layout=True, glyph_layout_mode="tokens")
+    with pytest.raises(ValueError, match="glyph_layout_mode"):
+        C.CustomRGBTextureFullPipeline(seed=0, glyph_layout=True, glyph_tokens=False, glyph_layout_mode="sideways")
+    # a texture pass that does not take the tokens is an error
+    C2 = unitex_classes(repos["patched"], flux=LayoutFlux(tiny[1], ignore=True))
+    pipe2 = C2.CustomRGBTextureFullPipeline(seed=0, glyph_layout=True, glyph_tokens=False, glyph_layout_mode="tokens")
+    with pytest.raises(RuntimeError, match="layout tokens"):
+        pipe2.infer_mv(str(tmp_path), *_grids(str(tmp_path), 512), glyph_text=_text(eval2))
+
+
+def test_use_texture_lora_wraps_x_embedder_with_the_projection(tmp_path):
+    from safetensors.torch import save_file
+    t = torch.nn.Module()
+    t.x_embedder = torch.nn.Linear(64, 32)
+    t.config = types.SimpleNamespace(in_channels=64)
+    loaded = []
+    pipe = types.SimpleNamespace(
+        pipeline=types.SimpleNamespace(transformer=t, load_lora_weights=lambda p, adapter_name: loaded.append(p)),
+        adapter_names=["texture", "delight"], weights_for_texture=[1.0, 0.0], weights_for_delight=[0.0, 1.0])
+    lora = tmp_path / "pytorch_lora_weights.safetensors"
+    lora.write_bytes(b"")
+    with pytest.raises(FileNotFoundError):
+        run_unitex.use_texture_lora(pipe, str(lora), layout=True)
+    assert loaded == [] and pipe.adapter_names == ["texture", "delight"]
+    w = torch.randn(32, 64)
+    save_file({gla.PROJ_KEY: w}, str(tmp_path / gla.LAYOUT_PROJ_FILE))
+    run_unitex.use_texture_lora(pipe, str(lora), layout=True)
+    assert torch.equal(t.x_embedder.layout_proj.weight, w) and loaded == [str(lora)]
+    assert pipe.weights_for_texture == [0.0, 0.0, 1.0] and pipe.weights_for_delight == [0.0, 1.0, 0.0]
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # (d) run_unitex.py --dry-run and run_eval.sh
 # ────────────────────────────────────────────────────────────────────────────
@@ -691,9 +895,43 @@ def test_d_missing_text_json_and_flag_validation(eval2, tmp_path):
     assert r.returncode == 0 and _log(eval2, "pattern")[0]["status"] == "ok"
     for bad in (["--glyph-mode", "warp"], ["--glyph-delight"], ["--glyph-set", "token_budget=1"],
                 ["--glyph-json-name", "text.json", "--glyph-set", "no_such_field=1"],
-                ["--glyph-json-name", "text.json", "--view-res", "768"], ["--view-res", "500"]):
+                ["--glyph-json-name", "text.json", "--view-res", "768"], ["--view-res", "500"],
+                ["--delight-shading", "0"], ["--delight-shading", "-2"]):
         r = _run_unitex("--eval-dir", eval2, "--dry-run", "--run-name", "bad", *bad)
         assert r.returncode == 2, (bad, r.stderr)
+
+
+def test_d_dry_run_glyph_layout(eval2):
+    r = _run_unitex("--eval-dir", eval2, "--dry-run", "--run-name", "layout_dry", "--glyph-json-name", "text.json",
+                    "--glyph-layout", "--no-glyph-tokens", "--glyph-layout-set", "min_height_px=4")
+    assert r.returncode == 0, r.stderr
+    recs = _log(eval2, "layout_dry")
+    assert len(recs) == 2
+    for rec in recs:
+        g = rec["glyph"]
+        assert rec["status"] == "ok" and g["tokens"] is False
+        assert g["layout"]["kind"] == "font" and g["layout"]["config"]["min_height_px"] == 4
+        cache = os.path.join(eval2, rec["sku"], "layout_dry", "cache")
+        assert not os.path.exists(os.path.join(cache, "glyph_tokens.json"))
+        info = json.load(open(os.path.join(cache, "glyph_layout.json")))
+        assert info["n_lines"] == g["layout"]["n_lines"] > 0 and info["per_view"] == g["layout"]["per_view"]
+    # tokens mode: no GlyphAnchor tokens without asking, the token count is logged
+    r = _run_unitex("--eval-dir", eval2, "--dry-run", "--run-name", "layout_tok_dry", "--glyph-json-name", "text.json",
+                    "--glyph-layout", "--glyph-layout-mode", "tokens")
+    assert r.returncode == 0, r.stderr
+    for rec in _log(eval2, "layout_tok_dry"):
+        g = rec["glyph"]
+        assert rec["status"] == "ok" and g["tokens"] is False and g["layout"]["mode"] == "tokens"
+        assert g["layout"]["n_tokens"] > 0 and g["layout"]["token_lines"] == g["layout"]["n_lines"] > 0
+        assert not os.path.exists(os.path.join(eval2, rec["sku"], "layout_tok_dry", "cache", "glyph_tokens.json"))
+    for bad in (["--glyph-layout"], ["--glyph-json-name", "text.json", "--no-glyph-tokens"],
+                ["--glyph-json-name", "text.json", "--glyph-layout-mode", "tokens"],
+                ["--glyph-json-name", "text.json", "--glyph-layout-kind", "edges"],
+                ["--glyph-json-name", "text.json", "--glyph-layout", "--glyph-layout-set", "nope=1"]):
+        r = _run_unitex("--eval-dir", eval2, "--dry-run", "--run-name", "bad", *bad)
+        assert r.returncode == 2, (bad, r.stderr)
+    r = _run_unitex("--eval-dir", eval2, "--run-name", "bad", "--glyph-json-name", "text.json", "--glyph-layout")
+    assert r.returncode == 2 and "--texture-lora" in r.stderr
 
 
 def test_d_run_eval_sh_anchors_and_glyph_passthrough(tmp_path):

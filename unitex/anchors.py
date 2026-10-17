@@ -471,6 +471,33 @@ def fit_photo_to_view0(photo_mask, fg_box, mask0, refine=True, max_frac=0.1,
     return C.fit_box_affine(fg_box, box_of(cur)), info
 
 
+def registered_view0_map(pf_info, res=None):
+    """Photo px -> view-0 px from a photo_front.py run_info.json: its bbox fit, then its SIFT
+    homography when one was accepted. Exact for a planar front face, where the axis-aligned bbox
+    fit alone misplaces text on a tilted photo. register_photo fits the homography between the
+    affine-warped photo and the generated front at `scale` x view_res. res: output per-view res
+    (default the run's view_res). Returns (fn mapping (..., 2) arrays, info)."""
+    al, reg = pf_info["align"], pf_info.get("register") or {}
+    R = float(pf_info["view_res"])
+    aff = C.fit_box_affine(al["fg_box_photo"], al.get("box") or al["view0_box"])
+    H = reg.get("homography")
+    H = None if H is None else np.asarray(H, np.float64)
+    s = float(reg.get("scale", 2))
+    f = (res or R) / R
+
+    def fn(xy):
+        q = C.apply_affine(xy, aff)
+        if H is not None:
+            p = np.concatenate([s * q, np.ones(q.shape[:-1] + (1,))], axis=-1) @ H.T
+            q = p[..., :2] / p[..., 2:3] / s
+        return q * f
+
+    return fn, {"method": "homography" if H is not None else "bbox", "view_res": int(R), "scale_to_res": f,
+                "affine": [round(float(v), 6) for v in aff],
+                "homography": None if H is None else [[round(float(v), 6) for v in row] for row in H],
+                "n_inliers": reg.get("n_inliers"), "ncc_final": reg.get("ncc_final")}
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Lift
 # ────────────────────────────────────────────────────────────────────────────
@@ -618,11 +645,12 @@ def lift_quad(q0, geo, cfg, pull):
     return views, info
 
 
-def lift(items, photo_mask, fg_box, geo, cfg=None, photo_size=None):
+def lift(items, photo_mask, fg_box, geo, cfg=None, photo_size=None, view0_map=None, view0_map_info=None):
     """OCR items (photo px quads) + photo foreground + mesh views -> text.json dict (photo-lift).
 
     items: [{"text", "conf", "quad" [[x, y] x 4] TL, TR, BR, BL in reading order, optional "id",
     "flags"}]. photo_mask: bool (H, W) photo foreground for the IoU refinement (None: bbox fit only).
+    view0_map: photo px -> view-0 px at geo.res (registered_view0_map) used instead of the bbox fit.
     """
     cfg = cfg or LiftConfig()
     aff, align = fit_photo_to_view0(photo_mask, fg_box, geo.masks[0], cfg.refine, cfg.refine_max)
@@ -637,7 +665,7 @@ def lift(items, photo_mask, fg_box, geo, cfg=None, photo_size=None):
         ang, snap = quad_orientation(q)
         if snap != 0:
             flags.append("rotated")
-        q0 = C.apply_affine(q, aff)
+        q0 = view0_map(q) if view0_map is not None else C.apply_affine(q, aff)
         rec = {"id": len(out_items), "text": " ".join(str(it["text"]).split()), "conf": _r(conf, 4),
                "provenance": "photo", "flags": flags, "angle_deg": _r(ang, 1),
                "src_quad": [[_r(x), _r(y)] for x, y in q], "src_id": it.get("id", k),
@@ -671,6 +699,8 @@ def lift(items, photo_mask, fg_box, geo, cfg=None, photo_size=None):
             "created": datetime.datetime.now().isoformat(timespec="seconds"),
         },
     }
+    if view0_map is not None:
+        doc["lift"]["view0_map"] = view0_map_info or {"method": "custom"}
     return doc
 
 
@@ -779,9 +809,24 @@ def load_geometry(kind, mesh_views=None, unitex_cache=None, smooth_radius=2):
     raise ValueError(f"geometry must be mvgen or unitex, got {kind}")
 
 
+def save_front_image(panel_png, out_png):
+    """photo_front.py's debug panel (generated | registered photo | weight | result, one view each)
+    -> the registered photo alone: the photo in view-0 pixels, grey outside the photo mask."""
+    panel = Image.open(panel_png).convert("RGB")
+    R = panel.height
+    if panel.width != 4 * R:
+        raise ValueError(f"{panel_png}: expected 4 panels of {R} px, got width {panel.width}")
+    panel.crop((R, 0, 2 * R, R)).save(out_png)
+
+
 def lift_sku(eval_dir, sku, geometry="mvgen", run_name=None, mesh_views=None, unitex_cache=None,
-             text_source="gt", ocr_json=None, cfg=None, debug_png=None):
-    """One eval-dir SKU -> text.json dict. mesh_views / unitex_cache / ocr_json accept {eval} {sku} {run}."""
+             text_source="gt", ocr_json=None, cfg=None, debug_png=None, register_run=None):
+    """One eval-dir SKU -> text.json dict. mesh_views / unitex_cache / ocr_json accept {eval} {sku} {run}.
+
+    register_run: a photo_front.py run under <eval>/<sku>/ whose registration (bbox fit + SIFT
+    homography) places the text on view 0 instead of this lift's bbox fit. When that photo was not
+    registered (skipped), the bbox fit is kept and the reason is recorded.
+    """
     cfg = cfg or LiftConfig()
     eval_dir = pathlib.Path(eval_dir)
     sku_dir = eval_dir / sku
@@ -794,7 +839,18 @@ def lift_sku(eval_dir, sku, geometry="mvgen", run_name=None, mesh_views=None, un
     photo = load_photo(sku_dir, meta)
     mask, fg_box, mask_src = photo_foreground(photo, meta, run_dir)
     items, text_src = load_text_items(sku_dir, text_source, _fmt(ocr_json, eval_dir, sku, run_name), cfg.min_conf)
-    doc = lift(items, mask, fg_box, geo, cfg, photo.size)
+    view0_map = view0_info = None
+    if register_run:
+        with open(sku_dir / register_run / "run_info.json") as f:
+            pf = json.load(f)
+        if pf.get("skipped"):
+            view0_info = {"method": "bbox", "reason": f"not registered: {pf['skipped']}"}
+        else:
+            view0_map, view0_info = registered_view0_map(pf, geo.res)
+        view0_info["register_run"] = register_run
+    doc = lift(items, mask, fg_box, geo, cfg, photo.size, view0_map, view0_info)
+    if view0_info is not None:
+        doc["lift"]["view0_map"] = view0_info
     doc["lift"].update(sku=sku, photo=str(sku_dir / "ref.png"), photo_pad=meta.get("pad"),
                        photo_mask_source=mask_src, text_source=text_src)
     if debug_png:
@@ -939,6 +995,12 @@ def main(argv=None):
     p.add_argument("--run-name", default=None,
                    help="UniTEX run under <eval>/<sku>/: its cache for --geometry unitex, its rmbg_mask_1024.png "
                         "for the photo mask")
+    p.add_argument("--register-run", default=None,
+                   help="photo_front.py run under <eval>/<sku>/: place the text on view 0 with its registration "
+                        "(bbox fit + SIFT homography) instead of the bbox fit")
+    p.add_argument("--front-image", default=None,
+                   help="with --register-run: also save the photo registered into view 0 (photo_front.png panel 2) "
+                        "under this name next to the output, as the text.json's front_image (glyph kind gt)")
     p.add_argument("--mesh-views", default=None,
                    help="mvgen views dir ({eval} {sku} {run} expand), default {eval}/{sku}/mesh_views")
     p.add_argument("--unitex-cache", default=None, help="default {eval}/{sku}/{run}/cache")
@@ -974,7 +1036,7 @@ def main(argv=None):
             dbg = str(out.parent / "anchors_debug.png")
         try:
             doc = lift_sku(args.eval_dir, sku, args.geometry, args.run_name, args.mesh_views, args.unitex_cache,
-                           args.text_source, args.ocr_json, cfg, dbg)
+                           args.text_source, args.ocr_json, cfg, dbg, args.register_run)
         except Exception as e:
             failed[sku] = f"{type(e).__name__}: {e}"
             print(f"  [{sku}] FAILED {failed[sku]}")
@@ -982,6 +1044,11 @@ def main(argv=None):
         if args.out_res and args.out_res != doc["res"]:
             doc = rescale_doc(doc, args.out_res)
         out.parent.mkdir(parents=True, exist_ok=True)
+        vm = doc["lift"].get("view0_map")
+        if args.front_image and vm and "reason" not in vm:
+            save_front_image(pathlib.Path(args.eval_dir) / sku / args.register_run / "photo_front.png",
+                             out.parent / args.front_image)
+            doc["front_image"] = args.front_image
         with open(out, "w") as f:
             json.dump(doc, f, indent=1, ensure_ascii=False)
         L = doc["lift"]

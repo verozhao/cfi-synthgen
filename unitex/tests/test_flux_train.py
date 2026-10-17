@@ -301,6 +301,31 @@ def test_text_token_mask_and_boost():
     assert gt.text_token_mask("", 512).sum() == 0
 
 
+def test_text_loss_weight_and_weighted_loss():
+    small, big = [20, 40, 50, 60], [100, 100, 200, 148]          # 20 and 48 px tall at 512
+    text = {"res": 512, "items": [{"id": 0, "text": "A", "views": {"1": {"bbox": small}}},
+                                  {"id": 1, "text": "B", "views": {"1": {"bbox": big}}}]}
+    one = lambda b: gt.text_loss_weight({"res": 512, "items": [{"id": 0, "text": "A", "views": {"1": {"bbox": b}}}]},
+                                        512, 1.0, 0) > 1
+    w = gt.text_loss_weight(text, 512, 9.0, 64)                  # 64 px at 1024 = 32 at 512: the small box only
+    assert w.dtype == torch.float32 and set(w.unique().tolist()) == {1.0, 10.0}
+    assert torch.equal(w > 1, one(small))
+    assert torch.equal(gt.text_loss_weight(text, 512, 9.0, 0) > 1, one(small) | one(big))
+    assert torch.equal(gt.text_loss_weight(text, 1024, 9.0, 64) > 1,
+                       gt.text_token_mask({"res": 512, "items": text["items"][:1]}, 1024))
+    g = torch.Generator().manual_seed(0)
+    pred, target = torch.randn(1, 16, 8, 8, generator=g), torch.randn(1, 16, 8, 8, generator=g)
+    keep = (torch.rand(1, 16, 8, 8, generator=g) < 0.5).float()
+    weighting = torch.ones(1, 1, 1, 1)
+    trainer_loss = torch.sum(weighting * ((pred * keep) - (target * keep)) ** 2) / keep.sum()
+    assert float(gt.weighted_flow_loss(pred, target, keep, weighting, torch.ones_like(pred))) == float(trainer_loss)
+    tw = torch.ones_like(pred)
+    tw[..., :2, :] = 5.0
+    manual = (tw * keep * (pred - target) ** 2).sum() / (tw * keep).sum()
+    assert float(gt.weighted_flow_loss(pred, target, keep, weighting, tw)) == pytest.approx(float(manual), rel=1e-6)
+    assert gt.text_loss_share(keep, tw) == pytest.approx(float((tw * keep)[..., :2, :].sum() / (tw * keep).sum()))
+
+
 def test_glyph_config_json_and_overrides(tmp_path):
     cfg = gt.glyph_config('{"anchor_mode": "warp", "stages": [[100, 1, 0, 0], ["inf", 0, 0, 1]]}',
                           ["token_budget=512", "aug_scale=[0.9, 1.1]", "drop_flags=[]"])
@@ -593,6 +618,8 @@ def worker(spec):
     if spec.get("checkpoint0"):
         os.makedirs(os.path.join(out_dir, "checkpoint-0"), exist_ok=True)
         shutil.copy(spec["checkpoint0"], os.path.join(out_dir, "checkpoint-0", "pytorch_lora_weights.safetensors"))
+    if spec.get("checkpoint0_proj"):
+        shutil.copy(spec["checkpoint0_proj"], os.path.join(out_dir, "checkpoint-0", "glyph_layout_proj.safetensors"))
     if spec.get("from_args"):
         torch.manual_seed(0)
         trainer = tm.Trainer.from_args(args, accelerator, logger, dl)
@@ -632,6 +659,9 @@ def worker(spec):
 
     res["trainable"] = [n for n, p in trainer.transformer.named_parameters() if p.requires_grad]
     xe = trainer.transformer.x_embedder
+    if hasattr(xe, "layout_proj"):       # --glyph_layout wraps the original embedder
+        res["layout_proj_abs"] = float(xe.layout_proj.weight.detach().abs().sum())
+        xe = xe.base
     w = xe.modules_to_save["default"].weight if hasattr(xe, "modules_to_save") else xe.weight
     base = FluxTransformer2DModel.from_pretrained(spec["pretrained"], subfolder="transformer").x_embedder.weight
     res["x_embedder_zero"] = bool((w == 0).all())
@@ -649,8 +679,12 @@ def worker(spec):
 
     def pre(mod, a, kw):
         ids = kw["img_ids"]
-        rec["calls"].append({"n_tokens": int(kw["hidden_states"].shape[1]), "ids_dtype": str(ids.dtype),
-                             "n_glyph": int(getattr(trainer, "last_n_glyph", 0))})
+        hs = kw["hidden_states"]
+        rec["calls"].append({"n_tokens": int(hs.shape[1]), "ids_dtype": str(ids.dtype),
+                             "n_glyph": int(getattr(trainer, "last_n_glyph", 0)),
+                             "n_layout": int(getattr(trainer, "last_n_layout", 0)), "channels": int(hs.shape[-1]),
+                             "layout_abs": float(hs[..., 64:].detach().float().abs().sum()) if hs.shape[-1] > 64 else 0.0,
+                             "grad": bool(torch.is_grad_enabled())})
         rec["ids"] = ids.detach().float().cpu()
         if spec.get("mode") == "ids":
             raise StopForward
@@ -670,6 +704,17 @@ def worker(spec):
 
     trainer.transformer.register_forward_pre_hook(pre, with_kwargs=True)
     trainer.transformer.register_forward_hook(post, with_kwargs=True)
+    if spec.get("capture_text_loss"):
+        g = tm.glyph_tokens()
+        orig_wfl = g.weighted_flow_loss
+
+        def wfl(pred, target, keep, weighting, token_weight):
+            loss = orig_wfl(pred, target, keep, weighting, token_weight)
+            torch.save({k: v.detach().cpu() for k, v in (("pred", pred), ("target", target), ("keep", keep),
+                                                          ("weighting", weighting), ("token_weight", token_weight))},
+                       os.path.join(out_dir, "text_loss.pt"))
+            return loss
+        g.weighted_flow_loss = wfl
     losses = []
     orig_backward = accelerator.backward
 
@@ -690,6 +735,12 @@ def worker(spec):
             raise
         res["end_error"] = f"AttributeError: {e}"
     res.update(losses=losses, calls=rec["calls"], lora_changed=bool((lora[0][1].detach() - before).abs().sum() > 0))
+    res["drawn_text"] = (getattr(trainer, "last_layout_info", None) or {}).get("drawn_text")
+    lp = getattr(trainer.transformer.x_embedder, "layout_proj", None)
+    if lp is not None:
+        res["layout_proj_max_after"] = float(lp.weight.detach().abs().max())
+        res["layout_in_main_optimizer"] = any(p is lp.weight for g in trainer.optimizer.param_groups for p in g["params"])
+        res["layout_optimizer"] = getattr(trainer, "layout_optimizer", None) is not None
     if "ids" in rec:
         torch.save(rec["ids"], os.path.join(out_dir, "img_ids.pt"))
     return res
@@ -824,6 +875,146 @@ def test_text_keep_boost(tmp_path, patched, pretrained, sample_real):
     kept[tgt[:, 1].long(), tgt[:, 2].long()] = True
     assert m.sum() > 0 and bool(kept[m].all())         # every text token kept at boost 1
     assert one["calls"][0]["n_tokens"] > z["calls"][0]["n_tokens"]
+
+
+def test_text_loss_weight(tmp_path, patched, pretrained, sample512):
+    """--text_loss_weight: weights of 1 give the original loss, and the weight sits on the latent
+    values of the small text boxes (2 x 2 latent pixels per token, every channel)."""
+    base = run_worker(tmp_path, patched, pretrained, sample512, argv=["--zero_text_embeds"])
+    ones = run_worker(tmp_path, patched, pretrained, sample512, capture_text_loss=True,
+                      argv=["--zero_text_embeds", "--text_loss_weight", "9", "--text_loss_max_height", "1"])
+    on = run_worker(tmp_path, patched, pretrained, sample512, capture_text_loss=True,
+                    argv=["--zero_text_embeds", "--text_loss_weight", "9"])
+    assert ones["losses"][0] == pytest.approx(base["losses"][0], rel=1e-6)
+    c = torch.load(os.path.join(on["out_dir"], "text_loss.pt"))
+    text = torch.load(str(sample512))["text_json"]
+    m = gt.text_token_mask(text, 512, max_height_px=32).reshape(32, 192)     # SIDE and BACK PANEL, not FRONT LABEL
+    every = gt.text_token_mask(text, 512).reshape(32, 192)
+    assert m.any() and (every & ~m).any() and not (m & ~every).any()
+    want = 1 + 9 * m.float().repeat_interleave(2, 0).repeat_interleave(2, 1)
+    assert c["token_weight"].shape == (1, 16, 64, 384)
+    assert torch.equal(c["token_weight"], want.expand(1, 16, 64, 384))
+    tw = c["token_weight"]
+    manual = (tw * c["weighting"] * (c["keep"] * (c["pred"] - c["target"])) ** 2).sum() / (tw * c["keep"]).sum()
+    assert on["losses"][0] == pytest.approx(float(manual), rel=1e-5)
+    assert on["losses"][0] != pytest.approx(base["losses"][0], rel=1e-3)
+
+
+def test_glyph_layout_channels(tmp_path, patched, pretrained, sample512):
+    """--glyph_layout: the forward gets 64 layout channels next to the latents, the projection starts at
+    zero (first loss equal to the run without layout), trains, is saved with every checkpoint and the
+    final LoRA and is loaded on resume. The probe's two losses are equal at step 1 and differ after it."""
+    base = run_worker(tmp_path, patched, pretrained, sample512, argv=["--zero_text_embeds"], steps=2)
+    lay_argv = ["--zero_text_embeds", "--glyph_layout", "--glyph_layout_set", "p_all_drop=0", "p_item_drop=0",
+                "p_edges=0.5", "--glyph_layout_probe_every", "1", "--checkpointing_steps", "1"]
+    lay = run_worker(tmp_path, patched, pretrained, sample512, argv=lay_argv, steps=2)
+    out = lay["out_dir"]
+    assert "x_embedder.layout_proj.weight" in lay["trainable"] and lay["layout_proj_abs"] == 0.0
+    assert not any("x_embedder.base" in n for n in lay["trainable"])
+    train_calls = [c for c in lay["calls"] if c["grad"]]
+    assert [c["channels"] for c in train_calls] == [128, 128] and all(c["layout_abs"] > 0 for c in train_calls)
+    assert all(c["channels"] == 64 for c in lay["calls"] if not c["grad"])      # the probe's no-layout forward
+    assert lay["losses"][0] == base["losses"][0]
+    probe = [json.loads(s) for s in open(os.path.join(out, "layout_probe_rank0.jsonl"))]
+    assert [p["step"] for p in probe] == [1, 2] and all(p["n_tokens"] > 0 for p in probe)
+    assert probe[0]["proj_mean_abs"] == 0.0 and probe[1]["proj_mean_abs"] > 0
+    assert probe[0]["with"] == pytest.approx(probe[0]["without"], rel=1e-6)
+    assert probe[1]["with"] != pytest.approx(probe[1]["without"], rel=1e-9, abs=0)
+    cfg = json.load(open(os.path.join(out, "glyph_layout_config.json")))
+    assert cfg["p_edges"] == 0.5 and cfg["p_all_drop"] == 0
+    from unitex import glyph_layout as gla
+    w1 = gla.load_layout_proj(os.path.join(out, "checkpoint-1"))
+    w2 = gla.load_layout_proj(os.path.join(out, "pytorch_lora_weights.safetensors"))
+    assert w1.abs().sum() > 0 and not torch.equal(w1, w2)
+    # resume from a checkpoint with a projection: it is loaded, not reset
+    res = run_worker(tmp_path, patched, pretrained, sample512, mode="params",
+                     argv=lay_argv + ["--resume_from_checkpoint", "latest"],
+                     checkpoint0=os.path.join(out, "pytorch_lora_weights.safetensors"),
+                     checkpoint0_proj=gla.layout_proj_path(os.path.join(out, "pytorch_lora_weights.safetensors")))
+    assert res["layout_proj_abs"] == pytest.approx(float(w2.abs().sum()), rel=1e-6)
+    # a warm start without one starts at zero
+    res0 = run_worker(tmp_path, patched, pretrained, sample512, mode="params",
+                      argv=lay_argv + ["--resume_from_checkpoint", "latest"],
+                      checkpoint0=os.path.join(out, "pytorch_lora_weights.safetensors"))
+    assert res0["layout_proj_abs"] == 0.0 and res0["lora_loaded"]
+
+
+def test_glyph_layout_lr(tmp_path, patched, pretrained, sample512):
+    """--glyph_layout_lr: the layout projection leaves Prodigy for its own AdamW, so the first step moves every
+    weight with a gradient by the learning rate. In Prodigy (d0 1e-6) the first step moves it about 1e-6."""
+    argv = ["--zero_text_embeds", "--glyph_layout", "--glyph_layout_set", "p_all_drop=0", "p_item_drop=0"]
+    slow = run_worker(tmp_path, patched, pretrained, sample512, argv=argv, steps=1)
+    fast = run_worker(tmp_path, patched, pretrained, sample512, argv=argv + ["--glyph_layout_lr", "1e-3"], steps=1)
+    assert slow["layout_in_main_optimizer"] and not slow["layout_optimizer"]
+    assert fast["layout_optimizer"] and not fast["layout_in_main_optimizer"]
+    assert fast["layout_proj_max_after"] == pytest.approx(1e-3, rel=1e-3)
+    assert 0 < slow["layout_proj_max_after"] < 1e-4
+    assert fast["losses"] == slow["losses"] and fast["lora_changed"]
+
+
+def test_glyph_layout_tokens(tmp_path, patched, pretrained, sample512):
+    """--glyph_layout_mode tokens: x_embedder stays as it is, the layout tokens come last with ids
+    (1, row, col) of exactly the target tokens under the drawn lines, are cut off before the loss, the
+    probe drops them, and no projection is saved."""
+    argv = ["--zero_text_embeds", "--glyph_layout", "--glyph_layout_mode", "tokens", "--glyph_layout_set",
+            "p_all_drop=0", "p_item_drop=0", "p_edges=0.5"]
+    ids_run = run_worker(tmp_path, patched, pretrained, sample512, argv=argv, mode="ids", no_drop=True)
+    n_lay = ids_run["calls"][0]["n_layout"]
+    assert n_lay > 0 and ids_run["calls"][0]["channels"] == 64
+    ids = torch.load(os.path.join(ids_run["out_dir"], "img_ids.pt"))
+    nr, nc = 512 // 16, 6 * 512 // 16
+    assert torch.equal(ids[:nr * nc, 0], torch.zeros(nr * nc))           # the full target first (no drop)
+    idx = torch.nonzero(gt.text_token_mask(ids_run["drawn_text"], 512)).flatten()
+    lay = ids[-n_lay:]
+    assert idx.numel() == n_lay and torch.equal(lay[:, 0], torch.ones(n_lay))
+    assert torch.equal(lay[:, 1:], ids[idx, 1:])                          # on the target tokens they describe
+    run = run_worker(tmp_path, patched, pretrained, sample512, steps=2,
+                     argv=argv + ["--glyph_layout_probe_every", "1", "--checkpointing_steps", "1"])
+    assert not any("layout_proj" in n for n in run["trainable"]) and run["x_embedder_is_base"]
+    train_calls = [c for c in run["calls"] if c["grad"]]
+    probe_calls = [c for c in run["calls"] if not c["grad"]]
+    assert len(train_calls) == len(probe_calls) == 2 and all(c["n_layout"] > 0 for c in train_calls)
+    assert [p["n_tokens"] for p in probe_calls] == [c["n_tokens"] - c["n_layout"] for c in train_calls]
+    probe = [json.loads(s) for s in open(os.path.join(run["out_dir"], "layout_probe_rank0.jsonl"))]
+    assert [p["step"] for p in probe] == [1, 2] and all(p["layout_tokens"] > 0 for p in probe)
+    assert "proj_mean_abs" not in probe[0] and probe[0]["with"] != pytest.approx(probe[0]["without"], rel=1e-9, abs=0)
+    assert not os.path.exists(os.path.join(run["out_dir"], "checkpoint-1", "glyph_layout_proj.safetensors"))
+    assert not os.path.exists(os.path.join(run["out_dir"], "glyph_layout_proj.safetensors"))
+    assert os.path.exists(os.path.join(run["out_dir"], "pytorch_lora_weights.safetensors"))
+
+
+def test_glyph_layout_argument_checks(patched, tmp_path):
+    common = BASE_ARGV + ["--pretrained_model_name_or_path", "x", "--output_dir", "y"]
+    cases = {"ok": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_probe_every", "5"],
+             "lr": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_lr", "2e-4"],
+             "x_embedder": common + ["--dataset_impl", "cfi", "--glyph_layout", "--train_x_embedder"],
+             "probe_alone": common + ["--dataset_impl", "cfi", "--glyph_layout_probe_every", "5"],
+             "probe_negative": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_probe_every", "-1"],
+             "lr_alone": common + ["--dataset_impl", "cfi", "--glyph_layout_lr", "2e-4"],
+             "lr_negative": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_lr", "-1"],
+             "tokens": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_mode", "tokens"],
+             "tokens_lr": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_mode", "tokens",
+                                    "--glyph_layout_lr", "2e-4"],
+             "tokens_glyph": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_mode", "tokens",
+                                       "--glyph"],
+             "tokens_cap": common + ["--dataset_impl", "cfi", "--glyph_layout", "--glyph_layout_mode", "tokens",
+                                     "--glyph_layout_max_tokens", "0"],
+             "not_cfi": common + ["--glyph_layout"]}
+    (tmp_path / "cases.json").write_text(json.dumps(cases))
+    script = ("import json, sys\nimport launch\nout = {}\n"
+              "for k, argv in json.load(open(sys.argv[1])).items():\n"
+              "    try:\n        a = launch.parse_args(argv)\n        out[k] = 'ok' if a.glyph_layout else 'off'\n"
+              "    except ValueError as e:\n        out[k] = 'ValueError'\n"
+              "print(json.dumps(out))\n")
+    env = dict(os.environ, PYTHONPATH=patched + os.pathsep + REPO, USE_TF="0", CAUGHT_ALL_EXCEPTIONS="1")
+    r = subprocess.run([sys.executable, "-c", script, str(tmp_path / "cases.json")], capture_output=True, text=True,
+                       env=env, cwd=patched, timeout=600)
+    assert r.returncode == 0, r.stderr[-3000:]
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got == {"ok": "ok", "lr": "ok", "x_embedder": "ValueError", "probe_alone": "ValueError",
+                   "probe_negative": "ValueError", "lr_alone": "ValueError", "lr_negative": "ValueError",
+                   "tokens": "ok", "tokens_lr": "ValueError", "tokens_glyph": "ValueError",
+                   "tokens_cap": "ValueError", "not_cfi": "ValueError"}
 
 
 @pytest.mark.skipif(not SLOW, reason="FLUX_TEST_SLOW=0")

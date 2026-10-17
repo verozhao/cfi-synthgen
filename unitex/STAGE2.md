@@ -264,7 +264,8 @@ Training at 1024:
 
 Inference at 1024: `--view-res 1024 --pos-scale 0.5 --shift-mu 2.19 --delight-res 512`. The delight
 LoRA is a 512 model, so the delight pass runs at 512 on the downsampled strip and the texture
-pass's detail above 512 is added back.
+pass's detail above 512 is added back. With `--delight-shading 4` the delight pass gives only the
+shading, and the letters come from the texture pass (DESIGN.md step 6).
 
 Photo front (`unitex/photo_front.py`, inference only, any finished run): the photo is aligned to the
 generated front view (bbox fit, then a SIFT homography), its detail replaces the front view where

@@ -680,3 +680,71 @@ def test_text_at_box_top_edge_not_on_top_view(scenes):
     print("top edge views:", {k: (v["pixels"], v["cos"], v["height_px"]) for k, v in it["views"].items()})
     assert "4" not in it["views"], it["views"]["4"]
     assert set(it["views"]) == {"0", "1"}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Registered placement (photo_front registration instead of the bbox fit)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _tilt(deg=4.0, keystone=(2e-4, -1e-4), centre=(560.0, 540.0), margin=80.0):
+    """Photo -> tilted photo: rotation and keystone about the centre, then a shift into a margin."""
+    c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+    T = np.array([[1, 0, -centre[0]], [0, 1, -centre[1]], [0, 0, 1.0]])
+    P = np.array([[c, -s, 0], [s, c, 0], [keystone[0], keystone[1], 1.0]])
+    B = np.array([[1, 0, centre[0] + margin], [0, 1, centre[1] + margin], [0, 0, 1.0]])
+    return B @ P @ T
+
+
+def _hom(H, xy):
+    xy = np.asarray(xy, np.float64)
+    p = np.concatenate([xy, np.ones(xy.shape[:-1] + (1,))], axis=-1) @ H.T
+    return p[..., :2] / p[..., 2:3]
+
+
+def test_registered_view0_map_scales_and_falls_back_to_the_bbox_fit():
+    info = {"view_res": 1024, "align": {"fg_box_photo": [10, 20, 110, 220], "view0_box": [100, 50, 300, 450]},
+            "register": {"method": "affine"}}
+    fn, rec = an.registered_view0_map(info)
+    aff = C.fit_box_affine([10, 20, 110, 220], [100, 50, 300, 450])
+    xy = np.array([[10.0, 20.0], [60.0, 120.0]])
+    assert rec["method"] == "bbox" and np.allclose(fn(xy), C.apply_affine(xy, aff))
+    fn512, rec512 = an.registered_view0_map(info, res=512)
+    assert rec512["scale_to_res"] == 0.5 and np.allclose(fn512(xy), C.apply_affine(xy, aff) / 2)
+    # the refined box wins over the plain silhouette box
+    info["align"]["box"] = [90, 40, 310, 460]
+    assert np.allclose(an.registered_view0_map(info)[0](xy),
+                       C.apply_affine(xy, C.fit_box_affine([10, 20, 110, 220], [90, 40, 310, 460])))
+
+
+def test_registered_map_undoes_a_tilted_photo(scenes):
+    """A tilted catalog photo: the bbox fit misplaces front text by pixels, the photo_front
+    registration (bbox fit, then a homography in its 2x frame) puts it back on the exact spot."""
+    import cv2
+    sc = scenes["box"]
+    geo = _geo(sc, "mvgen")
+    Hp = _tilt()
+    canvas = sc["photo_mask"]
+    size = (canvas.shape[1] + 160, canvas.shape[0] + 160)
+    mask_t = cv2.warpPerspective(canvas.astype(np.uint8), Hp, size, flags=cv2.INTER_NEAREST) > 0
+    fg_t = C.bbox_of_mask(mask_t)
+    items = [dict(it, quad=_hom(Hp, it["quad"]).tolist()) for it in sc["items"]]
+    truth = [view0_quad(sc["shape"], sp["reg"], sp["orient"]) for sp in sc["specs"]]
+
+    bbox_doc = an.lift(items, mask_t, fg_t, geo, an.LiftConfig())
+    bbox_err = max(np.abs(np.asarray(it["view0_quad"]) - t).max() for it, t in zip(bbox_doc["items"], truth))
+    assert bbox_err > 2.0                                           # the tilt really misplaces the text
+
+    aff, align = an.fit_photo_to_view0(mask_t, fg_t, geo.masks[0])
+    A = C.fit_box_affine(align["fg_box_photo"], align.get("box") or align["view0_box"])
+    M_A = np.array([[A[0], 0, A[2]], [0, A[1], A[3]], [0, 0, 1.0]])
+    M_T = np.array([[1 / UP, 0, -PAD[0] / UP], [0, 1 / UP, -PAD[1] / UP], [0, 0, 1.0]]) @ np.linalg.inv(Hp)
+    S2 = np.diag([2.0, 2.0, 1.0])
+    H = S2 @ M_T @ np.linalg.inv(M_A) @ np.linalg.inv(S2)         # 2x affine-warped photo -> 2x view 0
+    pf = {"view_res": geo.res, "align": align,
+          "register": {"method": "homography", "scale": 2, "homography": H.tolist(), "n_inliers": 99}}
+    fn, rec = an.registered_view0_map(pf)
+    doc = an.lift(items, mask_t, fg_t, geo, an.LiftConfig(), view0_map=fn, view0_map_info=rec)
+    reg_err = max(np.abs(np.asarray(it["view0_quad"]) - t).max() for it, t in zip(doc["items"], truth))
+    assert reg_err < 0.05, reg_err
+    assert doc["lift"]["view0_map"]["method"] == "homography" and "view0_map" not in bbox_doc["lift"]
+    assert set(doc["items"][0]["views"]) == {"0", "1"}             # still lifted onto the same views

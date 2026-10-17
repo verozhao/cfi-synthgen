@@ -190,7 +190,7 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
     pre = np.ascontiguousarray(warp_into_view(photo, tuple(v * scale for v in aff), S)[..., :3])
     pre_m = warp_into_view(Image.fromarray(pmask.astype(np.uint8) * 255), tuple(v * scale for v in aff), S,
                            Image.BILINEAR).astype(np.float32) / 255.0
-    info = {"method": "affine", "requested": method}
+    info = {"method": "affine", "requested": method, "scale": scale}
     g2 = cv2.resize(gen0, (S, S), interpolation=cv2.INTER_CUBIC)
     m2 = cv2.resize(mask0.astype(np.uint8), (S, S), interpolation=cv2.INTER_NEAREST) > 0
     blur = lambda a: cv2.GaussianBlur(_gray(a), (0, 0), S / 128)       # noqa: E731

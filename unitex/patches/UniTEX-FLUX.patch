@@ -11,7 +11,7 @@ index d4fa89b..d400e75 100644
  from matplotlib import pyplot as plt
  import numpy as np
 diff --git a/launch.py b/launch.py
-index 566ae4f..34f3c27 100644
+index 566ae4f..111d37b 100644
 --- a/launch.py
 +++ b/launch.py
 @@ -32,6 +32,7 @@ from torchvision.transforms.functional import crop
@@ -22,7 +22,7 @@ index 566ae4f..34f3c27 100644
  import diffusers
  from diffusers import (
      AutoencoderKL,
-@@ -800,6 +801,53 @@ def parse_args(input_args=None):
+@@ -800,6 +801,88 @@ def parse_args(input_args=None):
              " or to a folder containing files that 🤗 Datasets can understand."
          ),
      )
@@ -72,11 +72,46 @@ index 566ae4f..34f3c27 100644
 +                             "which peft 0.15.2 never did. diffusers 0.32.2 drops it at load.")
 +    parser.add_argument("--text_keep_boost", type=float, default=0.0,
 +                        help="noise drop: target tokens in text boxes are kept with p + boost * (1 - p)")
++    parser.add_argument("--cfi_ref_text_dir", type=str, default=None,
++                        help="unitex.ref_text precompute output: text polygons of every render_random view")
++    parser.add_argument("--cfi_ref_text_blur", type=float, default=0.0,
++                        help="probability that a sample's reference gets its small text blurred, so those letters "
++                             "have to come from the glyph tokens (needs --cfi_ref_text_dir)")
++    parser.add_argument("--cfi_ref_text_max_height", type=int, default=None,
++                        help="blur text up to this height, px at 1024 (default unitex.ref_text.MAX_HEIGHT)")
++    parser.add_argument("--text_loss_weight", type=float, default=0.0,
++                        help="target tokens in small text boxes count 1 + this in the flow matching loss (a "
++                             "weighted mean, 0 = the original loss)")
++    parser.add_argument("--text_loss_max_height", type=float, default=64.0,
++                        help="--text_loss_weight covers text boxes up to this height, px at 1024 per view (0 = all)")
++    parser.add_argument("--glyph_layout", action="store_true",
++                        help="every text line drawn at its place and size in each view (unitex.glyph_layout) and "
++                             "VAE-encoded, given to the model as --glyph_layout_mode says (needs --dataset_impl cfi)")
++    parser.add_argument("--glyph_layout_mode", type=str, default="channels", choices=["channels", "tokens"],
++                        help="channels: extra input channels of the target tokens through a zero-initialised "
++                             "projection next to x_embedder. tokens: the layout latent under the drawn lines "
++                             "appended as tokens on the glyph plane at exactly those target tokens' (row, col)")
++    parser.add_argument("--glyph_layout_max_tokens", type=int, default=4096,
++                        help="tokens mode: at most this many layout tokens, the lines with the most tokens left out")
++    parser.add_argument("--glyph_layout_oracle", action="store_true",
++                        help="diagnostic, tokens mode: the layout tokens carry the clean target latent of the target "
++                             "tokens they sit on instead of the drawn layout (how fast aligned tokens can be learned)")
++    parser.add_argument("--glyph_layout_config", type=str, default=None,
++                        help="LayoutConfig as a JSON file or an inline JSON object")
++    parser.add_argument("--glyph_layout_set", type=str, nargs="*", default=[],
++                        help="LayoutConfig overrides key=value, e.g. p_edges=0.3 use_generated=false")
++    parser.add_argument("--glyph_layout_probe_every", type=int, default=0,
++                        help="every N steps one more forward without the layout channels (no gradient): logs the "
++                             "loss on drawn small-text tokens with and without the layout (0 = off)")
++    parser.add_argument("--glyph_layout_lr", type=float, default=0.0,
++                        help="learning rate of a separate AdamW for the layout projection (0 = it trains in the main "
++                             "optimizer). Prodigy sizes its steps for the LoRA, about 1e-5 per weight per step on a "
++                             "warm start, which leaves a projection that starts at zero near zero")
 +
      if input_args is not None:
          args = parser.parse_args(input_args)
      else:
-@@ -835,6 +883,20 @@ def parse_args(input_args=None):
+@@ -835,6 +918,50 @@ def parse_args(input_args=None):
      assert len(args.multiscale_training_step_range) == 2, \
          f'multiscale_training error: {args.multiscale_training_step_range}'
  
@@ -93,11 +128,41 @@ index 566ae4f..34f3c27 100644
 +        raise ValueError("--text_keep_boost must be in [0, 1]")
 +    if args.text_keep_boost > 0 and args.dataset_impl != "cfi":
 +        raise ValueError("--text_keep_boost needs --dataset_impl cfi (text_json per sample)")
++    if args.cfi_ref_text_blur > 0 and (args.dataset_impl != "cfi" or not args.cfi_ref_text_dir):
++        raise ValueError("--cfi_ref_text_blur needs --dataset_impl cfi and --cfi_ref_text_dir")
++    if args.text_loss_weight < 0 or args.text_loss_max_height < 0:
++        raise ValueError("--text_loss_weight and --text_loss_max_height must be >= 0")
++    if args.text_loss_weight > 0 and args.dataset_impl != "cfi":
++        raise ValueError("--text_loss_weight needs --dataset_impl cfi (text_json per sample)")
++    if args.text_loss_weight > 0 and args.with_prior_preservation:
++        raise ValueError("--text_loss_weight does not support --with_prior_preservation")
++    if args.glyph_layout:
++        if args.dataset_impl != "cfi":
++            raise ValueError("--glyph_layout needs --dataset_impl cfi (text_json per sample)")
++        if args.train_batch_size != 1:
++            raise ValueError("--glyph_layout needs --train_batch_size=1 (one layout per step)")
++        if args.train_x_embedder:
++            raise ValueError("--glyph_layout wraps x_embedder, it does not combine with --train_x_embedder")
++        if args.with_prior_preservation:
++            raise ValueError("--glyph_layout does not support --with_prior_preservation")
++    if args.glyph_layout_probe_every < 0 or (args.glyph_layout_probe_every and not args.glyph_layout):
++        raise ValueError("--glyph_layout_probe_every needs --glyph_layout and must be >= 0")
++    if args.glyph_layout_lr < 0 or (args.glyph_layout_lr and not args.glyph_layout):
++        raise ValueError("--glyph_layout_lr needs --glyph_layout and must be >= 0")
++    if args.glyph_layout and args.glyph_layout_mode == "tokens":
++        if args.glyph_layout_lr:
++            raise ValueError("--glyph_layout_lr is for the channels projection, tokens mode has none")
++        if args.glyph:
++            raise ValueError("--glyph_layout_mode tokens replaces --glyph (both use the glyph plane)")
++        if args.glyph_layout_max_tokens < 1:
++            raise ValueError("--glyph_layout_max_tokens must be >= 1")
++    if args.glyph_layout_oracle and not (args.glyph_layout and args.glyph_layout_mode == "tokens"):
++        raise ValueError("--glyph_layout_oracle needs --glyph_layout --glyph_layout_mode tokens")
 +
      env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
      if env_local_rank != -1 and env_local_rank != args.local_rank:
          args.local_rank = env_local_rank
-@@ -902,7 +964,19 @@ def main(args):
+@@ -902,7 +1029,29 @@ def main(args):
          transformers.utils.logging.set_verbosity_error()
          diffusers.utils.logging.set_verbosity_error()
      # dataset perparation
@@ -112,13 +177,23 @@ index 566ae4f..34f3c27 100644
 +            image_ext=args.cfi_image_ext,
 +            alpha_source=args.cfi_alpha_source,
 +            skip_broken=args.cfi_skip_broken,
++            ref_text_dir=args.cfi_ref_text_dir,
++            ref_text_blur=args.cfi_ref_text_blur,
++            ref_text_max_height=args.cfi_ref_text_max_height,
 +        )
-+        logger.info(f"cfi dataset: {len(train_dataset)} uids from {train_dataset.roots}, view_resolution {args.view_resolution}")
++        logger.info(f"cfi dataset: {len(train_dataset)} uids from {train_dataset.roots}, view_resolution {args.view_resolution}, "
++                    f"reference text blur {args.cfi_ref_text_blur} ({args.cfi_ref_text_dir}), "
++                    f"text loss weight {args.text_loss_weight} (boxes up to {args.text_loss_max_height} px), "
++                    f"glyph layout {args.glyph_layout_mode if args.glyph_layout else 'off'}"
++                    + (f" (projection AdamW lr {args.glyph_layout_lr})" if args.glyph_layout_lr else "")
++                    + (f" (at most {args.glyph_layout_max_tokens} tokens)"
++                       if args.glyph_layout and args.glyph_layout_mode == "tokens" else "")
++                    + (", ORACLE: clean target latents" if args.glyph_layout_oracle else ""))
 +    elif args.dataset_name_list is None:
          train_dataset = PBRTextureGenerationDataset(
              args.dataset_name, 
              MVDatasetConfig(
-@@ -928,6 +1002,7 @@ def main(args):
+@@ -928,6 +1077,7 @@ def main(args):
                  bump_background_color=args.background_color,
                  metallic_background_color=args.background_color,
                  roughness_background_color=args.background_color,
@@ -126,7 +201,7 @@ index 566ae4f..34f3c27 100644
                  skip_broken=True,
              ), 
              extra_dataset=ReconstructDataset(
-@@ -936,7 +1011,8 @@ def main(args):
+@@ -936,7 +1086,8 @@ def main(args):
                      image_ext='.mdb',
                      skip_broken=True,
                      rgb_background_color=args.background_color,
@@ -136,7 +211,7 @@ index 566ae4f..34f3c27 100644
                  ),
              ),
          )
-@@ -967,6 +1043,7 @@ def main(args):
+@@ -967,6 +1118,7 @@ def main(args):
                      bump_background_color=args.background_color,
                      metallic_background_color=args.background_color,
                      roughness_background_color=args.background_color,
@@ -144,7 +219,7 @@ index 566ae4f..34f3c27 100644
                      skip_broken=True,
                  ), 
                  extra_dataset=ReconstructDataset(
-@@ -974,7 +1051,8 @@ def main(args):
+@@ -974,7 +1126,8 @@ def main(args):
                      ReconstructDatasetConfig(
                          image_ext='.mdb',
                          rgb_background_color=args.background_color,
@@ -195,10 +270,10 @@ index c07b0a9..bfada15 100644
  
      def prepare_latents_and_image_ids(
 diff --git a/tasks/texturing/trainer.py b/tasks/texturing/trainer.py
-index 494a389..efdd77b 100644
+index 494a389..e04f26e 100644
 --- a/tasks/texturing/trainer.py
 +++ b/tasks/texturing/trainer.py
-@@ -80,6 +80,18 @@ from safetensors.torch import save_file, load_file
+@@ -80,6 +80,29 @@ from safetensors.torch import save_file, load_file
  from pipeline import PBRFluxPipeline, PBRFluxPriorReduxPipeline
  from attention_processor import NativeFluxAttnProcessor2_0, RandomDropFluxAttnProcessor2_0
  
@@ -214,10 +289,21 @@ index 494a389..efdd77b 100644
 +        _glyph_tokens = gt
 +    return _glyph_tokens
 +
++
++_glyph_layout = None
++
++
++def glyph_layout():
++    global _glyph_layout
++    if _glyph_layout is None:
++        from unitex import glyph_layout as gla
++        _glyph_layout = gla
++    return _glyph_layout
++
  def get_mha_processor(args, device='cuda'):
      text_tokens = 512
      if args.six_views_or_four_views:
-@@ -120,6 +132,17 @@ class Trainer(PBRFluxPipeline):
+@@ -120,6 +143,29 @@ class Trainer(PBRFluxPipeline):
          dataloader):
          super().__init__(scheduler, vae, text_encoder, tokenizer, text_encoder_2, tokenizer_2, transformer)
          self.args = args
@@ -225,6 +311,7 @@ index 494a389..efdd77b 100644
 +        self.text_embed_dims = (transformer.config.joint_attention_dim, transformer.config.pooled_projection_dim)
 +        self.glyph_cfg = None
 +        self.last_n_glyph = 0
++        self.last_text_share = 0.0
 +        if getattr(args, "glyph", False):
 +            self.glyph_cfg = glyph_tokens().glyph_config(getattr(args, "glyph_config", None),
 +                                                         getattr(args, "glyph_set", None) or ())
@@ -232,10 +319,21 @@ index 494a389..efdd77b 100644
 +                os.makedirs(args.output_dir, exist_ok=True)
 +                with open(os.path.join(args.output_dir, "glyph_config.json"), "w") as f:
 +                    json.dump(glyph_tokens().glyph_config_dict(self.glyph_cfg), f, indent=1)
++        self.layout_cfg = None
++        self.last_layout_info = None
++        self.last_probe = None
++        self.last_n_layout = 0
++        if getattr(args, "glyph_layout", False):
++            self.layout_cfg = glyph_layout().layout_config(getattr(args, "glyph_layout_config", None),
++                                                           getattr(args, "glyph_layout_set", None) or ())
++            if accelerator.is_main_process and args.output_dir is not None:
++                os.makedirs(args.output_dir, exist_ok=True)
++                with open(os.path.join(args.output_dir, "glyph_layout_config.json"), "w") as f:
++                    json.dump(glyph_layout().layout_config_dict(self.layout_cfg), f, indent=1)
          # set parameters in all models as false
          self.set_requires_grad()
          # set all parameters as half precision
-@@ -140,54 +163,69 @@ class Trainer(PBRFluxPipeline):
+@@ -140,54 +186,69 @@ class Trainer(PBRFluxPipeline):
          accelerator, 
          logger,
          train_dataloader):
@@ -342,7 +440,17 @@ index 494a389..efdd77b 100644
  
  
          ## add random drop technique for diffusion training acceleration![paper novelty!]
-@@ -214,8 +252,10 @@ class Trainer(PBRFluxPipeline):
+@@ -210,12 +271,20 @@ class Trainer(PBRFluxPipeline):
+ 
+         return Trainer(scheduler, vae, text_encoder, tokenizer, text_encoder_2, tokenizer_2, transformer, args, accelerator, logger, train_dataloader)
+ 
++    def layout_channels(self):
++        """--glyph_layout in channels mode: extra input channels through a projection next to x_embedder.
++        Tokens mode appends layout tokens instead and leaves x_embedder alone."""
++        return bool(getattr(self.args, "glyph_layout", False)) and \
++            getattr(self.args, "glyph_layout_mode", "channels") == "channels"
++
+     def set_requires_grad(self):
          # We only train the additional adapter LoRA layers and disable follows:
          self.transformer.requires_grad_(False)
          self.vae.requires_grad_(False)
@@ -355,7 +463,7 @@ index 494a389..efdd77b 100644
  
      
      def set_weight_type_and_device(self, accelerator):
-@@ -234,9 +274,12 @@ class Trainer(PBRFluxPipeline):
+@@ -234,9 +303,12 @@ class Trainer(PBRFluxPipeline):
              weight_dtype = torch.bfloat16
          self.weight_dtype = weight_dtype
          self.vae.to(accelerator.device, dtype=self.weight_dtype)
@@ -371,7 +479,16 @@ index 494a389..efdd77b 100644
  
  
      def prepare_training(self, accelerator, logger):
-@@ -295,28 +338,39 @@ class Trainer(PBRFluxPipeline):
+@@ -265,6 +337,8 @@ class Trainer(PBRFluxPipeline):
+         self.transformer, self.optimizer, self.train_dataloader, self.lr_scheduler = accelerator.prepare(
+             self.transformer, self.optimizer, self.train_dataloader, self.lr_scheduler
+         )
++        if self.layout_optimizer is not None:
++            self.layout_optimizer = accelerator.prepare(self.layout_optimizer)
+ 
+         # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+         self.num_update_steps_per_epoch = math.ceil(len(self.train_dataloader) / self.args.gradient_accumulation_steps)
+@@ -295,34 +369,59 @@ class Trainer(PBRFluxPipeline):
                  "ff_context.net.2",
              ]
  
@@ -430,14 +547,35 @@ index 494a389..efdd77b 100644
 +        self.transformer.add_adapter(transformer_lora_config)
 +        if train_x_embedder:
 +            self.transformer.x_embedder.modules_to_save.requires_grad_(True)
++        if self.layout_channels():
++            # x_embedder + a zero-initialised fp32 projection of the layout channels: the model gives
++            # its old output until the projection learns, and it trains next to the LoRA
++            xe = glyph_layout().wrap_x_embedder(self.transformer, device=accelerator.device, dtype=torch.float32)
++            xe.layout_proj.requires_grad_(True)
  
          self.load_LoRA_from_checkpoint(accelerator,logger)
  
-@@ -447,7 +501,16 @@ class Trainer(PBRFluxPipeline):
+     def set_optimizer(self, logger):
+         # parameters to optimize
+         transformer_lora_parameters = list(filter(lambda p: p.requires_grad, self.transformer.parameters()))
++        self.layout_optimizer = None
++        if getattr(self.args, "glyph_layout_lr", 0.0) > 0:
++            # the layout projection gets its own AdamW: Prodigy sizes its steps for the LoRA (about 1e-5
++            # per weight per step on a warm start), which leaves a projection that starts at zero near zero
++            proj = self.transformer.x_embedder.layout_proj.weight
++            transformer_lora_parameters = [p for p in transformer_lora_parameters if p is not proj]
++            self.layout_optimizer = torch.optim.AdamW([proj], lr=self.args.glyph_layout_lr,
++                                                      betas=(self.args.adam_beta1, self.args.adam_beta2),
++                                                      weight_decay=0.0, eps=1e-8)
+         transformer_parameters_with_lr = {
+             "params": transformer_lora_parameters, 
+             "lr": self.args.learning_rate,
+@@ -447,8 +546,24 @@ class Trainer(PBRFluxPipeline):
                  transformer_state_dict = {
                      f'{k.replace("transformer.", "")}': v for k, v in lora_state_dict.items() if k.startswith("transformer.")
                  }
 -                
+-                incompatible_keys = set_peft_model_state_dict(self.transformer, transformer_state_dict, adapter_name="default")  
 +                if not getattr(self.args, "train_x_embedder", False):
 +                    # The released UniTEX LoRAs carry x_embedder (equal to base FLUX). With x_embedder
 +                    # outside modules_to_save, peft 0.15.2 would silently copy it over the frozen base
@@ -448,10 +586,30 @@ index 494a389..efdd77b 100644
 +                    if dropped:
 +                        logger.warning(f"ignoring {dropped} from {path}: x_embedder is not trained (no --train_x_embedder)")
 +
-                 incompatible_keys = set_peft_model_state_dict(self.transformer, transformer_state_dict, adapter_name="default")  
++                incompatible_keys = set_peft_model_state_dict(self.transformer, transformer_state_dict, adapter_name="default")
++                if self.layout_channels():
++                    proj = glyph_layout().layout_proj_path(os.path.join(self.args.output_dir, path))
++                    if os.path.isfile(proj):
++                        glyph_layout().wrap_x_embedder(self.transformer, glyph_layout().load_layout_proj(proj))
++                        logger.info(f"glyph layout projection loaded from {proj}")
++                    else:
++                        logger.info(f"no glyph layout projection in {path}: it starts at zero")
  
                  if incompatible_keys is not None:
-@@ -505,8 +568,8 @@ class Trainer(PBRFluxPipeline):
+                     # check only for unexpected keys
+@@ -488,7 +603,10 @@ class Trainer(PBRFluxPipeline):
+                 save_directory=save_path,
+                 transformer_lora_layers=transformer_lora_layers,
+                 text_encoder_lora_layers=None,
+-            )  
++            )
++        if self.layout_channels():
++            # next to pytorch_lora_weights.safetensors, loaded by run_unitex.py --glyph-layout
++            glyph_layout().save_layout_proj(self.unwrap_model(self.transformer, accelerator).x_embedder, save_path)
+ 
+     def inference(self, steps, accelerator, logger, load_path=None, output_dir=None):
+         # Final inference
+@@ -505,8 +623,8 @@ class Trainer(PBRFluxPipeline):
              pipeline = PBRFluxPipeline.from_pretrained(
                          self.args.pretrained_model_name_or_path,
                          vae=self.vae,
@@ -462,7 +620,7 @@ index 494a389..efdd77b 100644
                          transformer=accelerator.unwrap_model(self.transformer).eval(),
                          redux_pipeline=None,
                          revision=self.args.revision,
-@@ -594,10 +657,11 @@ class Trainer(PBRFluxPipeline):
+@@ -594,10 +712,11 @@ class Trainer(PBRFluxPipeline):
                              image = [Image.open(im).convert('RGB') for im in image]
                              images += [im for im in image]
                      # NOTE: hardcode here
@@ -476,7 +634,7 @@ index 494a389..efdd77b 100644
                      pipeline_args["control_image"] = image
                  if args.redux_image:
                      image = validation_prompt_item['image']
-@@ -725,9 +789,17 @@ class Trainer(PBRFluxPipeline):
+@@ -725,9 +844,17 @@ class Trainer(PBRFluxPipeline):
              num_images_per_prompt: int = 1,
              text_input_ids_list=None):
          
@@ -495,7 +653,7 @@ index 494a389..efdd77b 100644
              dtype = self.text_encoder.dtype
  
              pooled_prompt_embeds = self._encode_prompt_with_clip(
-@@ -749,7 +821,7 @@ class Trainer(PBRFluxPipeline):
+@@ -749,7 +876,7 @@ class Trainer(PBRFluxPipeline):
  
              prompt_embeds = prompt_embeds.to(device, dtype=weight_dtype)
              pooled_prompt_embeds = pooled_prompt_embeds.to(device, dtype=weight_dtype)
@@ -504,7 +662,7 @@ index 494a389..efdd77b 100644
  
          return prompt_embeds, pooled_prompt_embeds, text_ids
          
-@@ -761,7 +833,44 @@ class Trainer(PBRFluxPipeline):
+@@ -761,7 +888,116 @@ class Trainer(PBRFluxPipeline):
  
  
      def _encode_vae_image():
@@ -519,6 +677,19 @@ index 494a389..efdd77b 100644
 +        if m.numel() != n_tokens:
 +            raise ValueError(f"text mask has {m.numel()} tokens, the target has {n_tokens}")
 +        return m
++
++    def text_loss_token_weight(self, batch, n_tokens, view_res):
++        """Loss weight per target token (CPU float32 [n_tokens]) for --text_loss_weight. With
++        --glyph_layout only the lines drawn in this sample's layout count: the others (dropped or
++        filtered) cannot be read from anywhere when the reference text is blurred."""
++        texts = batch.get("text_json") if isinstance(batch, dict) else None
++        text = texts[0] if texts else ""
++        if getattr(self.args, "glyph_layout", False):
++            text = (self.last_layout_info or {}).get("drawn_text") or ""
++        w = glyph_tokens().text_loss_weight(text, view_res, self.args.text_loss_weight, self.args.text_loss_max_height)
++        if w.numel() != n_tokens:
++            raise ValueError(f"text loss weight has {w.numel()} tokens, the target has {n_tokens}")
++        return w
 +
 +    def activation_offload(self):
 +        """--offload_activations: tensors autograd saves during the transformer forward go to pinned
@@ -547,10 +718,69 @@ index 494a389..efdd77b 100644
 +                                      view_res=view_res)
 +        return gt.encode_glyphs(insts, self.vae, device=accelerator.device, dtype=self.weight_dtype)
 +
++    def prepare_glyph_layout(self, batch, training_image, global_step, micro_step, accelerator):
++        """--glyph_layout: this sample's layout channels [1, n_target, 64] (weight_dtype, about zero
++        off the text). Lines come from text_json, drops and edges are drawn with a per-sample rng
++        (its own stream, not the glyph tokens'), edges from the target picked above."""
++        if training_image.shape[0] != 1:
++            raise ValueError("--glyph_layout needs --train_batch_size=1")
++        texts = batch.get("text_json") if isinstance(batch, dict) else None
++        if texts is None:
++            raise KeyError("--glyph_layout needs a dataset with a text_json key (launch.py --dataset_impl cfi)")
++        gla = glyph_layout()
++        rng = glyph_tokens().glyph_rng(self.args.seed, global_step, micro_step, accelerator.process_index, 1)
++        R = training_image.shape[-2]
++        views = glyph_tokens().strip_to_views(training_image[0], R) if gla.needs_views(self.layout_cfg) else None
++        strip, info = gla.layout_strip(texts[0], R, self.layout_cfg, rng=rng, views=views)
++        self.last_layout_info = info
++        if not self.layout_channels():
++            # tokens mode: ([1, N, 64] weight_dtype, [N, 3] fp32 ids on the glyph plane at the text's
++            # own target tokens), drawn_text narrowed to the lines that got tokens
++            lat, ids, self.last_layout_info = gla.layout_tokens(
++                strip, info, self.vae, max_tokens=self.args.glyph_layout_max_tokens,
++                device=accelerator.device, dtype=self.weight_dtype)
++            return lat, ids
++        return gla.encode_layout(strip, self.vae, device=accelerator.device, dtype=self.weight_dtype)
++
++    def layout_probe(self, model_pred, transformer_kwargs, hidden_states, n_noise, target_packed, keep_index,
++                     sigmas, view_res, accelerator):
++        """--glyph_layout_probe_every: the loss on the kept target tokens of drawn small lines, with the
++        layout (this step's prediction) and without it (one more forward, no gradient, zero layout
++        channels or no layout tokens). Same noise, timestep and conditions, so the difference is the
++        layout's effect."""
++        drawn = (self.last_layout_info or {}).get("drawn_text")
++        mh = float(self.args.text_loss_max_height) * view_res / 1024 if self.args.text_loss_max_height else math.inf
++        m = glyph_tokens().text_token_mask(drawn, view_res, max_height_px=mh).to(model_pred.device)
++        if keep_index is not None:
++            m = m[keep_index]
++        if not m.any():
++            return None
++        with torch.no_grad():
++            if self.layout_channels():
++                c = hidden_states.shape[-1] // 2
++                pred0 = self.transformer(hidden_states=hidden_states[..., :c], **transformer_kwargs)[0][:, :n_noise]
++            else:
++                # tokens mode: the same sequence without the layout tokens at its end
++                L = hidden_states.shape[1] - self.last_n_layout
++                kw = dict(transformer_kwargs, img_ids=transformer_kwargs["img_ids"][:L])
++                pred0 = self.transformer(hidden_states=hidden_states[:, :L], **kw)[0][:, :n_noise]
++            tgt = target_packed if keep_index is None else target_packed[:, keep_index]
++            w = compute_loss_weighting_for_sd3(weighting_scheme=self.args.weighting_scheme, sigmas=sigmas).float().view(-1)
++            err = lambda p: float((w[:, None, None] * (p.float() - tgt.float()) ** 2)[:, m].mean())
++            out = {"step": None, "rank": accelerator.process_index, "n_tokens": int(m.sum()),
++                   "with": err(model_pred.detach()), "without": err(pred0),
++                   "sigma": float(sigmas.view(-1)[0]), "lines": int((self.last_layout_info or {}).get("n_lines", 0))}
++            if self.layout_channels():
++                proj = self.unwrap_model(self.transformer, accelerator).x_embedder.layout_proj.weight
++                out["proj_mean_abs"] = float(proj.detach().abs().mean())
++            else:
++                out["layout_tokens"] = int(self.last_n_layout)
++        return out
++
      def train(self, accelerator, logger):
          # We need to initialize the trackers we use, and also store our configuration.
          # The trackers initializes automatically on the main process.
-@@ -865,7 +974,8 @@ class Trainer(PBRFluxPipeline):
+@@ -865,7 +1101,8 @@ class Trainer(PBRFluxPipeline):
  
                      # Add noise according to flow matching.
                      # zt = (1 - texp) * x + texp * z1
@@ -560,7 +790,7 @@ index 494a389..efdd77b 100644
                      noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
                      BL, CL, HL, WL = noisy_model_input.shape
                      latents = self._pack_latents(
-@@ -880,7 +990,7 @@ class Trainer(PBRFluxPipeline):
+@@ -880,7 +1117,7 @@ class Trainer(PBRFluxPipeline):
                          HL // 2,
                          WL // 2,
                          accelerator.device,
@@ -569,7 +799,7 @@ index 494a389..efdd77b 100644
                          offset_x=0,
                          offset_y=0,
                          offset_z=0,
-@@ -921,7 +1031,7 @@ class Trainer(PBRFluxPipeline):
+@@ -921,7 +1158,7 @@ class Trainer(PBRFluxPipeline):
                              HDL // 2, 
                              WDL // 2, 
                              accelerator.device,
@@ -578,7 +808,7 @@ index 494a389..efdd77b 100644
                              offset_x=WL // 2,
                              offset_y=HL // 2,
                              offset_z=0,
-@@ -964,7 +1074,7 @@ class Trainer(PBRFluxPipeline):
+@@ -964,7 +1201,7 @@ class Trainer(PBRFluxPipeline):
                              HCL // 2, 
                              WCL // 2, 
                              accelerator.device,
@@ -587,7 +817,7 @@ index 494a389..efdd77b 100644
                              offset_x=0,
                              offset_y=HL // 2,
                              offset_z=0,
-@@ -996,13 +1106,22 @@ class Trainer(PBRFluxPipeline):
+@@ -996,13 +1233,22 @@ class Trainer(PBRFluxPipeline):
                      if self.args.random_drop_noise and 0.0 <= self.args.random_drop_noise_probability <= 1.0:
                          if random.random() < 1.0:
                              random_drop_noise = True
@@ -611,7 +841,7 @@ index 494a389..efdd77b 100644
                      if condition_latents is not None:
                          if self.args.random_drop_condition and 0.0 <= self.args.random_drop_condition_probability <= 1.0:
                              if random.random() < 1.0:
-@@ -1015,20 +1134,35 @@ class Trainer(PBRFluxPipeline):
+@@ -1015,20 +1261,60 @@ class Trainer(PBRFluxPipeline):
                                  random_drop_condition = False
                          latents = torch.cat([latents, condition_latents], dim=1)
                          latent_image_ids = torch.cat([latent_image_ids, condition_ids], dim=0)
@@ -624,6 +854,20 @@ index 494a389..efdd77b 100644
 +                        if self.last_n_glyph:
 +                            latents = torch.cat([latents, glyph_latents.to(latents.dtype)], dim=1)
 +                            latent_image_ids = torch.cat([latent_image_ids, glyph_ids.to(latent_image_ids.dtype)], dim=0)
++                    # --glyph_layout_mode tokens: layout tokens last, never dropped, cut off before the loss
++                    self.last_n_layout = 0
++                    if getattr(self.args, "glyph_layout", False) and not self.layout_channels():
++                        lay_latents, lay_ids = self.prepare_glyph_layout(batch, training_image, global_step, step, accelerator)
++                        self.last_n_layout = lay_latents.shape[1]
++                        if self.last_n_layout:
++                            if getattr(self.args, "glyph_layout_oracle", False):
++                                # diagnostic: the clean target latent of the target tokens the layout
++                                # tokens sit on (ids (1, row, col), row-major over (HL/2, WL/2))
++                                clean = self._pack_latents(model_input, BL, CL, HL, WL)
++                                idx = lay_ids[:, 1].long() * (WL // 2) + lay_ids[:, 2].long()
++                                lay_latents = clean[:, idx.to(clean.device)]
++                            latents = torch.cat([latents, lay_latents.to(latents.dtype)], dim=1)
++                            latent_image_ids = torch.cat([latent_image_ids, lay_ids.to(latent_image_ids)], dim=0)
                      # 4. predict
 -                    model_pred = self.transformer(
 -                    hidden_states=latents,
@@ -635,17 +879,22 @@ index 494a389..efdd77b 100644
 -                    img_ids=latent_image_ids,
 -                    return_dict=False,
 -                    )[0]
--
--                    if condition_latents is not None:
--                        model_pred = model_pred[:, :-condition_latents.shape[1]]
 +                    if getattr(self.args, "pos_scale", 1.0) != 1.0:
 +                        # positional interpolation, like UniTEX inference --pos-scale: spatial axes of
 +                        # every image token (target, conditions, glyphs), axis 0 (glyph plane) unchanged
 +                        latent_image_ids = latent_image_ids.clone()
 +                        latent_image_ids[:, 1:] = latent_image_ids[:, 1:] * float(self.args.pos_scale)
-+                    with self.activation_offload():
-+                        model_pred = self.transformer(
-+                        hidden_states=latents,
++                    layout_keep = None
++                    if self.args.random_drop_noise and 0.0 <= self.args.random_drop_noise_probability <= 1.0 and random_drop_noise:
++                        layout_keep = index_noise
++                    hidden_states = latents
++                    if self.layout_channels():
++                        # --glyph_layout: 64 layout channels next to the 64 latent channels. Each kept
++                        # target token gets the layout under it, conditions and glyph tokens get zeros.
++                        layout = self.prepare_glyph_layout(batch, training_image, global_step, step, accelerator)
++                        layout = glyph_layout().layout_tokens_full(layout, latents.shape[1], layout_keep)
++                        hidden_states = torch.cat([latents, layout.to(latents.dtype).expand(latents.shape[0], -1, -1)], dim=-1)
++                    transformer_kwargs = dict(
 +                        timestep=timesteps / 1000,
 +                        guidance=guidance,
 +                        pooled_projections=pooled_prompt_embeds,
@@ -653,23 +902,109 @@ index 494a389..efdd77b 100644
 +                        txt_ids=text_image_ids,
 +                        img_ids=latent_image_ids,
 +                        return_dict=False,
-+                        )[0]
-+
++                    )
++                    with self.activation_offload():
++                        model_pred = self.transformer(hidden_states=hidden_states, **transformer_kwargs)[0]
+ 
+-                    if condition_latents is not None:
+-                        model_pred = model_pred[:, :-condition_latents.shape[1]]
 +                    # was model_pred[:, :-condition_latents.shape[1]], which would keep glyph tokens
 +                    model_pred = model_pred[:, :n_noise]
++                    pred_packed = model_pred
                          
                      model_pred_mask = torch.ones_like(model_pred)
                      if self.args.random_drop_noise and 0.0 <= self.args.random_drop_noise_probability <= 1.0:
-@@ -1142,6 +1276,8 @@ class Trainer(PBRFluxPipeline):
+@@ -1037,6 +1323,12 @@ class Trainer(PBRFluxPipeline):
+                             index_noise = index_noise.unsqueeze(0).unsqueeze(-1).repeat(model_pred_zero.shape[0], 1, model_pred_zero.shape[-1])
+                             model_pred = model_pred_zero.scatter(1, index_noise, model_pred)
+                             model_pred_mask = model_pred_zero.scatter(1, index_noise, torch.ones_like(model_pred))
++                    # --text_loss_weight: one weight per target token over the full strip, unpacked like model_pred
++                    token_weight = None
++                    if getattr(self.args, "text_loss_weight", 0.0) > 0:
++                        tw = self.text_loss_token_weight(batch, model_pred.shape[1], pixel_values.shape[-2])
++                        token_weight = tw.to(model_pred.device).view(1, -1, 1).expand(
++                            model_pred.shape[0], -1, model_pred.shape[-1]).contiguous()
+                     # model_pred = self._unpack_latents(
+                     #     model_pred,
+                     #     height=height,
+@@ -1056,6 +1348,13 @@ class Trainer(PBRFluxPipeline):
+                     width=model_input.shape[3] * vae_scale_factor,
+                     vae_scale_factor=vae_scale_factor,
+                     )
++                    if token_weight is not None:
++                        token_weight = self._unpack_latents(
++                            token_weight,
++                            height=model_input.shape[2] * vae_scale_factor,
++                            width=model_input.shape[3] * vae_scale_factor,
++                            vae_scale_factor=vae_scale_factor,
++                        )
+                     # 5. flow matching loss
+                     # these weighting schemes use a uniform timestep sampling
+                     # and instead post-weight the loss
+@@ -1079,7 +1378,12 @@ class Trainer(PBRFluxPipeline):
+                         prior_loss = prior_loss.mean()
+ 
+                     # Compute regular loss.
+-                    loss = torch.sum((weighting.float() * ((model_pred * model_pred_mask).float() - (target * model_pred_mask).float()) ** 2))/model_pred_mask.sum()
++                    if token_weight is None:
++                        loss = torch.sum((weighting.float() * ((model_pred * model_pred_mask).float() - (target * model_pred_mask).float()) ** 2))/model_pred_mask.sum()
++                    else:
++                        # the same masked loss as a weighted mean: small text boxes count 1 + text_loss_weight
++                        loss = glyph_tokens().weighted_flow_loss(model_pred, target, model_pred_mask, weighting, token_weight)
++                        self.last_text_share = glyph_tokens().text_loss_share(model_pred_mask, token_weight)
+ 
+                     if self.args.with_prior_preservation:
+                         # Add the prior loss to the instance loss.
+@@ -1096,12 +1400,30 @@ class Trainer(PBRFluxPipeline):
+                         loss = loss + args.preconditioning_loss_weight * preconditioning_loss
+ 
+                     accelerator.backward(loss)
++                    probe_every = getattr(self.args, "glyph_layout_probe_every", 0)
++                    self.last_probe = None
++                    if probe_every and accelerator.sync_gradients and (global_step + 1) % probe_every == 0:
++                        # before the optimizer step, so both predictions come from the same weights
++                        self.last_probe = self.layout_probe(
++                            pred_packed, transformer_kwargs, hidden_states, n_noise,
++                            self._pack_latents(target, BL, CL, HL, WL), layout_keep, sigmas,
++                            pixel_values.shape[-2], accelerator)
++                        if self.last_probe is not None and self.args.output_dir:
++                            self.last_probe["step"] = global_step + 1
++                            self.last_probe["ref_text_blurred"] = int(batch["ref_text_blurred"][0]) \
++                                if "ref_text_blurred" in batch else None
++                            with open(os.path.join(self.args.output_dir,
++                                                   f"layout_probe_rank{accelerator.process_index}.jsonl"), "a") as f:
++                                f.write(json.dumps(self.last_probe) + "\n")
+                     if accelerator.sync_gradients:
+                         params_to_clip = [self.transformer.parameters()]
+                         accelerator.clip_grad_norm_(itertools.chain(*params_to_clip), self.args.max_grad_norm)
+                         del params_to_clip
+ 
+                     self.optimizer.step()
++                    if self.layout_optimizer is not None:
++                        self.layout_optimizer.step()
++                        self.layout_optimizer.zero_grad()
+                     self.lr_scheduler.step()
+                     self.optimizer.zero_grad()
+                     # breakpoint()
+@@ -1142,6 +1464,17 @@ class Trainer(PBRFluxPipeline):
  
  
                  logs = {"loss": loss.detach().item(), "lr": self.lr_scheduler.get_last_lr()[0]}
 +                if getattr(self.args, "glyph", False):
 +                    logs["glyph_tokens"] = self.last_n_glyph
++                if getattr(self.args, "text_loss_weight", 0.0) > 0:
++                    logs["text_share"] = round(self.last_text_share, 3)
++                if getattr(self.args, "glyph_layout", False):
++                    logs["layout_lines"] = (self.last_layout_info or {}).get("n_lines", 0)
++                    if not self.layout_channels():
++                        logs["layout_tokens"] = self.last_n_layout
++                    if self.last_probe is not None:
++                        logs["probe_with"] = round(self.last_probe["with"], 4)
++                        logs["probe_without"] = round(self.last_probe["without"], 4)
                  progress_bar.set_postfix(**logs)
                  accelerator.log(logs, step=global_step)
  
-@@ -1155,7 +1291,8 @@ class Trainer(PBRFluxPipeline):
+@@ -1155,7 +1488,8 @@ class Trainer(PBRFluxPipeline):
              self.save_lora_layers(accelerator, self.args.output_dir)
  
          # Final inference
