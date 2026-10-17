@@ -185,7 +185,8 @@ Other changes in the patch: position ids are built in fp32 everywhere (trainer c
   which shows how fast aligned layout tokens can be learned at all.
 - **Edge maps the same way.** `--glyph_layout_set p_edges=0.7 p_crop=0.0 crop_shift=1.0 crop_blur=0.75
   crop_color=0.15` draws 70% of the training lines as Canny edges of the target view, found on the pixels
-  after the crop degradations, and the rest as font. Inference: `--glyph-layout-kind edges`.
+  after the crop degradations, and the rest as font. Inference: `--glyph-layout-kind edges`. In the eval
+  the edge maps added nothing, so crops stay the layout to use (DESIGN.md, step 5).
 - **OCR loss.** `--ocr_loss_weight w` adds a recognizer's loss on the text itself. At steps with noise
   level up to `max_sigma` (0.4) it takes up to 6 lines drawn in the layout, 12 to 64 px tall at 1024 and
   at most 24 times as long as tall. Every target token of their boxes is kept in the noise drop (the flow

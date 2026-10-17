@@ -177,6 +177,17 @@ text are reported separately.
   - With the sharp photo the crop run reads 34 lines in the final view and the same LoRA without a
     layout reads 30. Before the delight pass the crop run reads 39, the most of any run. The delight
     pass loses the difference (step 6).
+- Edges eval (`layouttokE_1024_ft500`, edges for 70% of training lines, everything else as the crop
+  run). These evals use `--delight-shading 4`, so the crop run's numbers here are those of step 6. The
+  edge maps come from the same registered photo pixels as the crops, and their letters are clean.
+  - With the sharp photo the edges run reads 37 lines in the final view and the crop run 39. The edges
+    LoRA without a layout also reads 37, the very same lines. So the edge maps add nothing.
+  - With the photo's text blurred the edges run reads 15 lines and the crop run 33. The crop run reads
+    18 lines the edges run misses, and the edges run reads none that the crop run misses (p 8e-6). So
+    the model takes no text from the edge maps.
+  - The training probe agrees. It compares the small-text loss of a sample with and without its
+    layout. Over the second half of training the layout lowered that loss by 3.8% with edges and by
+    10.4% with crops.
 
 ## Delight shading (step 6)
 
@@ -278,3 +289,23 @@ text are reported separately.
   A recognizer's gradient on a line it cannot read says little about the letters and would outweigh the
   flow loss, so `max_sigma` is 0.4. The run weight 0.007 puts the median OCR gradient below that limit
   at half the flow gradient. Memory peaked at 20 GB per GPU.
+- Run (`ocrC_1024_ft500`): the crop run plus the OCR loss at weight 0.007, everything else the same.
+  Each GPU used the loss at about a third of its steps. Of the lines it drew, 1834 of 2826 passed the
+  label check. It added under 1% to the training time.
+- Lines read on the 6 test products, out of 56, with `--delight-shading 4`. The last column counts the
+  28 lines under 16 px in the final view:
+
+| LoRA and layout | lit | final view | under 16 px |
+|---|---|---|---|
+| crop run, crop layout, sharp photo | 39 | 39 | 14 |
+| OCR run, crop layout, sharp photo | 40 | 40 | 14 |
+| crop run, crop layout, photo text blurred | 32 | 33 | 8 |
+| OCR run, crop layout, photo text blurred | 31 | 31 | 7 |
+| crop run, no layout | 34 | 34 | 9 |
+| OCR run, no layout | 35 | 35 | 11 |
+
+- With the sharp photo the OCR run reads one more line in the final view and loses none. That line is
+  over 32 px, and both runs read the same small lines. With the photo's text blurred the OCR run reads
+  2 fewer. Neither difference is significant.
+- The OCR loss did change the LoRA. Its effective weights end 81% as far from the crop LoRA as the crop
+  LoRA moved from its start. What the eval reads stayed the same.
