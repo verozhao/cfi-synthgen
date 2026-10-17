@@ -240,6 +240,7 @@ text are reported separately.
 | `g1024_final` (glyph tokens LoRA at 1024) | 122 (35) | 108 (23) | 104 (22) |
 | `g1024_final`, delight fix applied offline | 122 (35) | 126 (38) | |
 | crop layout with `--delight-shading 4` | 154 (57) | 152 (58) | 146 (57) |
+| the same with the OCR loss LoRA (step 7) | 151 (54) | 150 (53) | 140 (49) |
 | current Gemini pipeline (`baseline`) | | | 157 (86) |
 
 - In the final view the crop run reads 45 lines that `g1024_final` misses and misses 1 that it reads.
@@ -309,3 +310,9 @@ text are reported separately.
   2 fewer. Neither difference is significant.
 - The OCR loss did change the LoRA. Its effective weights end 81% as far from the crop LoRA as the crop
   LoRA moved from its start. What the eval reads stayed the same.
+- On all 28 products, scored as in the full eval above, the OCR run reads no more either. Its final view
+  reads 150 lines and the crop run's 152. It reads 6 lines the crop run misses and misses 8 that it
+  reads. The sign test gives p 0.79. On small lines it reads 53 and the crop run 58. The baked asset
+  reads 140 lines against 146. The sign test gives p 0.18. Both runs used the same layouts, so only the
+  LoRA differs.
+- So at weight 0.007 the OCR loss does not close the small-text gap to the current pipeline.

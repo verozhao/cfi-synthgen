@@ -193,7 +193,8 @@ Other changes in the patch: position ids are built in fp32 everywhere (trainer c
   loss still sees only the tokens the drop kept), the predicted clean latent of each box goes through the
   VAE decoder, and TrOCR's cross entropy of its reading of the clean target box is the loss. Lines TrOCR
   cannot read in the clean target are left out. `ocr_rank<r>.jsonl` holds every step's lines, readings and
-  losses. The weight 0.007 comes from a pilot with `--ocr_loss_grad_every` (DESIGN.md, step 7).
+  losses. The weight 0.007 comes from a pilot with `--ocr_loss_grad_every` (DESIGN.md, step 7). In the
+  eval it did not raise the lines read, on the test products or on all 28 (DESIGN.md, step 7).
 
 - **Warm start from the released LoRA** through `checkpoint-0` as above. It needs `--lora_rank 16
   --lora_alpha 16` and the default target modules (no `--lora_layers`), which match the 684 LoRA
