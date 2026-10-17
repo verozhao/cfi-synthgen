@@ -249,7 +249,7 @@ def layout_summary(glyph_text, cfg, view_res, mode="channels", max_tokens=LAYOUT
            "config": gla.layout_config_dict(cfg)}
     if mode == "tokens":
         index, kept = gla.layout_token_index(info, max_tokens)
-        out.update(n_tokens=int(index.numel()), token_lines=len(kept))
+        out.update(n_tokens=int(index.numel() + gla.both_token_index(kept, view_res).numel()), token_lines=len(kept))
     else:
         out.update(n_tokens=(view_res // 16) * (6 * view_res // 16), strong_tokens=None)
     return strip, out
@@ -754,9 +754,9 @@ def main(argv=None):
                    help="channels (default): layout channels of the target tokens through the LoRA's "
                         "glyph_layout_proj.safetensors. tokens: layout tokens on the glyph plane at the text's own "
                         "target tokens (implies --no-glyph-tokens)")
-    g.add_argument("--glyph-layout-kind", choices=("font", "edges", "crop"), default=None,
+    g.add_argument("--glyph-layout-kind", choices=("font", "edges", "crop", "both"), default=None,
                    help="LayoutConfig.infer_kind: font (default), or edges or crops of the registered photo "
-                        "(front view)")
+                        "(front view), or both: font plus the edges on a second token plane (tokens mode)")
     g.add_argument("--glyph-layout-set", action="append", default=None, metavar="KEY=VALUE",
                    help="LayoutConfig override, repeatable")
     g.add_argument("--no-glyph-tokens", action="store_true",
@@ -793,6 +793,8 @@ def main(argv=None):
     if layout_opts and not args.glyph_layout:
         p.error(f"{', '.join(layout_opts)} need --glyph-layout")
     args.glyph_layout_mode = args.glyph_layout_mode or "channels"
+    if args.glyph_layout_kind == "both" and args.glyph_layout_mode != "tokens":
+        p.error("--glyph-layout-kind both needs --glyph-layout-mode tokens")
     if args.glyph_layout and not args.glyph_json_name:
         p.error("--glyph-layout needs --glyph-json-name (the lines to draw)")
     if args.glyph_layout and not args.dry_run and not args.texture_lora:

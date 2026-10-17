@@ -187,6 +187,10 @@ Other changes in the patch: position ids are built in fp32 everywhere (trainer c
   crop_color=0.15` draws 70% of the training lines as Canny edges of the target view, found on the pixels
   after the crop degradations, and the rest as font. Inference: `--glyph-layout-kind edges`. In the eval
   the edge maps added nothing, so crops stay the layout to use (DESIGN.md, step 5).
+- **Edges and font together.** `--glyph_layout_set p_edges=0.0 p_crop=0.0 p_both=0.7 crop_shift=1.0
+  crop_blur=0.75 crop_color=0.15` gives 70% of the training lines both inputs: the font on the glyph plane
+  and the edges on a second plane at the same target tokens. The rest are font. Tokens mode only.
+  Inference: `--glyph-layout-kind both`.
 - **OCR loss.** `--ocr_loss_weight w` adds a recognizer's loss on the text itself. At steps with noise
   level up to `max_sigma` (0.4) it takes up to 6 lines drawn in the layout, 12 to 64 px tall at 1024 and
   at most 24 times as long as tall. Every target token of their boxes is kept in the noise drop (the flow

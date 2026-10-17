@@ -188,6 +188,11 @@ text are reported separately.
   - The training probe agrees. It compares the small-text loss of a sample with and without its
     layout. Over the second half of training the layout lowered that loss by 3.8% with edges and by
     10.4% with crops.
+- Kind `both` gives a line the font and the edges at once, each as its own input. The font goes on the
+  layout strip and the edges on a second strip below it. In tokens mode the line's target tokens get
+  the font tokens on the glyph plane and the edge tokens on an edge plane (ids (2, row, col)). The
+  target and the conditions keep axis 0 at 0, so the edge plane is free. Edge tokens count toward the
+  token cap like the font tokens.
 
 ## Delight shading (step 6)
 

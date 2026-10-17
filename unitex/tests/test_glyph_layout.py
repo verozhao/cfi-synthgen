@@ -290,6 +290,64 @@ def test_one_kind_draw_per_item():
     assert not gla.needs_views(gla.LayoutConfig(p_edges=0.0, p_crop=0.0))
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Both: font and edges of the same line
+# ────────────────────────────────────────────────────────────────────────────
+
+def _bar_text_and_view(R):
+    view = np.full((R, R, 3), 230, np.uint8)
+    view[100:140, 100:300] = 20
+    view[210:250, 100:300] = 20
+    boxes = ((150, 90, 250, 150), (150, 200, 250, 260))
+    items = [_item(i, f"BAR {i}", {"0": _view(_quad(*b))}) for i, b in enumerate(boxes)]
+    items.append(_item(2, "SIDE TEXT", {"2": _view(_quad(100, 400, 300, 430))}))
+    return _text(items), [view] + [None] * 5
+
+
+def test_both_draws_the_font_on_top_and_the_edges_below():
+    R = 512
+    text, views = _bar_text_and_view(R)
+    strip, info = gla.layout_strip(text, R, gla.LayoutConfig(infer_kind="both"), views=views)
+    font, _ = gla.layout_strip(text, R, gla.LayoutConfig(infer_kind="font"), views=views)
+    edges, _ = gla.layout_strip(text, R, gla.LayoutConfig(infer_kind="edges"), views=views)
+    # the side view has no image: font there, and no edges below it
+    assert strip.shape == (2 * R, 6 * R, 3) and info["kinds"] == {"both": 2, "font": 1}
+    assert np.array_equal(strip[:R], font)
+    off2 = FULL_INDEX.index(2) * R
+    assert np.array_equal(strip[R:], np.where(np.arange(6 * R)[None, :, None] // R == off2 // R, 255, edges))
+    assert _ink(strip[R:]).any() and not _ink(strip[R:, off2:off2 + R]).any()
+    # no view image at all: plain font, one plane
+    s1, i1 = gla.layout_strip(text, R, gla.LayoutConfig(infer_kind="both"), views=None)
+    assert s1.shape == (R, 6 * R, 3) and i1["kinds"] == {"font": 3} and np.array_equal(s1, font)
+
+
+def test_both_in_training_draws_like_edges():
+    R = 512
+    text, views = _bar_text_and_view(R)
+    base = dict(p_item_drop=0.0, p_all_drop=0.0, crop_shift=3.0, crop_blur=1.5, crop_color=0.2)
+    both = gla.LayoutConfig(p_edges=0.0, p_both=1.0, **base)
+    edge = gla.LayoutConfig(p_edges=1.0, **base)
+    for s in range(4):
+        a, ia = gla.layout_strip(text, R, both, rng=np.random.default_rng(s), views=views)
+        e, _ = gla.layout_strip(text, R, edge, rng=np.random.default_rng(s), views=views)
+        f, _ = gla.layout_strip(text, R, gla.LayoutConfig(infer_kind="font"), views=views)
+        # the same rng numbers as the edges run: its degraded edges below, the clean font on top
+        off0 = FULL_INDEX.index(0) * R
+        assert ia["kinds"] == {"both": 2, "font": 1} and np.array_equal(a[:R], f)
+        assert np.array_equal(a[R:, off0:off0 + R], e[:, off0:off0 + R])
+    # one kind draw per item: both with p_both 0.5 is exactly edges with p_edges 0.5
+    many = _many()
+    kw = dict(p_item_drop=0.3, p_all_drop=0.0)
+    e = gla.layout_lines(many, 512, gla.LayoutConfig(p_edges=0.5, **kw), np.random.default_rng(11))
+    b = gla.layout_lines(many, 512, gla.LayoutConfig(p_edges=0.0, p_both=0.5, **kw), np.random.default_rng(11))
+    assert [ln["kind"] == "edges" for ln in e] == [ln["kind"] == "both" for ln in b]
+    assert {ln["kind"] for ln in b} == {"font", "both"}
+    with pytest.raises(ValueError):
+        gla.layout_config(None, ["p_edges=0.5", "p_both=0.6"])
+    assert gla.layout_config(None, ["infer_kind=both"]).infer_kind == "both"
+    assert gla.needs_views(gla.LayoutConfig(p_edges=0.0, p_both=0.2))
+
+
 def test_drawn_text_matches_the_text_token_mask():
     R = 1024
     text = _many(6)
@@ -380,6 +438,37 @@ def test_layout_tokens_cap_leaves_out_the_largest_lines(vae):
     _, info0 = gla.layout_strip(_text([]), R)
     lat0, ids0, t0 = gla.layout_tokens(white, info0, vae)
     assert lat0.shape == (1, 0, 64) and ids0.shape == (0, 3) and t0["n_layout_tokens"] == 0
+
+
+def test_both_tokens_sit_on_two_planes(vae):
+    """Kind both: the font tokens of every line on the glyph plane, then the edge tokens of the both
+    lines at the same target tokens on the edge plane. Channels mode refuses a two-plane strip."""
+    R = 512
+    text, views = _bar_text_and_view(R)
+    strip, info = gla.layout_strip(text, R, gla.LayoutConfig(infer_kind="both"), views=views)
+    lat, ids, tinfo = gla.layout_tokens(strip, info, vae)
+    idx = torch.nonzero(gt.text_token_mask(info["drawn_text"], R)).flatten()
+    both = [ln for ln in info["lines"] if ln["kind"] == "both"]
+    eidx = torch.nonzero(gt.text_token_mask(gla.lines_text(both, R), R)).flatten()
+    n, ne = idx.numel(), eidx.numel()
+    assert 0 < ne < n and lat.shape == (1, n + ne, 64) and ids.shape == (n + ne, 3)
+    assert torch.equal(lat[:, :n], gla.encode_layout(strip[:R], vae, subtract_blank=False)[:, idx])
+    assert torch.equal(lat[:, n:], gla.encode_layout(strip[R:], vae, subtract_blank=False)[:, eidx])
+    assert (ids[:n, 0] == gla.LAYOUT_PLANE).all() and (ids[n:, 0] == gla.EDGE_PLANE).all()
+    assert torch.equal(ids[n:], gla.layout_token_ids(eidx, R, plane=gla.EDGE_PLANE))
+    assert tinfo["n_layout_tokens"] == n + ne and tinfo["n_edge_tokens"] == ne and tinfo["token_lines"] == 3
+    assert torch.equal(gla.both_token_index(info["lines"], R), eidx)
+    # the edge tokens count toward the cap: one token short leaves a line out
+    _, kept = gla.layout_token_index(info, max_tokens=n + ne - 1)
+    assert len(kept) < 3
+    lat2, _, t2 = gla.layout_tokens(strip, info, vae, max_tokens=n + ne - 1)
+    assert lat2.shape[1] <= n + ne - 1 and t2["token_lines"] == len(kept)
+    with pytest.raises(ValueError):
+        gla.encode_layout(strip, vae)
+    # a one-plane strip has no edge tokens
+    font, finfo = gla.layout_strip(text, R, gla.LayoutConfig(infer_kind="font"), views=views)
+    _, fids, ft = gla.layout_tokens(font, finfo, vae)
+    assert ft["n_edge_tokens"] == 0 and (fids[:, 0] == gla.LAYOUT_PLANE).all()
 
 
 # ────────────────────────────────────────────────────────────────────────────
