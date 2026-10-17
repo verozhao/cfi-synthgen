@@ -30,6 +30,10 @@ Ink per line (`kind`):
          degrades them like a registered photo (shift, blur, contrast and brightness). An oracle check
          (layout tokens carrying the clean target latent) is learned within 100 steps, while font and
          edges ink is not used after 200, so the layout has to look like the text it stands for.
+  both   font and edges of the same line, each its own input: the font on the layout strip and the edges
+         on a second strip below it (the strip is then (2R, 6R, 3)). In tokens mode the line's target
+         tokens get both, the font tokens on the glyph plane and the edge tokens on the edge plane (axis
+         0 = 2) at the same (row, col). Tokens mode only. Without a view image the line is font.
 
 API (numpy / torch / PIL / cv2, no UniTEX imports, the VAE is any diffusers AutoencoderKL):
   layout_config(spec, overrides)                 LayoutConfig from JSON + key=value overrides
@@ -37,6 +41,7 @@ API (numpy / torch / PIL / cv2, no UniTEX imports, the VAE is any diffusers Auto
   layout_strip(text, view_res, cfg, rng, views)  uint8 (R, 6R, 3) strip + info (lines drawn, drawn text.json)
   encode_layout(strip, vae)                      [1, (R/16)(6R/16), 4C] = packed latent - packed blank latent
   layout_tokens(strip, info, vae, max_tokens)    layout tokens: latents [1, N, 4C] + ids [N, 3] on the glyph plane
+                                                 (and the edge plane for kind both)
   lines_text(lines, view_res)                    text.json dict of drawn lines (text loss weight)
   GlyphLayoutEmbedder, wrap_x_embedder           x_embedder + zero-initialised projection of the extra channels
   save_layout_proj, load_layout_proj             LAYOUT_PROJ_FILE next to pytorch_lora_weights.safetensors
@@ -64,8 +69,9 @@ except ImportError:   # imported with unitex/ itself on sys.path
 LAYOUT_PROJ_FILE = "glyph_layout_proj.safetensors"
 PROJ_KEY = "layout_proj.weight"
 LAYOUT_PLANE = 1.0       # axis 0 of layout token ids: the glyph plane (the target and conditions use 0)
-KINDS = ("font", "edges", "crop")
-VIEW_KINDS = ("edges", "crop")    # kinds drawn from a view image (font without one)
+EDGE_PLANE = 2.0         # axis 0 of the edge tokens of kind both lines
+KINDS = ("font", "edges", "crop", "both")
+VIEW_KINDS = ("edges", "crop", "both")    # kinds drawn from a view image (font without one)
 WHITE = 255
 _LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 
@@ -85,12 +91,14 @@ class LayoutConfig:
     p_item_drop: float = 0.15        # a line missing from the layout: paint it from the reference
     p_all_drop: float = 0.1          # no layout at all: the model keeps working without one
     p_edges: float = 0.3             # training: share of lines drawn as edges instead of font
-    p_crop: float = 0.0              # training: share of lines drawn as crops (p_edges + p_crop <= 1)
+    p_crop: float = 0.0              # training: share of lines drawn as crops
+    p_both: float = 0.0              # training: share of lines drawn as font and edges (p_edges + p_crop
+                                     # + p_both <= 1)
     crop_shift: float = 0.0          # training: crop content shifted by up to this many px per axis
     crop_blur: float = 0.0           # training: Gaussian blur of the crop, sigma uniform up to this
     crop_color: float = 0.0          # training: crop contrast and brightness scaled by up to this share
                                      # (the three also degrade the pixels edges are found on)
-    infer_kind: str = "font"         # inference: font, or edges / crop (front view, registered photo)
+    infer_kind: str = "font"         # inference: font, or edges / crop / both (front view, registered photo)
     pad_frac: float = 0.06           # ink margin inside the quad, as a fraction of its height
     font_path: str = None
     edge_low: int = 60               # Canny thresholds on the 8-bit gray view
@@ -117,19 +125,20 @@ def layout_config(spec=None, overrides=()):
     cfg = LayoutConfig(**d)
     if cfg.infer_kind not in KINDS:
         raise ValueError(f"infer_kind must be one of {KINDS}, got {cfg.infer_kind!r}")
-    for k in ("p_item_drop", "p_all_drop", "p_edges", "p_crop", "crop_color"):
+    for k in ("p_item_drop", "p_all_drop", "p_edges", "p_crop", "p_both", "crop_color"):
         if not 0.0 <= float(getattr(cfg, k)) <= 1.0:
             raise ValueError(f"{k} must be a probability, got {getattr(cfg, k)}")
-    if float(cfg.p_edges) + float(cfg.p_crop) > 1.0:
-        raise ValueError(f"p_edges + p_crop must be at most 1, got {cfg.p_edges} + {cfg.p_crop}")
+    if float(cfg.p_edges) + float(cfg.p_crop) + float(cfg.p_both) > 1.0:
+        raise ValueError(f"p_edges + p_crop + p_both must be at most 1, got {cfg.p_edges} + {cfg.p_crop} + "
+                         f"{cfg.p_both}")
     if float(cfg.crop_shift) < 0 or float(cfg.crop_blur) < 0:
         raise ValueError("crop_shift and crop_blur must not be negative")
     return cfg
 
 
 def needs_views(cfg):
-    """True when training draws lines from the target views (edges or crops)."""
-    return float(cfg.p_edges) > 0 or float(cfg.p_crop) > 0
+    """True when training draws lines from the target views (edges, crops or both)."""
+    return float(cfg.p_edges) > 0 or float(cfg.p_crop) > 0 or float(cfg.p_both) > 0
 
 
 def layout_config_dict(cfg):
@@ -152,9 +161,9 @@ def layout_lines(text, view_res, cfg=None, rng=None):
     {item_id, raw_view, text, quad (4 [x, y], reading order TL TR BR BL), height, kind}.
 
     rng (numpy Generator) turns on the training draws: p_all_drop, p_item_drop per item (all its
-    views), and its kind per item: edges with probability p_edges, crop with p_crop, else font (one
-    draw, so with p_crop 0 the stream is the same as before crops existed). Without rng every line
-    passing the filters is drawn with cfg.infer_kind.
+    views), and its kind per item: edges with probability p_edges, crop with p_crop, both with p_both,
+    else font (one draw, so with p_crop and p_both 0 the stream is the same as before they existed).
+    Without rng every line passing the filters is drawn with cfg.infer_kind.
     """
     cfg = cfg or LayoutConfig()
     text = gt.load_text(text)
@@ -182,7 +191,8 @@ def layout_lines(text, view_res, cfg=None, rng=None):
         if rng is None:
             kind = cfg.infer_kind
         else:
-            kind = "edges" if u < cfg.p_edges else "crop" if u < cfg.p_edges + cfg.p_crop else "font"
+            pe, pc, pb = float(cfg.p_edges), float(cfg.p_crop), float(cfg.p_both)
+            kind = ("edges" if u < pe else "crop" if u < pe + pc else "both" if u < pe + pc + pb else "font")
         for rv, v in sorted((it.get("views") or {}).items(), key=lambda kv: int(kv[0])):
             if not (v.get("bbox") or v.get("quad")):
                 continue
@@ -346,16 +356,19 @@ def draw_crop(canvas, view, quad, cfg=None, rng=None):
 def layout_strip(text, view_res, cfg=None, rng=None, views=None):
     """(uint8 (R, 6R, 3) strip in FULL_INDEX slot order, info) for one asset.
 
-    views: 6 raw-ordered images at view_res (None entries allowed) for kinds edges and crop, e.g.
+    views: 6 raw-ordered images at view_res (None entries allowed) for kinds edges, crop and both, e.g.
     glyph_tokens.strip_to_views(training_image) in training or [registered photo] + [None] * 5 at
-    inference. An edges or crop line on a view without an image is drawn as font. rng (training)
+    inference. An edges, crop or both line on a view without an image is drawn as font. rng (training)
     also degrades the crops, and the pixels edges are found on when crop_* are set.
+    With kind both lines the strip is (2R, 6R, 3): the font of every line on top, the edges of the both
+    lines below. A both line whose edges cannot be drawn (quad too small) counts as font.
     info: {"lines": [...], "n_lines", "kinds": {kind: n}, "per_view": {raw view: n},
            "drawn_text": text.json dict at view_res with only the drawn line views (text loss weight)}.
     """
     cfg = cfg or LayoutConfig()
     R = int(view_res)
     canv = [np.full((R, R, 3), WHITE, np.uint8) for _ in range(6)]
+    canv2 = None
     lines = layout_lines(text, R, cfg, rng)
     drawn, kinds, per_view = [], {}, {}
     for ln in lines:
@@ -370,12 +383,19 @@ def layout_strip(text, view_res, cfg=None, rng=None, views=None):
             ok = draw_crop(c, img, ln["quad"], cfg, rng)
         else:
             ok = draw_font(c, ln["text"], ln["quad"], cfg)
+            if ok and kind == "both":
+                if canv2 is None:
+                    canv2 = [np.full((R, R, 3), WHITE, np.uint8) for _ in range(6)]
+                if not draw_edges(canv2[ln["raw_view"]], img, ln["quad"], cfg, rng):
+                    kind = "font"
         if not ok:
             continue
         drawn.append({**ln, "kind": kind})
         kinds[kind] = kinds.get(kind, 0) + 1
         per_view[str(ln["raw_view"])] = per_view.get(str(ln["raw_view"]), 0) + 1
     strip = np.concatenate([canv[FULL_INDEX[s]] for s in range(6)], axis=1)
+    if "both" in kinds:
+        strip = np.concatenate([strip, np.concatenate([canv2[FULL_INDEX[s]] for s in range(6)], axis=1)], axis=0)
     info = {"view_res": R, "lines": drawn, "n_lines": len(drawn), "kinds": kinds, "per_view": per_view,
             "drawn_text": lines_text(drawn, R)}
     return strip, info
@@ -412,6 +432,8 @@ def encode_layout(strip, vae, device=None, dtype=None, subtract_blank=True):
     dtype = dtype or vae.dtype
     a = np.asarray(strip)
     H, W = a.shape[:2]
+    if subtract_blank and H == 2 * (W // 6):
+        raise ValueError("a layout with kind both lines (two planes) works in tokens mode only")
     C = int(vae.config.latent_channels) * 4
     n = (H // TOKEN_PX) * (W // TOKEN_PX)
     if subtract_blank and (a == WHITE).all():
@@ -437,7 +459,9 @@ def encode_layout(strip, vae, device=None, dtype=None, subtract_blank=True):
 
 def layout_token_index(info, max_tokens=None):
     """Target tokens under the drawn lines of a layout_strip info -> (sorted LongTensor index, kept
-    lines). Over max_tokens the lines with the most tokens are left out (large text needs no help)."""
+    lines). Over max_tokens the lines with the most tokens are left out (large text needs no help).
+    Kind both lines also get edge tokens at the same target tokens (both_token_index), and those
+    count toward max_tokens too."""
     R = int(info["view_res"])
     n = (R // TOKEN_PX) * (6 * R // TOKEN_PX)
     lines = list(info.get("lines") or [])
@@ -445,17 +469,29 @@ def layout_token_index(info, max_tokens=None):
     keep = list(range(len(lines)))
     if max_tokens is not None:
         order = sorted(keep, key=lambda i: (int(masks[i].sum()), i))
-        keep, union = [], torch.zeros(n, dtype=torch.bool)
+        keep, union, union2 = [], torch.zeros(n, dtype=torch.bool), torch.zeros(n, dtype=torch.bool)
         for i in order:
             u = union | masks[i]
-            if int(u.sum()) <= int(max_tokens):
-                union = u
+            u2 = union2 | masks[i] if lines[i]["kind"] == "both" else union2
+            if int(u.sum()) + int(u2.sum()) <= int(max_tokens):
+                union, union2 = u, u2
                 keep.append(i)
         keep.sort()
     m = torch.zeros(n, dtype=torch.bool)
     for i in keep:
         m |= masks[i]
     return torch.nonzero(m).flatten(), [lines[i] for i in keep]
+
+
+def both_token_index(lines, view_res):
+    """Target tokens under the kind both lines among `lines` (e.g. the kept lines of
+    layout_token_index): where their edge tokens go -> sorted LongTensor index."""
+    R = int(view_res)
+    m = torch.zeros((R // TOKEN_PX) * (6 * R // TOKEN_PX), dtype=torch.bool)
+    for ln in lines:
+        if ln["kind"] == "both":
+            m |= gt.text_token_mask(lines_text([ln], R), R)
+    return torch.nonzero(m).flatten()
 
 
 def layout_token_ids(index, view_res, plane=LAYOUT_PLANE):
@@ -469,17 +505,28 @@ def layout_token_ids(index, view_res, plane=LAYOUT_PLANE):
 def layout_tokens(strip, info, vae, max_tokens=None, device=None, dtype=None):
     """Layout tokens: the strip's packed latent (no blank subtracted, an image of the text like glyph
     tokens) at the target tokens under the drawn lines, ids on the glyph plane at those tokens' (row,
-    col). -> (latents [1, N, 4C], ids [N, 3] fp32, info) with info["n_layout_tokens"],
-    info["token_lines"] and info["drawn_text"] narrowed to the lines that got tokens."""
+    col). A two-plane strip (kind both) adds the packed latent of its lower half at the both lines'
+    target tokens, ids on the edge plane. -> (latents [1, N, 4C], ids [N, 3] fp32, info) with
+    info["n_layout_tokens"] (both planes), info["n_edge_tokens"], info["token_lines"] and
+    info["drawn_text"] narrowed to the lines that got tokens."""
     index, kept = layout_token_index(info, max_tokens)
     R = int(info["view_res"])
-    info = dict(info, n_layout_tokens=int(index.numel()), token_lines=len(kept), drawn_text=lines_text(kept, R))
+    a = np.asarray(strip)
+    two = a.shape[0] == 2 * R
+    eindex = both_token_index(kept, R) if two else torch.zeros(0, dtype=torch.long)
+    info = dict(info, n_layout_tokens=int(index.numel() + eindex.numel()), n_edge_tokens=int(eindex.numel()),
+                token_lines=len(kept), drawn_text=lines_text(kept, R))
     if index.numel() == 0:
         C = int(vae.config.latent_channels) * 4
         dev = device or next(vae.parameters()).device
         return torch.zeros(1, 0, C, device=dev, dtype=dtype or vae.dtype), torch.zeros(0, 3), info
-    z = encode_layout(strip, vae, device=device, dtype=dtype, subtract_blank=False)
-    return z[:, index.to(z.device)], layout_token_ids(index, R), info
+    z = encode_layout(a[:R] if two else a, vae, device=device, dtype=dtype, subtract_blank=False)
+    lat, ids = z[:, index.to(z.device)], layout_token_ids(index, R)
+    if eindex.numel():
+        z2 = encode_layout(a[R:], vae, device=device, dtype=dtype, subtract_blank=False)
+        lat = torch.cat([lat, z2[:, eindex.to(z2.device)]], dim=1)
+        ids = torch.cat([ids, layout_token_ids(eindex, R, plane=EDGE_PLANE)], dim=0)
+    return lat, ids, info
 
 
 def layout_tokens_full(layout, n_total, keep_index=None):
