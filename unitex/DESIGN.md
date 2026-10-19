@@ -193,6 +193,19 @@ text are reported separately.
   the font tokens on the glyph plane and the edge tokens on an edge plane (ids (2, row, col)). The
   target and the conditions keep axis 0 at 0, so the edge plane is free. Edge tokens count toward the
   token cap like the font tokens.
+- Both eval (`layouttokB_1024_ft500`, kind both for 70% of training lines, everything else as the crop
+  run). These evals use `--delight-shading 4`. As with crops, front-view lines get the font and the
+  photo's edges, and lines in other views get the font alone. The edges are found on the sharp photo,
+  so the layouts with and without `--ref-text-blur` are the same.
+  - With the sharp photo the both run reads 39 lines in the final view, as many as the crop run. Each
+    run reads one line the other misses. The same LoRA without a layout reads 36.
+  - With the photo's text blurred the both run reads 17 lines and the crop run 33. The crop run reads
+    16 lines the both run misses, and the both run reads none that the crop run misses (p 3e-5). The
+    same LoRA given the font alone reads 15, as does the edges run. So font and edges together carry
+    no more text than either one alone.
+  - In the training probe the layout lowered the small-text loss by 6.6% over the second half. That is
+    between edges (3.8%) and crops (10.4%). The model leans on the two inputs a little in training, but
+    at inference they bring back almost none of the blurred text.
 
 ## Delight shading (step 6)
 
