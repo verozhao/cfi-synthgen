@@ -23,7 +23,9 @@ Two ways in:
 Ink per line (`kind`):
   font   the line's OCR text drawn into its view quad, stretched to fill it (any view)
   edges  Canny edges of the view's own pixels inside the quad, drawn dark on white. Training: the
-         target view, degraded like a crop first when crop_* are set. Inference: the photo registered
+         target view, degraded like a crop first when crop_* are set (edge_degrade "all"), or only
+         shifted (edge_degrade "shift": blur and contrast changes erase the edges of low-contrast small
+         text that a sharp registered photo keeps). Inference: the photo registered
          into the front view (text.json "front_image"), so edges exist on the front view only and other
          views fall back to font.
   crop   the view's own pixels inside the quad, in colour, from the same images as edges. Training
@@ -50,7 +52,7 @@ API (numpy / torch / PIL / cv2, no UniTEX imports, the VAE is any diffusers Auto
 import json
 import math
 import os
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 
 import cv2
 import numpy as np
@@ -98,6 +100,8 @@ class LayoutConfig:
     crop_blur: float = 0.0           # training: Gaussian blur of the crop, sigma uniform up to this
     crop_color: float = 0.0          # training: crop contrast and brightness scaled by up to this share
                                      # (the three also degrade the pixels edges are found on)
+    edge_degrade: str = "all"        # training edges: after all three ("all") or after the shift only
+                                     # ("shift"), the same rng draws either way
     infer_kind: str = "font"         # inference: font, or edges / crop / both (front view, registered photo)
     pad_frac: float = 0.06           # ink margin inside the quad, as a fraction of its height
     font_path: str = None
@@ -133,6 +137,8 @@ def layout_config(spec=None, overrides=()):
                          f"{cfg.p_both}")
     if float(cfg.crop_shift) < 0 or float(cfg.crop_blur) < 0:
         raise ValueError("crop_shift and crop_blur must not be negative")
+    if cfg.edge_degrade not in ("all", "shift"):
+        raise ValueError(f"edge_degrade must be all or shift, got {cfg.edge_degrade!r}")
     return cfg
 
 
@@ -314,8 +320,8 @@ def _view_crop(v, box, H, cfg, rng):
 def draw_edges(canvas, view, quad, cfg=None, rng=None):
     """Canny edges of view (uint8 RGB / gray at the canvas size) inside quad, drawn black. With an rng
     (training) and a config that degrades crops, the edges are found on the view pixels degraded the
-    way draw_crop degrades them, so training edges look like the edges of a registered photo. Without
-    degradations no rng number is used."""
+    way draw_crop degrades them (edge_degrade "all"), or only shifted (edge_degrade "shift"), with the
+    same rng draws either way. Without degradations no rng number is used."""
     cfg = cfg or LayoutConfig()
     q = np.asarray(quad, np.float64)
     x0, y0, x1, y1 = _bbox(q, canvas.shape[:2], margin=4)
@@ -324,7 +330,8 @@ def draw_edges(canvas, view, quad, cfg=None, rng=None):
     v = np.asarray(view)
     if rng is not None and _degrades(cfg):
         v = np.repeat(v[..., None], 3, axis=2) if v.ndim == 2 else v[..., :3]
-        crop = _view_crop(v, (x0, y0, x1, y1), canvas.shape[0], cfg, rng)
+        ecfg = cfg if cfg.edge_degrade == "all" else replace(cfg, crop_blur=0.0, crop_color=0.0)
+        crop = _view_crop(v, (x0, y0, x1, y1), canvas.shape[0], ecfg, rng)
         g = cv2.cvtColor(np.clip(np.round(crop), 0, 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
     else:
         if v.ndim == 3:
