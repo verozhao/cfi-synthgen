@@ -221,6 +221,36 @@ def test_training_edges_are_found_on_degraded_pixels():
         assert len(ys) > 50 and np.abs(np.where(ys < 120, ys - 100, ys - 140)).max() <= 5
 
 
+def test_training_edges_after_the_shift_only():
+    R = 512
+    view = np.full((R, R, 3), 230, np.uint8)
+    view[100:140, 100:300] = 20          # a dark bar
+    view[210:250, 100:300] = 170         # a faint bar, 60 grey levels: blur can erase its edges
+    boxes = ((150, 90, 250, 150), (150, 200, 250, 260))
+    text = _text([_item(i, f"BAR {i}", {"0": _view(_quad(*b))}) for i, b in enumerate(boxes)])
+    views = [view] + [None] * 5
+    base = dict(p_edges=1.0, p_crop=0.0, p_item_drop=0.0, p_all_drop=0.0, crop_shift=3.0)
+    deg = dict(crop_blur=3.0, crop_color=0.2)
+    off = FULL_INDEX.index(0) * R
+    faint = gla.quad_mask(_quad(*boxes[1]), (R, R))
+    erased = 0
+    for s in range(12):
+        r_all, r_shift, r_ref = (np.random.default_rng(s) for _ in range(3))
+        full, _ = gla.layout_strip(text, R, gla.LayoutConfig(**base, **deg), rng=r_all, views=views)
+        shift, info = gla.layout_strip(text, R, gla.LayoutConfig(**base, **deg, edge_degrade="shift"), rng=r_shift,
+                                       views=views)
+        ref, _ = gla.layout_strip(text, R, gla.LayoutConfig(**base), rng=r_ref, views=views)
+        # the shift alone, with the same rng draws as the full degradation
+        assert info["kinds"] == {"edges": 2} and np.array_equal(shift, ref)
+        assert r_all.random() == r_shift.random() == r_ref.random()
+        assert _ink(shift)[:, off:off + R][faint].sum() > 50
+        erased += _ink(full)[:, off:off + R][faint].sum() < 20
+    # with blur and contrast changes the faint bar loses its edges in some draws
+    assert erased > 0
+    with pytest.raises(ValueError):
+        gla.layout_config(None, ["edge_degrade=blur"])
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Crops
 # ────────────────────────────────────────────────────────────────────────────
