@@ -187,8 +187,11 @@ Other changes in the patch: position ids are built in fp32 everywhere (trainer c
   crop_color=0.15` draws 70% of the training lines as Canny edges of the target view, found on the pixels
   after the crop degradations, and the rest as font. Inference: `--glyph-layout-kind edges`. In the eval
   the edge maps added nothing, so crops stay the layout to use (DESIGN.md, step 5). Adding `edge_degrade=shift`
-  finds the edges after the shift only. On a training sample the blur and contrast changes left 67 of 267
-  small lines without edges. After the shift only, 22 had none, the same as on clean pixels.
+  finds the edges after the shift only. On the retail training products the blur and contrast changes left
+  21 of 705 small lines without edges. On clean pixels, or after the shift only, 11 had none. One dark
+  local sample lost far more, 67 of 267. With the fix and 1500 steps (`layouttokE2_1024_ft1500`) the edge
+  maps do carry text when the photo's text is blurred, but less than crops after 500 steps (DESIGN.md,
+  step 5).
 - **Edges and font together.** `--glyph_layout_set p_edges=0.0 p_crop=0.0 p_both=0.7 crop_shift=1.0
   crop_blur=0.75 crop_color=0.15` gives 70% of the training lines both inputs: the font on the glyph plane
   and the edges on a second plane at the same target tokens. The rest are font. Tokens mode only.
