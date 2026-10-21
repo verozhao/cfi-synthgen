@@ -276,6 +276,9 @@ text are reported separately.
   misses. That difference is not significant (p 0.32). On small lines the baseline reads 86 and ours 57.
   On the larger lines ours reads 89 and the baseline 71.
 - So the remaining gap is small text, which the OCR loss (step 7) targets.
+- Correction (step 8): the baked asset and baseline columns crop each line through a box fit of the photo,
+  which puts the crop beside the line when the photo is not exactly frontal. With the view-0 crops of step 8
+  the crop run's baked asset reads 151 lines (56 under 16 px) and the baseline 154 (82).
 
 ## OCR loss (step 7)
 
@@ -336,3 +339,60 @@ text are reported separately.
   reads 140 lines against 146. The sign test gives p 0.18. Both runs used the same layouts, so only the
   LoRA differs.
 - So at weight 0.007 the OCR loss does not close the small-text gap to the current pipeline.
+
+## Finishing the asset (step 8)
+
+These steps work on a finished run and then only bake again. FLUX is not loaded.
+
+- Scoring baked models. The baked stage crops each line through a box fit of the photo onto the front render.
+  For a photo that is not exactly frontal those crops land beside the line: on the test products "General"
+  read "neral", and the crop of "Cream Cheese" read the "16 OZ" below it. The render and view 0 are
+  orthographic front views of the same mesh at the same framing (scale 1.000 within 0.005 on all 28
+  products). `bakedview.py` places the render on view 0 by the silhouette bboxes, so `eval_text` crops it like
+  the final view (`--align homography`). The tables below use these crops. The current pipeline's renders
+  land at scale 1 too, except 5 products whose mesh is up to 3% wider or narrower. Matching width and height
+  separately changes its count by 1 line.
+- Lines read exactly. A line counts as read at 80% similarity, which lets about one character in five be
+  wrong. So the tables also count the lines read exactly.
+- Baked models of all 28 products (277 lines, 169 under 16 px), with these crops:
+
+| baked model | read | exact | under 16 px read | under 16 px exact |
+|---|---|---|---|---|
+| crop run with `--delight-shading 4` (step 6) | 151 | 119 | 56 | 38 |
+| the same with photo front | 223 | 192 | 127 | 105 |
+| the same with photo front, text lines, bake cutoff 75 deg, 4096 texture | 238 | 211 | 137 | 121 |
+| final: all of the below together (back panel, cleaned sides, top, bottom and front edges, colour match) | 240 | 215 | 138 | 123 |
+| current Gemini pipeline (`baseline`) | 154 | 128 | 82 | 65 |
+
+- The final models read 89 lines that the current pipeline misses and miss 3 that it reads (p 5e-23).
+  Counting exact lines, it is 96 against 9 (p 2e-19). Against photo front alone they gain 19 lines and
+  lose 2 (p 2e-4). The photo itself reads 264 lines at 1024 px, so the final models keep 91% of what the
+  photo shows. Under 16 px they keep 85%.
+- Photo front on the crop run. `photo_front.py` puts the registered photo's detail into view 0 and bakes again.
+  On the crop run it lifts the baked models from 151 lines to 223, most of them under 16 px.
+- Whole text lines. `--text-json text_reg.json` gives weight 1 to each of the photo's OCR lines (its
+  `view0_quad`, padded by `--text-pad` line heights). Without it the local trust keeps the generated letters
+  where they differ from the photo's, and the facing ramp keeps them where a can turns away. A line could then
+  come out half photo and half made up: Red Bull's "Vitalizes" read "italizes" over a generated "Violines".
+  With `--text-pad 1.0` the final view reads 240 lines and 213 exactly, against 229 and 197 without it.
+- Bake cutoff. UniTEX's bake gives each texel to the first view that sees it within 60 deg, in the order front,
+  back, left, right, top, bottom. On a can the band past 60 deg came from the side views and their made-up
+  print. `UNITEX_BAKE_ANGLE=105` (75 deg) lets the front view, and so the photo, cover it. With this cutoff some
+  meshes have no texel left for LTM, whose `decode_field` then failed on an empty query. The patch returns an
+  empty result.
+- Bake texture. `UNITEX_BAKE_TEX=4096` bakes into a 4096 texture instead of 2048. It reads the same 238 lines
+  and more of them exactly, 211 against 205 (under 16 px, 121 against 113).
+- Back panel (`back_panel.py`). With only a front photo the back is unknown, and the model fills it with
+  made-up print. The back keeps the generated colours (a median-filtered blur, white print boxes turned to the
+  label colour) and gets, where the surface faces the back camera, a US Nutrition Facts panel and the
+  ingredients from the product's Open Food Facts record (`off_lookup.py`, 27 of the 28 eval products have
+  one), a UPC-A barcode of the product's own code and the brand. Only what the record has is drawn, so
+  nothing on the back is made up.
+- The rest of the label. `--clean-views 1,3,4,5` replaces the made-up print on the sides, top and bottom with
+  a flat colour, on the sides the front label's (`--sides-from-front`). `--clean-front-edges` does the same on
+  the turning-away band of view 0 that the photo did not cover, which the 75 deg cutoff would otherwise
+  stretch round the curve. `--color-match` maps the coarse colours of all views to the photo's, with an affine
+  colour map fitted where photo front used the photo. It is applied to each view's blur only. On the full
+  image its gains under 1 also cut the contrast of small print, and the front read 10 lines fewer.
+- Checking by eye. `quality_views.py` renders four angled lit views of a GLB with mvgen.py's own import,
+  lights and passes, next to its straight views (`mvgen.py --mode views`).

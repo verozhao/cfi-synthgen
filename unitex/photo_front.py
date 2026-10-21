@@ -141,6 +141,42 @@ def local_agreement(gen0, photo, region, res, win_frac=1 / 16, blur_frac=1 / 64,
     return cv2.GaussianBlur(trust, (0, 0), s / 2)
 
 
+def text_weight(text_json, mask0, normals0, photo_mask, res, pad=0.3, facing=0.15, feather_frac=1 / 128):
+    """Weight 1 on the photo's own text lines, so each line comes from the photo whole.
+
+    The lines are the view0_quad entries of a registered OCR file (text_reg.json), padded by pad times the
+    line height. Without this, the facing ramp keeps the generated letters where a can turns away from the
+    camera and the local trust keeps them where the generated text differs from the photo's, so a line can
+    end up half photo, half made up ("Vitalizes" read "italizes" over a generated "Violines"). Surfaces
+    facing the camera less than cos facing, and pixels outside the warped photo, keep weight 0.
+    Returns (weight (res, res) float32, number of lines).
+    """
+    import cv2
+    p = pathlib.Path(text_json)
+    if not p.exists():
+        return np.zeros((res, res), np.float32), 0
+    d = json.loads(p.read_text())
+    s = res / float(d.get("res", res))
+    m = np.zeros((res, res), np.uint8)
+    n = 0
+    for it in d.get("items", []):
+        q = it.get("view0_quad")
+        if not q:
+            continue
+        q = np.asarray(q, np.float32) * s                      # top-left, top-right, bottom-right, bottom-left
+        c = q.mean(axis=0)
+        h = max(float(np.linalg.norm(q[3] - q[0])), float(np.linalg.norm(q[2] - q[1])), 1.0)
+        wv = (q[1] - q[0]) / max(1e-6, float(np.linalg.norm(q[1] - q[0])))
+        hv = (q[3] - q[0]) / max(1e-6, float(np.linalg.norm(q[3] - q[0])))
+        out = np.sign((q - c) @ wv)[:, None] * wv + np.sign((q - c) @ hv)[:, None] * hv
+        cv2.fillPoly(m, [np.round(q + out * pad * h).astype(np.int32)], 1)
+        n += 1
+    wt = cv2.GaussianBlur(m.astype(np.float32), (0, 0), max(1.0, res * feather_frac))
+    g = np.clip((normals0 @ TO_FRONT_CAMERA - facing) / 0.1, 0.0, 1.0)
+    wt = wt * g * (photo_mask >= 0.5) * mask0
+    return wt.astype(np.float32), n
+
+
 def blend(gen, photo, w, core, mode="detail", sigma=16.0):
     """gen, photo (res, res, 3) uint8, w (res, res) in [0, 1] -> uint8 view."""
     g = gen.astype(np.float32)
@@ -252,12 +288,14 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
 
 def front_from_photo(sku_dir, src_run_dir, cache_dir, mode="detail", sigma_frac=1 / 32,
                      feather_frac=1 / 128, facing=(0.35, 0.7), register="homography", min_ncc=0.6,
-                     trust=(0.5, 0.8)):
+                     trust=(0.5, 0.8), text_json=None, text_pad=0.3):
     """Blend the photo into view 0 of cache_dir/mv_rgb.png. Returns (new grid, debug panel, info).
 
     The photo is used only when it registers: blurred grey NCC with the generated front view of at
     least min_ncc after alignment. Below that (Shin Ramyun cup shot from above: 0.04 after the
     bbox fit) pasting it would put the wrong part of the photo on the front, so view 0 is kept.
+    With text_json (a registered OCR file in the SKU folder, e.g. text_reg.json) every photo text
+    line gets weight 1 (text_weight).
     """
     sku_dir, cache_dir = pathlib.Path(sku_dir), pathlib.Path(cache_dir)
     with open(sku_dir / "ref_meta.json") as f:
@@ -274,6 +312,11 @@ def front_from_photo(sku_dir, src_run_dir, cache_dir, mode="detail", sigma_frac=
     trust_ramp = tuple(trust)
     trust = local_agreement(gen0, ph, core, res, lo=trust_ramp[0], hi=trust_ramp[1])
     w = w * trust
+    n_text = 0
+    if text_json:
+        wt, n_text = text_weight(sku_dir / text_json, geo.masks[FRONT], geo.normals[FRONT], pm, res, text_pad,
+                                 feather_frac=feather_frac)
+        w = np.maximum(w, wt)
     skipped = None
     if reg["ncc_final"] < min_ncc:
         skipped = f"photo not registered: NCC {reg['ncc_final']} < {min_ncc}, view 0 kept"
@@ -287,6 +330,7 @@ def front_from_photo(sku_dir, src_run_dir, cache_dir, mode="detail", sigma_frac=
     info = {"view_res": res, "mode": mode, "sigma_px": round(sigma, 2), "feather_px": round(max(1.0, res * feather_frac), 2),
             "facing": list(facing), "photo_mask_source": mask_src, "align": align, "register": reg,
             "min_ncc": min_ncc, "skipped": skipped, "trust_ramp": list(trust_ramp),
+            "text_json": text_json, "text_lines": n_text,
             "local_trust_mean_on_core": round(float(trust[core].mean()), 4) if core.any() else 0.0,
             "weight_mean_on_silhouette": round(float(w[m0].mean()), 4) if m0.any() else 0.0,
             "replaced_frac_of_silhouette": round(float((w[m0] >= 0.5).mean()), 4) if m0.any() else 0.0}
@@ -348,7 +392,7 @@ def run(args):
                 copy_cache(src / "cache", dst / "cache")
                 grid, panel, info = front_from_photo(sku_dir, src, dst / "cache", args.mode, args.sigma_frac,
                                                      args.feather_frac, tuple(args.facing), args.register,
-                                                     args.min_ncc, tuple(args.trust))
+                                                     args.min_ncc, tuple(args.trust), args.text_json, args.text_pad)
                 rec.update(info)
                 shutil.copy(dst / "cache" / "mv_rgb.png", dst / "cache" / "mv_rgb_generated.png")
                 Image.fromarray(grid).save(dst / "cache" / "mv_rgb.png")
@@ -407,6 +451,10 @@ def main(argv=None):
     p.add_argument("--feather-frac", type=float, default=1 / 128, help="edge feather as a fraction of view_res")
     p.add_argument("--facing", type=float, nargs=2, default=(0.35, 0.7), metavar=("LO", "HI"),
                    help="cos to the front camera where the photo starts and fully takes over")
+    p.add_argument("--text-json", default=None,
+                   help="registered OCR file in the SKU folder (e.g. text_reg.json): its lines are taken from the "
+                        "photo whole")
+    p.add_argument("--text-pad", type=float, default=0.3, help="padding of each text line, times its height")
     p.add_argument("--seed", type=int, default=63)
     p.add_argument("--resume", action="store_true", help="skip SKUs with run_info.json")
     p.add_argument("--no-bake", action="store_true", help="write mv_rgb.png and photo_front.png only (CPU)")

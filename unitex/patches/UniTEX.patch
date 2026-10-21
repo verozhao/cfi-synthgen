@@ -1,7 +1,8 @@
 diff --git a/LTM/rgb_field.py b/LTM/rgb_field.py
+index d2a0aec..ab3707a 100755
 --- a/LTM/rgb_field.py
 +++ b/LTM/rgb_field.py
-@@ -46,8 +46,11 @@
+@@ -46,8 +46,11 @@ class RGBFieldVAE(nn.Module):
          B, N, C, H, W = albedo_fbrltd.shape
          pixel_values = torch.cat([albedo_fbrltd, ccm_fbrltd, alpha_fbrltd], dim=2).reshape(B*N, 2*C+1, H, W)
          if H != 512 or W != 512:
@@ -15,10 +16,20 @@ diff --git a/LTM/rgb_field.py b/LTM/rgb_field.py
          H = W = 512
          pixel_values[:, :2*C, :, :] = pixel_values[:, :2*C, :, :] * 2.0 - 1.0
          pixel_values = pixel_values.reshape(B, N, 2*C+1, H, W).permute(0, 2, 3, 1, 4).reshape(B, 2*C+1, H, N*W)
+@@ -85,6 +88,8 @@ class RGBFieldVAE(nn.Module):
+                 if logits is None:
+                     logits = torch.zeros((B, L, logits_batch.shape[-1]), dtype=logits_batch.dtype, device=logits_batch.device)
+                 logits[:, idx:idx+batch_size, :] = logits_batch
++            if logits is None:  # no queries: every texel is seen by a view
++                logits = torch.zeros((B, 0, 3), dtype=queries.dtype, device=queries.device)
+         logits = logits * 0.5 + 0.5
+         if return_pcds:
+             queries_np = queries.detach().cpu().numpy()
 diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipeline.py
+index c07b0a9..babc6e9 100644
 --- a/flux_piplines/texturing/pipeline.py
 +++ b/flux_piplines/texturing/pipeline.py
-@@ -266,12 +266,14 @@
+@@ -266,12 +266,14 @@ class PBRFluxPipeline(FluxPipeline):
  
      @staticmethod
      def _prepare_latent_image_ids(batch_size, height, width, device, dtype, offset_x=0, offset_y=0, offset_z=0):
@@ -34,7 +45,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
          return latent_image_ids
  
      def prepare_latents_and_image_ids(
-@@ -401,6 +403,50 @@
+@@ -401,6 +403,50 @@ class PBRFluxPipeline(FluxPipeline):
              control_latents, control_ids,
          )
  
@@ -85,7 +96,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
      @torch.no_grad()
      @replace_example_docstring(EXAMPLE_DOC_STRING)
      def __call__(
-@@ -428,6 +474,14 @@
+@@ -428,6 +474,14 @@ class PBRFluxPipeline(FluxPipeline):
          callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
          callback_on_step_end_tensor_inputs: List[str] = ["latents"],
          max_sequence_length: int = 512,
@@ -100,7 +111,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
      ):
          r"""
          Function invoked when calling the pipeline for generation.
-@@ -490,6 +544,14 @@
+@@ -490,6 +544,14 @@ class PBRFluxPipeline(FluxPipeline):
                  will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
                  `._callback_tensor_inputs` attribute of your pipeline class.
              max_sequence_length (`int` defaults to 512): Maximum sequence length to use with the `prompt`.
@@ -115,7 +126,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
  
          Examples:
  
-@@ -577,6 +639,7 @@
+@@ -577,6 +639,7 @@ class PBRFluxPipeline(FluxPipeline):
          )
          latents = noise_latents
          latent_image_ids = noise_ids
@@ -123,7 +134,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
          if dual_latents is not None and control_latents is not None:
              condition_latents = torch.cat([control_latents, dual_latents], dim=1)
              condition_ids = torch.cat([control_ids, dual_ids], dim=0)
-@@ -589,17 +652,37 @@
+@@ -589,17 +652,37 @@ class PBRFluxPipeline(FluxPipeline):
          else:
              condition_latents = None
              condition_ids = None
@@ -168,7 +179,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
          timesteps, num_inference_steps = retrieve_timesteps(
              self.scheduler,
              num_inference_steps,
-@@ -627,9 +710,34 @@
+@@ -627,9 +710,34 @@ class PBRFluxPipeline(FluxPipeline):
          else:
              prompt_image_embeds = prompt_embeds
              text_image_ids = text_ids
@@ -203,7 +214,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
          with self.progress_bar(total=num_inference_steps) as progress_bar:
              for i, t in enumerate(timesteps):
                  if self.interrupt:
-@@ -642,9 +750,10 @@
+@@ -642,9 +750,10 @@ class PBRFluxPipeline(FluxPipeline):
                  # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                  timestep = t.expand(latents.shape[0]).to(latents.dtype)
                  if condition_latents is not None:
@@ -216,7 +227,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
                      timestep=timestep / 1000,
                      guidance=guidance,
                      pooled_projections=pooled_prompt_embeds,  # clip: [1, 768]
-@@ -681,7 +790,7 @@
+@@ -681,7 +790,7 @@ class PBRFluxPipeline(FluxPipeline):
                      xm.mark_step()
  
          if condition_latents is not None:
@@ -226,6 +237,7 @@ diff --git a/flux_piplines/texturing/pipeline.py b/flux_piplines/texturing/pipel
              image = latents
          else:
 diff --git a/pipeline.py b/pipeline.py
+index 79a7674..c30a262 100644
 --- a/pipeline.py
 +++ b/pipeline.py
 @@ -1,6 +1,7 @@
@@ -236,7 +248,7 @@ diff --git a/pipeline.py b/pipeline.py
  import os
  import shutil
  import sys
-@@ -83,6 +84,7 @@
+@@ -83,6 +84,7 @@ def build_pipeline(pretrain_models=None, pipeline_name='texture_plus', model='rg
          quantization_config = None
          cpu_offload = False
      else:
@@ -244,7 +256,7 @@ diff --git a/pipeline.py b/pipeline.py
          quantization_config = BitsAndBytesConfig(
              load_in_4bit=True,
              bnb_4bit_quant_type="nf4",
-@@ -136,8 +138,96 @@
+@@ -136,8 +138,96 @@ def build_ltm(pretrain_models=None):
  
  
  
@@ -342,7 +354,7 @@ diff --git a/pipeline.py b/pipeline.py
          pipeline,weights_for_texture,weights_for_delight,adapter_names = build_pipeline(pretrain_models=pretrain_models, pipeline_name=pipeline_name,speedup_mode = speedup_mode, add_lora_path=add_lora_path,add_lora_weights=add_lora_weights, model='rgb')
          if enable_rembg:
              rembg_session = build_rembg()
-@@ -184,31 +274,34 @@
+@@ -184,31 +274,34 @@ class RGBTextureFullPipelineBase:
  
      @CPUTimer('preprocess_reference_image')
      def preprocess_reference_image(self, save_dir, input_image_path, scale=0.95, color='grey'):
@@ -383,7 +395,7 @@ diff --git a/pipeline.py b/pipeline.py
              fov_deg=49.1,
              scale=scale,
              perspective=False,
-@@ -231,20 +324,115 @@
+@@ -231,20 +324,115 @@ class RGBTextureFullPipelineBase:
          torch.save(camera_info, os.path.join(save_dir, 'camera_info.pth'))
  
  
@@ -503,7 +515,7 @@ diff --git a/pipeline.py b/pipeline.py
              self.pipeline.set_adapters(adapter_names=self.adapter_names, adapter_weights=self.weights_for_texture)
              out = self.pipeline(
                  prompt='[MVFLUX]',
-@@ -252,37 +440,62 @@
+@@ -252,37 +440,62 @@ class RGBTextureFullPipelineBase:
                  dual_image=reference_image,
                  prompt_embeds=None,
                  pooled_prompt_embeds=None,
@@ -573,7 +585,25 @@ diff --git a/pipeline.py b/pipeline.py
              
              if self.super_resolutions:
                  mv_rgb.save(os.path.join(save_dir, 'mv_rgb_lr.png'))
-@@ -576,13 +789,13 @@
+@@ -323,7 +536,7 @@ class RGBTextureFullPipelineBase:
+         input_mv_image = image_to_tensor(input_mv_image, device='cuda')
+         H, W, C = input_mv_image.shape
+         HP, WP = H // n_rows, W // n_cols
+-        HT, WT = 2048, 2048
++        HT = WT = int(os.environ.get("UNITEX_BAKE_TEX", "2048"))
+         image_attrs = input_mv_image.reshape(n_rows, HP, n_cols, WP, C).permute(0, 2, 1, 3, 4).reshape(n_views, HP, WP, C)
+         camera_info = torch.load(camera_info_path, weights_only=True, map_location='cuda')
+         c2ws = camera_info['c2ws']
+@@ -351,7 +564,7 @@ class RGBTextureFullPipelineBase:
+             kdtree_n_neighbors = 8,
+             kdtree_n_neighbors_visiable = 4,
+             grad_norm_threhold=0.05,
+-            ray_normal_angle_threhold=120,
++            ray_normal_angle_threhold=float(os.environ.get("UNITEX_BAKE_ANGLE", "120")),
+             filt_gradient_points=inpainting and self.filt_gradient_points,
+             filt_large_angle_points=inpainting and self.filt_large_angle_points,
+             grad_dilation_kernel=grad_dilation_kernel,
+@@ -576,13 +789,13 @@ class RGBTextureFullPipelineBase:
  
  
  class RGBTextureFullPipeline(RGBTextureFullPipelineBase):
@@ -589,7 +619,7 @@ diff --git a/pipeline.py b/pipeline.py
  
      def step_2_1(self, cache_dir:str, input_image_path:str, input_mesh_path:str, clear_cache=False, *args, **kwargs):
          self.reproject_and_query_field(cache_dir, os.path.join(cache_dir, 'processed_mesh.obj'), os.path.join(cache_dir, 'mv_rgb.png'), os.path.join(cache_dir, 'camera_info.pth'), inpainting=False)
-@@ -607,7 +820,9 @@
+@@ -607,7 +820,9 @@ class RGBTextureFullPipeline(RGBTextureFullPipelineBase):
          input_image_path:str, 
          input_mesh_path:str, 
          clear_cache=False,
@@ -599,7 +629,7 @@ diff --git a/pipeline.py b/pipeline.py
          os.makedirs(save_dir, exist_ok=True)
          cache_dir = os.path.join(os.path.abspath(save_dir), 'cache')
          os.makedirs(cache_dir, exist_ok=True)
-@@ -616,6 +831,7 @@
+@@ -616,6 +831,7 @@ class RGBTextureFullPipeline(RGBTextureFullPipelineBase):
              input_image_path=input_image_path, 
              input_mesh_path=input_mesh_path, 
              clear_cache=clear_cache,

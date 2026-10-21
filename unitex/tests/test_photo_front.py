@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 from PIL import Image
@@ -85,3 +87,26 @@ def test_local_agreement_trusts_matching_layout_and_flat_views_only():
     assert P.local_agreement(base, shifted, region, R).mean() < 0.5
     flat = np.full((R, R, 3), 180, np.uint8)              # blank generated label
     assert P.local_agreement(flat, base, region, R).min() > 0.95
+
+
+def test_text_weight_takes_whole_lines_from_the_photo(tmp_path):
+    R = 128
+    mask0 = np.zeros((R, R), bool)
+    mask0[8:120, 8:120] = True
+    normals = np.zeros((R, R, 3))
+    normals[mask0] = P.TO_FRONT_CAMERA
+    normals[8:120, 96:120] = (0.95, -0.31, 0.0)          # turning away: cos 0.31, below the 0.35 photo ramp start
+    normals[8:120, 112:120] = (1.0, 0.0, 0.0)            # grazing: cos 0
+    photo_mask = mask0.astype(float)
+    # one line at 512 px in the file = 4x the view: x 40..116, y 40..48 in the view, its right end turns away
+    q = [[160, 160], [464, 160], [464, 192], [160, 192]]
+    (tmp_path / "text_reg.json").write_text(json.dumps({"res": 512, "items": [{"view0_quad": q}, {"text": "no quad"}]}))
+    w, n = P.text_weight(tmp_path / "text_reg.json", mask0, normals, photo_mask, R)
+    assert n == 1
+    assert w[44, 60] > 0.95                               # on the line, facing
+    assert w[44, 100] > 0.95                              # on the line where the facing ramp gives 0
+    assert w[44, 116] == 0.0                              # on the line but grazing: kept generated
+    assert w[80, 60] == 0.0                               # off the line
+    assert w[38, 60] > 0.5                                # padded by 0.3 x the 8 px line height
+    w0, n0 = P.text_weight(tmp_path / "missing.json", mask0, normals, photo_mask, R)
+    assert n0 == 0 and w0.max() == 0.0
