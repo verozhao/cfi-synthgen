@@ -177,8 +177,9 @@ def text_weight(text_json, mask0, normals0, photo_mask, res, pad=0.3, facing=0.1
     return wt.astype(np.float32), n
 
 
-def blend(gen, photo, w, core, mode="detail", sigma=16.0):
-    """gen, photo (res, res, 3) uint8, w (res, res) in [0, 1] -> uint8 view."""
+def blend(gen, photo, w, core, mode="detail", sigma=16.0, under=None):
+    """gen, photo (res, res, 3) uint8, w (res, res) in [0, 1] -> uint8 view. under: what shows where w < 1
+    (default gen)."""
     g = gen.astype(np.float32)
     p = photo.astype(np.float32)
     if mode == "none":
@@ -189,8 +190,22 @@ def blend(gen, photo, w, core, mode="detail", sigma=16.0):
         out = p
     else:
         raise ValueError(f"mode must be detail, full or none, got {mode}")
-    res = w[..., None] * out + (1.0 - w[..., None]) * g
+    u = g if under is None else under.astype(np.float32)
+    res = w[..., None] * out + (1.0 - w[..., None]) * u
     return np.clip(np.rint(res), 0, 255).astype(np.uint8)
+
+
+def own_layout_under(gen0, photo, mask0, pmask, sigma):
+    """What shows where the photo fades out when it keeps its own layout: its own blur inside the warped photo,
+    the generated view's blur outside it, the generated view outside the silhouette. With the generated blur
+    alone the box of every whole text line showed where the facing ramp let the generated colours in (Betty
+    Crocker's tub had a lighter rectangle round its lines). float32 (res, res, 3)."""
+    import cv2
+    m0 = mask0.astype(bool)
+    pin = m0 & (pmask >= 0.5)
+    pf = cv2.GaussianBlur(pin.astype(np.float32), (0, 0), max(1.0, sigma / 2))[..., None]
+    u = pf * masked_blur(photo.astype(np.float32), pin, sigma) + (1.0 - pf) * masked_blur(gen0.astype(np.float32), m0, sigma)
+    return np.where(m0[..., None], u, gen0.astype(np.float32)).astype(np.float32)
 
 
 def _gray(a):
@@ -206,7 +221,7 @@ def _ncc(a, b, mask):
 
 
 def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", scale=2, ratio=0.75,
-                   min_inliers=12, max_corner_shift=0.5):
+                   min_inliers=12, max_corner_shift=0.5, flow_below=0.8, flow_min=0.9):
     """Photo -> view-0 pixels. Returns (photo (res, res, 3) uint8, photo mask (res, res) float, info).
 
     affine      the anchors.py fit only: photo foreground bbox onto the view-0 silhouette bbox,
@@ -219,6 +234,15 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
                 need a large move: the bbox fit squeezes the lid in), and the blurred grey images
                 agreeing at least as well as before (NCC). Otherwise the affine is used.
     flow        homography, then a smoothed DIS optical flow (curved labels)
+    auto        flow only when the homography's NCC is under flow_below. The flow fixes a jar or tub
+                shot from above (Jif 0.79 -> 0.96), but on a photo the homography already fits it shears
+                letters ("Gluten" came out slanted), so it is not used there. A flow that still leaves the
+                NCC under flow_min is not used either: the generated layout itself differs from the photo
+                (Betty Crocker's ribbon is tilted and its badge sits lower, 0.74 -> 0.85), and bending the
+                photo onto it mixed two copies of "Cream Cheese". info["layout"] is then "photo": the
+                photo is placed by the affine silhouette fit and front_from_photo keeps its own layout.
+                info["ncc_matched"] keeps the best fit's NCC, which still decides whether the photo shows
+                the product's front at all (min_ncc).
     All work at scale * res and the result is area-downsampled, so small print is not aliased.
     """
     import cv2
@@ -227,12 +251,13 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
     pre_m = warp_into_view(Image.fromarray(pmask.astype(np.uint8) * 255), tuple(v * scale for v in aff), S,
                            Image.BILINEAR).astype(np.float32) / 255.0
     info = {"method": "affine", "requested": method, "scale": scale}
+    pre_aff, pre_m_aff = pre, pre_m
     g2 = cv2.resize(gen0, (S, S), interpolation=cv2.INTER_CUBIC)
     m2 = cv2.resize(mask0.astype(np.uint8), (S, S), interpolation=cv2.INTER_NEAREST) > 0
     blur = lambda a: cv2.GaussianBlur(_gray(a), (0, 0), S / 128)       # noqa: E731
     region = m2 & (pre_m >= 0.5)
     info["ncc_affine"] = round(_ncc(blur(g2), blur(pre), region), 4)
-    if method in ("homography", "flow"):
+    if method in ("homography", "flow", "auto"):
         sift = cv2.SIFT_create(nfeatures=5000)
         kg, dg = sift.detectAndCompute(_gray(g2), m2.astype(np.uint8) * 255)
         kp, dp = sift.detectAndCompute(_gray(pre), (pre_m >= 0.5).astype(np.uint8) * 255)
@@ -262,7 +287,8 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
             if shift.max() <= max_corner_shift and ncc_h >= info["ncc_affine"] - 0.01:
                 pre, pre_m, info["method"] = warped, warped_m, "homography"
                 info["homography"] = [[round(float(v), 6) for v in row] for row in H]
-        if method == "flow" and info["method"] == "homography":
+        if info["method"] == "homography" and (method == "flow" or (method == "auto"
+                                                and info["ncc_homography"] < flow_below)):
             dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
             a = cv2.GaussianBlur(_gray(g2), (0, 0), 1.5 * scale)
             b = cv2.GaussianBlur(_gray(pre), (0, 0), 1.5 * scale)
@@ -278,9 +304,16 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
             warped_m = cv2.remap(pre_m, mx, my, cv2.INTER_LINEAR, borderValue=0)
             ncc_f = _ncc(blur(g2), blur(warped), m2 & (warped_m >= 0.5))
             info.update(ncc_flow=round(ncc_f, 4), flow_max_px=round(float(mag.max()) / scale, 2))
-            if ncc_f >= info["ncc_homography"] - 0.01:
+            if ncc_f >= info["ncc_homography"] - 0.01 and (method == "flow" or ncc_f >= flow_min):
                 pre, pre_m, info["method"] = warped, warped_m, "flow"
     info["ncc_final"] = info[f"ncc_{info['method']}"]
+    own = method == "auto" and info["method"] != "flow" and info["ncc_final"] < flow_below
+    info["layout"] = "photo" if own else "generated"
+    info["ncc_matched"] = info["ncc_final"]                 # best fit to the generated front, for the min_ncc gate
+    if own and info["method"] != "affine":
+        # a fit to a layout that differs only bends the photo (Betty Crocker's homography moved the silhouette
+        # corners by 24 %), so the photo goes where the silhouettes put it
+        pre, pre_m, info["method"], info["ncc_final"] = pre_aff, pre_m_aff, "affine", info["ncc_affine"]
     ph = cv2.resize(pre, (res, res), interpolation=cv2.INTER_AREA)
     pm = cv2.resize(pre_m, (res, res), interpolation=cv2.INTER_AREA)
     return ph, pm, info
@@ -288,14 +321,21 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
 
 def front_from_photo(sku_dir, src_run_dir, cache_dir, mode="detail", sigma_frac=1 / 32,
                      feather_frac=1 / 128, facing=(0.35, 0.7), register="homography", min_ncc=0.6,
-                     trust=(0.5, 0.8), text_json=None, text_pad=0.3):
+                     trust=(0.5, 0.8), text_json=None, text_pad=0.3, text_min_ncc=0.8, flow_below=0.8,
+                     flow_min=0.9):
     """Blend the photo into view 0 of cache_dir/mv_rgb.png. Returns (new grid, debug panel, info).
 
     The photo is used only when it registers: blurred grey NCC with the generated front view of at
     least min_ncc after alignment. Below that (Shin Ramyun cup shot from above: 0.04 after the
     bbox fit) pasting it would put the wrong part of the photo on the front, so view 0 is kept.
     With text_json (a registered OCR file in the SKU folder, e.g. text_reg.json) every photo text
-    line gets weight 1 (text_weight).
+    line gets weight 1 (text_weight), when the photo registers with NCC of at least text_min_ncc. Below
+    that the photo sits a little off (a tub or jar shot from above), and forcing whole lines in would
+    show them next to the generated ones (Betty Crocker's "16 OZ" twice).
+    When --register auto finds that the generated layout differs from the photo (layout "photo", see
+    register_photo), the photo replaces the facing part of view 0 as it is (mode full, no local trust,
+    whole text lines), and where it fades out its own blur shows (own_layout_under), so no generated
+    letters sit next to the photo's.
     """
     sku_dir, cache_dir = pathlib.Path(sku_dir), pathlib.Path(cache_dir)
     with open(sku_dir / "ref_meta.json") as f:
@@ -307,22 +347,30 @@ def front_from_photo(sku_dir, src_run_dir, cache_dir, mode="detail", sigma_frac=
     photo = A.load_photo(sku_dir, meta)
     pmask, fg_box, mask_src = A.photo_foreground(photo, meta, src_run_dir)
     aff, align = A.fit_photo_to_view0(pmask, fg_box, geo.masks[FRONT])
-    ph, pm, reg = register_photo(gen0, geo.masks[FRONT], photo, pmask, aff, res, register)
+    ph, pm, reg = register_photo(gen0, geo.masks[FRONT], photo, pmask, aff, res, register, flow_below=flow_below,
+                                 flow_min=flow_min)
+    own_layout = reg["layout"] == "photo"
     w, core = front_weight(geo.masks[FRONT], geo.normals[FRONT], pm, res, facing, feather_frac)
     trust_ramp = tuple(trust)
-    trust = local_agreement(gen0, ph, core, res, lo=trust_ramp[0], hi=trust_ramp[1])
+    trust = (np.ones_like(w) if own_layout
+             else local_agreement(gen0, ph, core, res, lo=trust_ramp[0], hi=trust_ramp[1]))
     w = w * trust
     n_text = 0
-    if text_json:
+    ncc_gate = reg["ncc_homography"] if reg["method"] in ("homography", "flow") else reg["ncc_final"]
+    if text_json and (own_layout or ncc_gate >= text_min_ncc):          # the fit before any flow
         wt, n_text = text_weight(sku_dir / text_json, geo.masks[FRONT], geo.normals[FRONT], pm, res, text_pad,
                                  feather_frac=feather_frac)
         w = np.maximum(w, wt)
     skipped = None
-    if reg["ncc_final"] < min_ncc:
-        skipped = f"photo not registered: NCC {reg['ncc_final']} < {min_ncc}, view 0 kept"
+    if reg["ncc_matched"] < min_ncc:
+        skipped = f"photo not registered: NCC {reg['ncc_matched']} < {min_ncc}, view 0 kept"
         w = np.zeros_like(w)
     sigma = max(1.0, res * sigma_frac)
-    new0 = blend(gen0, ph, w, core, mode, sigma)
+    if own_layout and not skipped:
+        mode = "full"
+        new0 = blend(gen0, ph, w, core, mode, sigma, under=own_layout_under(gen0, ph, geo.masks[FRONT], pm, sigma))
+    else:
+        new0 = blend(gen0, ph, w, core, mode, sigma)
     out = put_view(grid.copy(), FRONT, new0, res)
     wv = np.repeat((w * 255).astype(np.uint8)[..., None], 3, axis=2)
     panel = np.concatenate([gen0, np.where(pm[..., None] >= 0.5, ph, 128).astype(np.uint8), wv, new0], axis=1)
@@ -392,13 +440,15 @@ def run(args):
                 copy_cache(src / "cache", dst / "cache")
                 grid, panel, info = front_from_photo(sku_dir, src, dst / "cache", args.mode, args.sigma_frac,
                                                      args.feather_frac, tuple(args.facing), args.register,
-                                                     args.min_ncc, tuple(args.trust), args.text_json, args.text_pad)
+                                                     args.min_ncc, tuple(args.trust), args.text_json, args.text_pad,
+                                                     args.text_min_ncc, args.flow_below, args.flow_min)
                 rec.update(info)
                 shutil.copy(dst / "cache" / "mv_rgb.png", dst / "cache" / "mv_rgb_generated.png")
                 Image.fromarray(grid).save(dst / "cache" / "mv_rgb.png")
                 Image.fromarray(panel).save(dst / "photo_front.png")
                 reg = info["register"]
-                print(f"  [{sku}] ({i + 1}/{len(skus)}) aligned by {reg['method']} (IoU {info['align'].get('iou')}, "
+                print(f"  [{sku}] ({i + 1}/{len(skus)}) aligned by {reg['method']}, {reg['layout']} layout "
+                      f"(IoU {info['align'].get('iou')}, "
                       f"NCC affine {reg['ncc_affine']} homography {reg.get('ncc_homography')} flow {reg.get('ncc_flow')}, "
                       f"inliers {reg.get('n_inliers')}), "
                       + (info["skipped"] if info["skipped"] else
@@ -440,8 +490,9 @@ def main(argv=None):
     p.add_argument("--run-name", required=True, help="new per-SKU output dir")
     p.add_argument("--skus", default=None, help="file or comma list (default: SKUs with a --src-run cache)")
     p.add_argument("--mode", choices=("detail", "full", "none"), default="detail")
-    p.add_argument("--register", choices=("affine", "homography", "flow"), default="homography",
-                   help="photo to view 0: bbox affine only, + SIFT homography (default), + optical flow")
+    p.add_argument("--register", choices=("affine", "homography", "flow", "auto"), default="homography",
+                   help="photo to view 0: bbox affine only, + SIFT homography (default), + optical flow, "
+                        "auto: flow only when the homography's NCC is under --flow-below")
     p.add_argument("--min-ncc", type=float, default=0.6,
                    help="use the photo only if it registers this well with the generated front (blurred grey NCC)")
     p.add_argument("--trust", type=float, nargs=2, default=(0.5, 0.8), metavar=("LO", "HI"),
@@ -455,6 +506,10 @@ def main(argv=None):
                    help="registered OCR file in the SKU folder (e.g. text_reg.json): its lines are taken from the "
                         "photo whole")
     p.add_argument("--text-pad", type=float, default=0.3, help="padding of each text line, times its height")
+    p.add_argument("--text-min-ncc", type=float, default=0.8, help="registration NCC needed for --text-json")
+    p.add_argument("--flow-below", type=float, default=0.8, help="--register auto: homography NCC under which flow is tried")
+    p.add_argument("--flow-min", type=float, default=0.9,
+                   help="--register auto: NCC the flow must reach, else the photo keeps its own layout")
     p.add_argument("--seed", type=int, default=63)
     p.add_argument("--resume", action="store_true", help="skip SKUs with run_info.json")
     p.add_argument("--no-bake", action="store_true", help="write mv_rgb.png and photo_front.png only (CPU)")

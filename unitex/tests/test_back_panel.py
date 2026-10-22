@@ -107,6 +107,10 @@ def test_front_edges_cleaned_only_off_the_photo_where_the_surface_turns_away():
     assert np.allclose(out[48, 55], (30, 160, 40), atol=2)      # bottom: print replaced by label colour
     assert out[10, 55].min() == 255                             # top: photo area untouched
     assert np.array_equal(out[48, 20], view[48, 20])            # facing the camera: untouched
+    lid = normals.copy()
+    lid[:, 48:60] = (0.0, -0.3, 0.95)                   # turning away upward, like a lid's top rim
+    out2 = B.clean_front_edges(view, mask, lid, w_photo, R)
+    assert np.array_equal(out2[48, 55], view[48, 55])           # lids and rims are left alone
 
 
 def test_inner_rect_stays_inside_the_region():
@@ -134,3 +138,70 @@ def test_colour_map_on_the_blur_keeps_the_print_contrast():
     assert full[5, 5, 0] - full[32, 30, 0] == 90                   # contrast halved
     assert kept[5, 5, 0] - kept[32, 30, 0] > 130                   # stroke keeps most of its 180 contrast
     assert abs(kept[5, 5, 0] - full[5, 5, 0]) <= 3                 # the label colour is still mapped
+
+
+def test_colour_lut_shifts_each_colour_on_its_own(tmp_path):
+    from PIL import Image
+    R = 64
+    gen = np.zeros((R, R, 3), np.uint8)
+    photo = np.zeros((R, R, 3), np.uint8)
+    gen[:, :32], photo[:, :32] = (200, 80, 40), (190, 30, 40)       # label red: generated too orange
+    gen[:, 32:], photo[:, 32:] = (190, 150, 90), (170, 120, 70)     # peanut butter: generated too light
+    weight = np.full((R, R, 3), 255, np.uint8)
+    Image.fromarray(np.concatenate([gen, photo, weight, photo], axis=1)).save(tmp_path / "photo_front.png")
+    lut = B.color_lut(tmp_path, R)
+    for g, p in (((200, 80, 40), (190, 30, 40)), ((190, 150, 90), (170, 120, 70))):
+        out = B.apply_color_lut(np.full((4, 4, 3), g, np.uint8), lut)
+        assert np.abs(out[0, 0].astype(int) - p).max() <= 4
+    blue = np.full((4, 4, 3), (40, 60, 200), np.uint8)                # a colour the front does not show
+    assert np.abs(B.apply_color_lut(blue, lut).astype(int) - blue).max() <= 2
+    kept = B.apply_color_lut(np.full((4, 4, 3), (200, 80, 40), np.uint8), lut, keep=np.ones((4, 4)))
+    assert np.all(kept == (200, 80, 40))
+
+
+def test_edge_colour_is_the_main_colour_of_each_front_edge():
+    R = 64
+    view = np.full((R, R, 3), 255, np.uint8)
+    mask = np.zeros((R, R), bool)
+    mask[4:60, 8:56] = True
+    view[4:20, 40:56] = (200, 30, 30)                   # right edge: a red lid on top
+    view[20:60, 40:56] = (40, 140, 60)                  # and green contents below, most of the edge
+    view[4:60, 8:24] = (30, 40, 160)                    # left edge: blue
+    view[:, 52] = 255                                   # a one-pixel glare stripe in the right band
+    normals = np.zeros((R, R, 3))
+    normals[mask] = B.PF.TO_FRONT_CAMERA
+    band = B.edge_band(mask, normals, R, "right")
+    assert band[30].sum() == 4 and band[30, 51:55].all()          # 4 px wide (R / 16), past 1 px (R / 64)
+    assert np.allclose(B.edge_color(view, mask, normals, R, ("right",)), (40, 140, 60), atol=3)
+    assert np.allclose(B.edge_color(view, mask, normals, R, ("left",)), (30, 40, 160), atol=3)
+    view[4:60, 8:24] = (40, 140, 60)                    # both edges: the colour most of their pixels share
+    view[4:60, 16:24] = (30, 40, 160)
+    assert np.allclose(B.edge_color(view, mask, normals, R), (40, 140, 60), atol=3)
+    assert B.edge_color(view, np.zeros((R, R), bool), normals, R) is None
+
+
+def test_front_edges_cleaned_with_each_sides_colour():
+    R = 64
+    view = np.full((R, R, 3), (30, 160, 40), np.uint8)
+    mask = np.zeros((R, R), bool)
+    mask[:, 4:60] = True
+    normals = np.zeros((R, R, 3))
+    normals[mask] = B.PF.TO_FRONT_CAMERA
+    normals[:, 48:60] = (0.9, -0.3, 0.0)                # right band turns away
+    normals[:, 4:16] = (-0.9, -0.3, 0.0)                # left band turns away
+    fills = (np.float32([0, 0, 200]), np.float32([200, 0, 0]))
+    out = B.clean_front_edges(view, mask, normals, np.zeros((R, R), np.float32), R, fills=fills)
+    assert np.allclose(out[10, 56], (200, 0, 0), atol=25) and np.allclose(out[10, 6], (0, 0, 200), atol=25)
+    assert np.array_equal(out[30, 32], view[30, 32])                # facing the camera: untouched
+
+
+def test_cleaned_view_reaches_close_to_the_edge_of_a_face():
+    R = 256
+    gen = np.full((R, R, 3), (20, 20, 90), np.uint8)
+    mask = np.zeros((R, R), bool)
+    mask[100:156, 40:216] = True                        # a box top seen from above, 56 px deep
+    gen[146:150, 60:200] = (230, 200, 40)              # made-up print 6 px inside the face's edge
+    normals = np.zeros((R, R, 3))
+    normals[mask] = (0.0, 0.0, 1.0)
+    out = B.clean_view(gen, mask, normals, B.VIEW_DIRS[4], R)
+    assert np.abs(out[148, 130].astype(int) - (20, 20, 90)).max() <= 6       # print gone

@@ -376,31 +376,77 @@ def dominant_color(img, region):
     return px[keys == np.bincount(keys).argmax()].mean(axis=0).astype(np.float32)
 
 
-def clean_front_edges(view0, mask0, normals0, w_photo, res, band=(0.35, 0.55)):
+def edge_band(mask0, normals0, res, side, min_cos=0.45, skip_frac=1 / 64, width_frac=1 / 16):
+    """The front view's left or right edge band: in each row, the outer width_frac * res px of the part that faces
+    the front camera (cos above min_cos), past its outer skip_frac * res px (the photo's feathered rim)."""
+    ok = mask0 & (normals0 @ PF.TO_FRONT_CAMERA > min_cos)
+    skip, width = int(res * skip_frac), max(2, int(res * width_frac))
+    band = np.zeros_like(ok)
+    for y in np.nonzero(ok.any(axis=1))[0]:
+        xs = np.nonzero(ok[y])[0]
+        if len(xs) >= skip + width:
+            band[y, xs[::-1][skip:skip + width] if side == "right" else xs[skip:skip + width]] = True
+    return band
+
+
+def edge_color(view0, mask0, normals0, res, sides=("left", "right")):
+    """Colour for the side views, which continue the front's edges: the dominant colour of the edge bands
+    (edge_band, both by default) after a res / 48 median filter. A jar of olives gets their green, a cereal box
+    its print's main colour. The side view's own dominant colour can be a made-up white panel (the olives' sides
+    came out white), a colour per row turned logos and badges at the edge into stripes, and one edge alone can
+    be a single badge (Jif's right side came out the green of its protein badge). run() passes the generated
+    front, after the colour lookup, not the photo: a photo's edges can be glare (Jif's sides came out white, a
+    Pure Leaf bottle's near black). None for empty bands."""
+    k = max(3, int(res / 48) | 1)
+    med = cv2.medianBlur(np.ascontiguousarray(view0, dtype=np.uint8), k)
+    band = np.zeros(mask0.shape, bool)
+    for s in sides:
+        band |= edge_band(mask0, normals0, res, s)
+    return dominant_color(med, band)
+
+
+def clean_front_edges(view0, mask0, normals0, w_photo, res, band=(0.35, 0.55), fills=None):
     """Flat colour on the band of the front view that turns away from the camera (cos to the front camera
     below band[1], fully below band[0]) where photo front did not use the photo. A bake cutoff past 60 deg takes
-    this band from the front view, whose generated pixels there are stretched round the curve."""
+    this band from the front view, whose generated pixels there are stretched round the curve. fills: (left,
+    right) colours for the two halves, as the side views get them, instead of the band's one dominant colour."""
     cos = normals0 @ PF.TO_FRONT_CAMERA
     f = np.clip((band[1] - cos) / (band[1] - band[0]), 0.0, 1.0)
-    w = f * f * (3 - 2 * f) * (1.0 - np.clip(w_photo, 0.0, 1.0))
+    side = np.clip((0.4 - np.abs(normals0[..., 2])) / 0.2, 0.0, 1.0)     # turning sideways, not lids and rims
+    w = f * f * (3 - 2 * f) * side * (1.0 - np.clip(w_photo, 0.0, 1.0))
     w[~mask0] = 0.0
     ring = mask0 & (cos > 0.2) & (cos < band[1])
     if not ring.any():
         return view0
-    base = base_fill(view0, ring, res, "flat")
+    if fills is not None and fills[0] is not None and fills[1] is not None:
+        base = np.empty(view0.shape, np.float32)
+        base[:, :res // 2], base[:, res // 2:] = fills[0], fills[1]
+    else:
+        base = base_fill(view0, ring, res, "flat")
     out = w[..., None] * base + (1 - w[..., None]) * view0.astype(np.float32)
     return np.clip(np.rint(out), 0, 255).astype(np.uint8)
 
 
+def edge_weight(mask, res, feather_frac=1 / 512):
+    """The mask, eroded by 2 * feather px and feathered (Gaussian, sigma = feather = feather_frac * res). The
+    facing ramps take care of grazing surfaces, so the edge only needs to avoid the view's anti-aliased rim: at
+    res / 128 the band of about 30 px it left kept the made-up print round every cleaned view, a quarter of a
+    cereal box's top."""
+    feather = max(1.0, res * feather_frac)
+    r = int(math.ceil(2 * feather))
+    core = cv2.erode(mask.astype(np.uint8), np.ones((2 * r + 1, 2 * r + 1), np.uint8)) > 0
+    return cv2.GaussianBlur(core.astype(np.float32), (0, 0), feather)
+
+
 def compose_back(gen2, mask2, normals2, rec, upc, res, sigma_frac=1 / 8, facing=(0.05, 0.25), base_mode="flat"):
     """New back view, the blend weight and what was placed."""
-    feather = max(1.0, res / 128)
+    feather = max(1.0, res / 128)                    # placement and background colours, inside a wider rim
     r = int(math.ceil(2 * feather))
     core = cv2.erode(mask2.astype(np.uint8), np.ones((2 * r + 1, 2 * r + 1), np.uint8)) > 0
     cos = normals2 @ TO_BACK_CAMERA
     f = np.clip((cos - facing[0]) / (facing[1] - facing[0]), 0.0, 1.0)
     f = f * f * (3 - 2 * f)
-    w = cv2.GaussianBlur(core.astype(np.float32), (0, 0), feather) * f
+    w = edge_weight(mask2, res) * f
     w[~mask2] = 0.0
     base = base_fill(gen2, core, res, base_mode, sigma_frac)
     canvas = Image.fromarray(np.clip(np.rint(base), 0, 255).astype(np.uint8))
@@ -480,11 +526,11 @@ VIEW_DIRS = {1: np.array([1.0, 0.0, 0.0]), 3: np.array([-1.0, 0.0, 0.0]), 4: np.
 def clean_view(gen, mask, normals, to_cam, res, sigma_frac=1 / 8, facing=(0.2, 0.5), base_mode="flat", fill=None):
     """The view's dominant colour (or wide blur) where the surface faces its camera: made-up print removed. With
     fill (an RGB colour) that colour is used instead, e.g. the front label's for the side views."""
-    feather = max(1.0, res / 128)
+    feather = max(1.0, res / 128)                    # the colour is taken inside a wider rim
     r = int(math.ceil(2 * feather))
     core = cv2.erode(mask.astype(np.uint8), np.ones((2 * r + 1, 2 * r + 1), np.uint8)) > 0
     f = np.clip((normals @ to_cam - facing[0]) / (facing[1] - facing[0]), 0.0, 1.0)
-    w = cv2.GaussianBlur(core.astype(np.float32), (0, 0), feather) * f * f * (3 - 2 * f)
+    w = edge_weight(mask, res) * f * f * (3 - 2 * f)
     w[~mask] = 0.0
     base = (np.broadcast_to(np.asarray(fill, np.float32), gen.shape).copy() if fill is not None
             else base_fill(gen, core, res, base_mode, sigma_frac))
@@ -520,6 +566,109 @@ def color_map(src_run_dir, res, sigma_frac=1 / 32):
         keep = err <= np.percentile(err, 90)
         M = np.linalg.lstsq(X[keep], Y[keep], rcond=None)[0].T
     return M
+
+
+def color_lut(src_run_dir, res, sigma_frac=1 / 32, bins=17, color_sigma=20.0, prior=25.0):
+    """Colour lookup from the generated front to the registered photo, fitted on the same blurs and pixels as
+    color_map: on a bins^3 RGB grid, each grid colour gets the mean photo-minus-generated offset of the pixels
+    whose generated colour lies near it (Gaussian weight, color_sigma grey levels), shrunk towards no offset
+    where such pixels are few (prior, in pixels). So colours the front shows each get their own shift, and
+    colours it does not show stay as they are. One affine map for all colours had to trade them off: it turned
+    Jif's peanut butter pink to bring the label's red right. The worst 10 % of pixels (glare, misregistration)
+    are dropped and the grid fitted again. (bins, bins, bins, 3) float32 offsets, None when the photo was not
+    used."""
+    p = pathlib.Path(src_run_dir) / "photo_front.png"
+    if not p.exists():
+        return None
+    panel = np.asarray(Image.open(p).convert("RGB")).astype(np.float32)
+    gen0, ph, wv = panel[:, :res], panel[:, res:2 * res], panel[:, 2 * res:3 * res, 0] / 255.0
+    core = wv > 0.9
+    if core.sum() < 0.05 * res * res:
+        return None
+    s = max(1.0, res * sigma_frac)
+    g = PF.masked_blur(gen0, core, s)
+    q = PF.masked_blur(ph, core, s)
+    lum_w = np.array([0.299, 0.587, 0.114], np.float32)
+    lq, lg = q @ lum_w, g @ lum_w
+    ys, xs = np.nonzero(core & (lq > 12) & (lq < 243) & (lg > 12) & (lg < 243))
+    k = max(1, len(ys) // 20000)
+    return fit_color_lut(g[ys[::k], xs[::k]], q[ys[::k], xs[::k]], bins, color_sigma, prior)
+
+
+def fit_color_lut(gen_colors, photo_colors, bins=17, color_sigma=20.0, prior=25.0, tau=None):
+    """color_lut's grid from (N, 3) pairs of generated and photo colours. tau: also shrink each grid colour's
+    offset by tau^2 / (tau^2 + v), v the spread (variance summed over channels) of its pixels' offsets, so a colour
+    whose pixels disagree on the photo colour stays nearer its own."""
+    X = np.asarray(gen_colors, np.float32)
+    D = np.asarray(photo_colors, np.float32) - X
+    ax = np.linspace(0.0, 255.0, bins, dtype=np.float32)
+    nodes = np.stack(np.meshgrid(ax, ax, ax, indexing="ij"), axis=-1).reshape(-1, 3)
+    keep = np.ones(len(X), bool)
+    for _ in range(2):
+        num = np.zeros((len(nodes), 3), np.float64)
+        den = np.zeros(len(nodes), np.float64)
+        sq = np.zeros(len(nodes), np.float64)
+        Xk, Dk = X[keep], D[keep]
+        for i in range(0, len(nodes), 512):
+            nb = nodes[i:i + 512]
+            d2 = (nb * nb).sum(1)[:, None] + (Xk * Xk).sum(1)[None, :] - 2.0 * nb @ Xk.T
+            wgt = np.exp(-np.maximum(d2, 0.0) / (2.0 * color_sigma ** 2))
+            num[i:i + 512] = wgt @ Dk
+            den[i:i + 512] = wgt.sum(axis=1)
+            sq[i:i + 512] = wgt @ (Dk * Dk).sum(1)
+        mean = num / np.maximum(den, 1e-9)[:, None]
+        off = num / (den + prior)[:, None]
+        if tau:
+            var = np.maximum(sq / np.maximum(den, 1e-9) - (mean * mean).sum(1), 0.0)
+            off = off * (tau * tau / (tau * tau + var))[:, None]
+        lut = off.astype(np.float32).reshape(bins, bins, bins, 3)
+        err = np.abs(D - lut_offsets(X, lut)).sum(axis=1)
+        keep = err <= np.percentile(err, 90)
+    return lut
+
+
+def lut_offsets(colors, lut):
+    """Trilinear lookup of (N, 3) colours in a color_lut grid -> (N, 3) offsets."""
+    b = lut.shape[0]
+    x = np.clip(colors.astype(np.float32) / 255.0 * (b - 1), 0.0, b - 1 - 1e-4)
+    i = np.floor(x).astype(np.int64)
+    f = x - i
+    out = np.zeros_like(x)
+    for dr in (0, 1):
+        for dg in (0, 1):
+            for db in (0, 1):
+                wgt = ((f[:, 0] if dr else 1 - f[:, 0]) * (f[:, 1] if dg else 1 - f[:, 1])
+                       * (f[:, 2] if db else 1 - f[:, 2]))
+                out += wgt[:, None] * lut[i[:, 0] + dr, i[:, 1] + dg, i[:, 2] + db]
+    return out
+
+
+def neutral_keep(colors, chroma=(8.0, 20.0)):
+    """(N,) weight in [0, 1] of how far (N, 3) RGB colours are from grey: 0 under CIELAB chroma chroma[0], 1 above
+    chroma[1], smoothstep between."""
+    x = np.clip(np.asarray(colors, np.float32), 0, 255).reshape(-1, 1, 3) / 255.0
+    lab = cv2.cvtColor(x, cv2.COLOR_RGB2LAB).reshape(-1, 3)
+    t = np.clip((np.hypot(lab[:, 1], lab[:, 2]) - chroma[0]) / (chroma[1] - chroma[0]), 0.0, 1.0)
+    return t * t * (3 - 2 * t)
+
+
+def apply_color_lut(img, lut, detail_sigma=None, keep=None, chroma=(8.0, 20.0)):
+    """img shifted by the color_lut offset of its colour. With detail_sigma the offset is looked up on the
+    Gaussian blur of img (sigma in px), so it follows the colour areas and leaves the detail above them alone.
+    keep: (H, W) weight in [0, 1] where img stays as it is (the photo where photo front used it whole).
+    Near-grey colours (black, white, silver; neutral_keep) keep theirs: a tint shows most on them, and the photo
+    pixels paired with them are often glare, shadow or the next colour area (Campbell's black lid came out
+    maroon, Dole's white cap pink). chroma None shifts them too."""
+    a = img.astype(np.float32)
+    low = cv2.GaussianBlur(a, (0, 0), detail_sigma) if detail_sigma else a
+    flat = low.reshape(-1, 3)
+    off = lut_offsets(flat, lut)
+    if chroma is not None:
+        off = off * neutral_keep(flat, chroma)[:, None]
+    off = off.reshape(a.shape)
+    if keep is not None:
+        off = off * (1.0 - np.clip(keep, 0.0, 1.0))[..., None]
+    return np.clip(np.rint(a + off), 0, 255).astype(np.uint8)
 
 
 def apply_color_map(img, M, detail_sigma=None):
@@ -562,12 +711,25 @@ def run(args):
             geo = A.load_unitex_cache(dst / "cache")
             res = geo.res
             grid = np.array(Image.open(dst / "cache" / "mv_rgb.png").convert("RGB"))
-            M = color_map(src, res) if args.color_match else None
+            pf_panel = src / "photo_front.png"
+            w_photo = (np.asarray(Image.open(pf_panel).convert("L"))[:, 2 * res:3 * res].astype(np.float32) / 255.0
+                       if pf_panel.exists() else np.zeros((res, res), np.float32))
+            M = color_map(src, res) if args.color_match == "affine" else None
             if M is not None:                            # all six views, before the back and the clean views
                 views = C.split_grid(grid, res)
                 for v in range(6):
                     grid = PF.put_view(grid, v, apply_color_map(np.ascontiguousarray(views[v]), M, res / 64), res)
                 rec_info["color_map"] = np.round(M, 4).tolist()
+            pf_info = json.loads((src / "run_info.json").read_text()) if (src / "run_info.json").exists() else {}
+            photo_whole = pf_info.get("mode") == "full"  # photo front kept the photo's own layout
+            lut = color_lut(src, res) if args.color_match == "lut" else None
+            if lut is not None:                          # the photo itself keeps its colours where used whole
+                keep0 = w_photo if photo_whole else None
+                views = C.split_grid(grid, res)
+                for v in range(6):
+                    grid = PF.put_view(grid, v, apply_color_lut(np.ascontiguousarray(views[v]), lut, res / 64,
+                                                                keep0 if v == 0 else None), res)
+                rec_info["color_lut_mean_abs_offset"] = round(float(np.abs(lut).mean()), 2)
             gen2 = np.ascontiguousarray(C.split_grid(grid, res)[BACK])
             f = off / f"{sku}.json"
             rec = json.loads(f.read_text()) if f.exists() else None
@@ -578,17 +740,31 @@ def run(args):
             views = C.split_grid(grid, res)
             k = max(3, int(res / 48) | 1)                # the front label's colour, for the sides
             front_fill = dominant_color(cv2.medianBlur(np.ascontiguousarray(views[0]), k), geo.masks[0])
+            edges = None
+            if args.sides_from_edge:                     # one colour from both edges of the generated front
+                front = np.ascontiguousarray(views[0])
+                if pf_panel.exists():
+                    front = np.ascontiguousarray(np.asarray(Image.open(pf_panel).convert("RGB"))[:, :res])
+                    if lut is not None:
+                        front = apply_color_lut(front, lut, res / 64)
+                ec = edge_color(front, geo.masks[0], geo.normals[0], res)
+                if ec is not None:
+                    edges = (ec, ec)
+                    rec_info["side_colour"] = np.round(ec).astype(int).tolist()
             for v in args.clean_views:
+                fill = None
+                if v in (1, 3) and edges is not None:   # views 1 and 3 look at the right and left sides
+                    fill = edges[1] if v == 1 else edges[0]
+                elif v in (1, 3) and args.sides_from_front:
+                    fill = front_fill
                 cv = clean_view(np.ascontiguousarray(views[v]), geo.masks[v], geo.normals[v], VIEW_DIRS[v], res,
-                                args.sigma_frac, base_mode=args.base,
-                                fill=front_fill if (v in (1, 3) and args.sides_from_front) else None)
+                                args.sigma_frac, base_mode=args.base, fill=fill)
                 out_grid = PF.put_view(out_grid, v, cv, res)
-            if args.clean_front_edges:
-                pf_panel = src / "photo_front.png"
-                w_photo = (np.asarray(Image.open(pf_panel).convert("L"))[:, 2 * res:3 * res].astype(np.float32) / 255.0
-                           if pf_panel.exists() else np.zeros((res, res), np.float32))
+            if args.clean_front_edges and not photo_whole:
+                # a front the photo replaced whole has no made-up print left, and cleaning round its text-line
+                # boxes left them as lighter boxes on the turning band (Betty Crocker's tub)
                 v0 = clean_front_edges(np.ascontiguousarray(C.split_grid(out_grid, res)[0]), geo.masks[0],
-                                       geo.normals[0], w_photo, res)
+                                       geo.normals[0], w_photo, res, fills=edges)
                 out_grid = PF.put_view(out_grid, 0, v0, res)
             Image.fromarray(out_grid).save(dst / "cache" / "mv_rgb.png")
             wv = np.repeat((w * 255).astype(np.uint8)[..., None], 3, axis=2)
@@ -638,10 +814,15 @@ def main(argv=None):
                    help="background of the back behind the panels: wide blur (keeps the label's colour areas) or flat")
     p.add_argument("--sides-from-front", action="store_true",
                    help="fill the cleaned side views (1, 3) with the front label's dominant colour")
+    p.add_argument("--sides-from-edge", action="store_true",
+                   help="fill the cleaned side views (1, 3) and the --clean-front-edges band with the dominant "
+                        "colour of the front view's left and right edges (edge_color)")
     p.add_argument("--clean-front-edges", action="store_true",
-                   help="flat colour on the front view's turning-away band where photo front did not use the photo")
-    p.add_argument("--color-match", action="store_true",
-                   help="map all views' colours to the photo's, fitted where photo front used the photo")
+                   help="flat colour on the front view's turning-away band where photo front did not use the photo "
+                        "(not on a front that photo front replaced whole, mode full)")
+    p.add_argument("--color-match", nargs="?", const="affine", default=None, choices=("affine", "lut"),
+                   help="map all views' colours to the photo's, fitted where photo front used the photo: one affine "
+                        "map (bare flag) or a colour lookup (lut)")
     p.add_argument("--seed", type=int, default=63)
     p.add_argument("--no-bake", action="store_true", help="write mv_rgb.png and back_panel.png only (CPU)")
     return run(p.parse_args(argv))

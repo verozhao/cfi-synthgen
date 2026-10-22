@@ -89,6 +89,38 @@ def test_local_agreement_trusts_matching_layout_and_flat_views_only():
     assert P.local_agreement(flat, base, region, R).min() > 0.95
 
 
+def test_auto_registration_tries_flow_only_when_the_homography_fits_poorly():
+    import cv2
+    rng = np.random.default_rng(0)
+    R = 128
+    tex = cv2.GaussianBlur(rng.random((R, R)).astype(np.float32), (0, 0), 1.5)
+    tex = (255 * (tex - tex.min()) / (tex.max() - tex.min())).astype(np.uint8)
+    gen0 = np.repeat(tex[..., None], 3, axis=2)
+    mask0 = np.zeros((R, R), bool)
+    mask0[8:120, 8:120] = True
+    photo = Image.fromarray(gen0)
+    _, _, fit = P.register_photo(gen0, mask0, photo, mask0, (1.0, 1.0, 0.0, 0.0), R, "auto")
+    assert fit["method"] == "homography" and fit["ncc_homography"] > 0.95 and "ncc_flow" not in fit
+    assert fit["layout"] == "generated"
+    _, _, forced = P.register_photo(gen0, mask0, photo, mask0, (1.0, 1.0, 0.0, 0.0), R, "auto", flow_below=1.01)
+    assert "ncc_flow" in forced                           # tried once the homography counts as poor
+    assert forced["method"] == "flow" and forced["layout"] == "generated"      # and it reaches flow_min 0.9
+    _, _, own = P.register_photo(gen0, mask0, photo, mask0, (1.0, 1.0, 0.0, 0.0), R, "auto", flow_below=1.01,
+                                 flow_min=1.01)
+    assert own["layout"] == "photo" and own["method"] == "affine"             # nothing fits: the photo's layout,
+    assert own["ncc_matched"] > 0.95 and own["ncc_final"] == own["ncc_affine"]  # placed by the silhouettes
+
+
+def test_blend_under_replaces_what_shows_where_the_photo_fades():
+    gen = np.full((8, 8, 3), 200, np.uint8)
+    photo = np.zeros((8, 8, 3), np.uint8)
+    core = np.ones((8, 8), bool)
+    w = np.full((8, 8), 0.25, np.float32)
+    under = np.full((8, 8, 3), 100, np.uint8)
+    out = P.blend(gen, photo, w, core, "full", under=under)
+    assert np.all(out == 75)                              # 0.25 * 0 + 0.75 * 100, the generated 200 never shows
+
+
 def test_text_weight_takes_whole_lines_from_the_photo(tmp_path):
     R = 128
     mask0 = np.zeros((R, R), bool)
@@ -110,3 +142,17 @@ def test_text_weight_takes_whole_lines_from_the_photo(tmp_path):
     assert w[38, 60] > 0.5                                # padded by 0.3 x the 8 px line height
     w0, n0 = P.text_weight(tmp_path / "missing.json", mask0, normals, photo_mask, R)
     assert n0 == 0 and w0.max() == 0.0
+
+
+def test_own_layout_fades_into_the_photos_own_colours():
+    R = 64
+    gen = np.full((R, R, 3), (240, 80, 20), np.uint8)    # generated tub: orange
+    photo = np.full((R, R, 3), (200, 40, 50), np.uint8)  # photo: red
+    mask0 = np.zeros((R, R), bool)
+    mask0[4:60, 4:60] = True
+    pmask = np.zeros((R, R), np.float32)
+    pmask[4:60, 4:40] = 1.0                               # the photo covers the left part of the silhouette
+    u = P.own_layout_under(gen, photo, mask0, pmask, 4.0)
+    assert np.abs(u[30, 15] - (200, 40, 50)).max() < 2    # inside the photo: its own colour
+    assert np.abs(u[30, 55] - (240, 80, 20)).max() < 2    # beyond it: the generated colour
+    assert np.array_equal(u[1, 1], gen[1, 1].astype(np.float32))      # outside the silhouette: untouched
