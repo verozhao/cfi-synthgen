@@ -276,6 +276,9 @@ text are reported separately.
   misses. That difference is not significant (p 0.32). On small lines the baseline reads 86 and ours 57.
   On the larger lines ours reads 89 and the baseline 71.
 - So the remaining gap is small text, which the OCR loss (step 7) targets.
+- Correction (step 8): the baked asset and baseline columns crop each line through a box fit of the photo,
+  which puts the crop beside the line when the photo is not exactly frontal. With the view-0 crops of step 8
+  the crop run's baked asset reads 151 lines (56 under 16 px) and the baseline 154 (82).
 
 ## OCR loss (step 7)
 
@@ -336,3 +339,98 @@ text are reported separately.
   reads 140 lines against 146. The sign test gives p 0.18. Both runs used the same layouts, so only the
   LoRA differs.
 - So at weight 0.007 the OCR loss does not close the small-text gap to the current pipeline.
+
+## Finishing the asset (step 8)
+
+These steps work on a finished run and then only bake again. FLUX is not loaded.
+
+- Scoring baked models. The baked stage crops each line through a box fit of the photo onto the front render.
+  For a photo that is not exactly frontal those crops land beside the line: on the test products "General"
+  read "neral", and the crop of "Cream Cheese" read the "16 OZ" below it. The render and view 0 are
+  orthographic front views of the same mesh at the same framing (scale 1.000 within 0.005 on all 28
+  products). `bakedview.py` places the render on view 0 by the silhouette bboxes, so `eval_text` crops it like
+  the final view (`--align homography`). The tables below use these crops. The current pipeline's renders
+  land at scale 1 too, except 5 products whose mesh is up to 3% wider or narrower. Matching width and height
+  separately changes its count by 1 line.
+- Lines read exactly. A line counts as read at 80% similarity, which lets about one character in five be
+  wrong. So the tables also count the lines read exactly.
+- Baked models of all 28 products (277 lines, 169 under 16 px), with these crops:
+
+| baked model | read | exact | under 16 px read | under 16 px exact |
+|---|---|---|---|---|
+| crop run with `--delight-shading 4` (step 6) | 151 | 119 | 56 | 38 |
+| the same with photo front | 223 | 192 | 127 | 105 |
+| the same with photo front, text lines, bake cutoff 75 deg, 4096 texture | 238 | 211 | 137 | 121 |
+| the same with `--register auto` | 232 | 207 | 137 | 121 |
+| first finish: back panel, cleaned sides, top, bottom and front edges, one affine colour map | 240 | 215 | 138 | 123 |
+| final, after the check by eye below | 235 | 207 | 139 | 122 |
+| current Gemini pipeline (`baseline`) | 154 | 128 | 82 | 65 |
+
+- The final models read 83 lines that the current pipeline misses and miss 2 that it reads. The sign test
+  gives p 2e-22. Counting exact lines, it is 89 against 10. That gives p 6e-17. The photo itself reads 264
+  lines at 1024 px. The final models keep 89% of what it shows. Under 16 px they keep 85%.
+- The first finish reads 8 lines that the final models miss and misses 3 that they read. The sign test gives p
+  0.23. It had ghosts, tints and white rims (below). Four of the 8 lines are Betty Crocker's. The final models
+  place its photo by the silhouettes (`--register auto`), and these crops follow the generated layout, so they
+  land beside the lines. Crops placed by the silhouette fit for every model read all 7 of its lines on the final
+  model, 5 on the first finish and none on the current pipeline.
+- Photo front on the crop run. `photo_front.py` puts the registered photo's detail into view 0 and bakes again.
+  On the crop run it lifts the baked models from 151 lines to 223, most of them under 16 px.
+- Whole text lines. `--text-json text_reg.json` gives weight 1 to each of the photo's OCR lines (its
+  `view0_quad`, padded by `--text-pad` line heights). Without it the local trust keeps the generated letters
+  where they differ from the photo's, and the facing ramp keeps them where a can turns away. A line could then
+  come out half photo and half made up: Red Bull's "Vitalizes" read "italizes" over a generated "Violines".
+  With `--text-pad 1.0` the final view reads 240 lines and 213 exactly, against 229 and 197 without it.
+  Whole lines need a homography NCC of at least 0.8 (`--text-min-ncc`). Below that the photo sits a little
+  off, and Betty Crocker's "16 OZ" came out twice.
+- Registration. `--register auto` keeps the SIFT homography when its blurred grey NCC with the generated front is
+  at least 0.8. Below that it tries a smoothed optical flow, which fits a jar or tub shot from above (Jif from
+  0.79 to 0.96). On a photo the homography already fits, the flow shears letters ("Gluten" came out slanted).
+  With flow on 26 products the baked models read 220 lines. Without it they read 240. A flow that stays under 0.9
+  (`--flow-min`) means the generated layout itself differs from the photo: Betty Crocker's ribbon is tilted and
+  its badge sits lower. Bent onto it, the photo showed two copies of "Cream Cheese". The photo then keeps its own
+  layout. It is placed by the silhouette fit alone and replaces the facing part of view 0 as it is, with its text
+  lines. Where it fades out its own blur shows, so neither generated letters nor generated colours sit next to
+  it. Of the 28 products Jif gets the flow, and Betty Crocker and Sparkling Ice keep the photo's layout.
+- Bake cutoff. UniTEX's bake gives each texel to the first view that sees it within 60 deg, in the order front,
+  back, left, right, top, bottom. On a can the band past 60 deg came from the side views and their made-up
+  print. `UNITEX_BAKE_ANGLE=105` (75 deg) lets the front view, and so the photo, cover it. With this cutoff some
+  meshes have no texel left for LTM, whose `decode_field` then failed on an empty query. The patch returns an
+  empty result.
+- Bake texture. `UNITEX_BAKE_TEX=4096` bakes into a 4096 texture instead of 2048. It reads the same 238 lines
+  and more of them exactly, 211 against 205 (under 16 px, 121 against 113).
+- Back panel (`back_panel.py`). With only a front photo the back is unknown, and the model fills it with
+  made-up print. The back keeps the generated colours (a median-filtered blur, white print boxes turned to the
+  label colour) and gets, where the surface faces the back camera, a US Nutrition Facts panel and the
+  ingredients from the product's Open Food Facts record (`off_lookup.py`, 27 of the 28 eval products have
+  one), a UPC-A barcode of the product's own code and the brand. Only what the record has is drawn, so
+  nothing on the back is made up.
+- The rest of the label. `--clean-views 1,3,4,5` replaces the made-up print on the sides, top and bottom with
+  a flat colour. The cleaned views and the back are blended up to 2 px from their edges. At res / 128 the rim
+  of about 30 px kept made-up print, a quarter of a cereal box's top. `--sides-from-edge` gives the sides the
+  dominant colour of both edges of the generated front, after the colour lookup below. The side view's own
+  dominant colour can be a made-up white panel (the olives showed white rims from the front). A photo's edges
+  can be glare (Jif's sides came out white), and one edge alone can be a badge. `--clean-front-edges` puts
+  the same colour on the turning-away band of view 0 that the photo did not cover, which the 75 deg cutoff
+  would otherwise stretch round the curve. It leaves out a front that keeps the photo's own layout. That
+  front has no made-up print, and cleaning round its text-line boxes left lighter boxes on Betty Crocker's
+  tub.
+- Colour. In detail mode the front keeps the generated coarse colours, and the model shifts some of them (El
+  Pato's dark green came out lime). `--color-match lut` fits a colour lookup on the blurs of the generated front
+  and the registered photo, where photo front used the photo. On a grid of 17 levels per channel each colour
+  takes the mean shift of the pixels whose generated colour is near it, shrunk towards none where they are few.
+  It is applied to each view's blur, so the print above it keeps its contrast. Fitted on the left half of each
+  front and measured on the right half, the median colour difference in CIELAB drops from 9.6 to 3.7. On El Pato
+  it drops from 26.5 to 7.0. One affine map for all colours (`--color-match`) reaches 3.8 on the front. But it
+  moves colours the front does not show by up to 170 (black on Garnier), and it turned Jif's peanut butter pink.
+  Near-grey colours keep theirs. A tint shows most on them, and their photo pixels are often glare, shadow or the
+  next colour area: Campbell's black lid came out maroon and Dole's white cap pink.
+- Checking by eye. `quality_views.py` renders four angled lit views of a GLB with mvgen.py's own import,
+  lights and passes, next to its straight views (`mvgen.py --mode views`). The first finish read the most
+  lines but had ghosts on jars and tubs shot from above (Jif's letters doubled, Betty Crocker's "16 OZ"
+  twice), a pink tint and pale lids from the affine colour map, and white rims from white sides. The
+  registration, colour and side changes above remove them.
+- Left as they are. Shin Ramyun's photo is shot from above and does not register (NCC 0.12), so its front
+  stays generated and the current pipeline reads more of it. Betty Crocker's photo also shows the top of its
+  lid, which lands on the lid's side. Tops and lids keep the generated colour where the front does not show
+  it (El Pato's top is yellow and its rim gold). The sides are plain.
