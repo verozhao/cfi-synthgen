@@ -190,6 +190,23 @@ text are reported separately.
   - The training probe agrees. It compares the small-text loss of a sample with and without its
     layout. Over the second half of training the layout lowered that loss by 3.8% with edges and by
     10.4% with crops.
+- Longer edges run (`layouttokE2_1024_ft1500`). It finds the training edges after the shift only
+  (`edge_degrade=shift`) and trains for 1500 steps instead of 500. Everything else is as in the edges
+  eval. Final view, 56 lines:
+  - With the sharp photo it reads 37 lines and the same LoRA without a layout 38. The crop run reads 39.
+    So with the sharp photo the edge maps still add nothing.
+  - With the photo's text blurred it reads 29 lines and the same LoRA without a layout 13. It reads 17
+    lines that the run without a layout misses and misses 1 that it reads (p 1.5e-4). So after 1500
+    steps the model does take text from the edge maps.
+  - The crop run still reads more with the blurred photo, 33 lines after only 500 steps. Against the
+    edges run that difference is not significant (p 0.34).
+  - Lines read exactly, with the blurred photo: 18 with edges and 10 without a layout. The crop run
+    reads 24 exactly.
+  - The fix alone changes little. At step 500 the run reads 34 lines with the sharp photo and 16 with
+    the blurred one. The 500-step edges run read 37 and 15.
+  - The gain comes from the longer training. From step 500 to 1500 the blurred-photo run gains 13 lines
+    and loses none (p 2.4e-4). Only 4 of the 13 are read exactly. The training probe agrees: the
+    layout's gain on the small-text loss kept growing and reached 9.4% in the last third of training.
 - Kind `both` gives a line the font and the edges at once, each as its own input. The font goes on the
   layout strip and the edges on a second strip below it. In tokens mode the line's target tokens get
   the font tokens on the glyph plane and the edge tokens on an edge plane (ids (2, row, col)). The
