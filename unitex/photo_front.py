@@ -24,6 +24,7 @@ copied cache with cache/mv_rgb_generated.png (view 0 before the blend).
 Usage (GPU server, UniTEX checkout with unitex/patches/UniTEX.patch):
   python unitex/photo_front.py --unitex-root /path/UniTEX --eval-dir EVAL --src-run glyph_trainAB \\
       --run-name glyph_trainAB_photofront [--skus a,b | file] [--mode detail|full|none] [--no-bake]
+      [--one-bake] [--fps-height 9]        (the last two shorten the bake, see unitex/bake_steps.py)
 """
 
 import argparse
@@ -42,6 +43,7 @@ from PIL import Image
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from unitex import anchors as A  # noqa: E402
+from unitex import bake_steps  # noqa: E402
 from unitex import common as C  # noqa: E402
 
 FRONT = 0                          # raw view index of the front camera
@@ -410,12 +412,23 @@ def copy_cache(src_cache, dst_cache):
                     ignore=shutil.ignore_patterns("w_LTM", "wo_LTM", "textured_mesh.glb", "*.mp4"))
 
 
+def sku_list(spec):
+    """--skus: a file (one SKU per line, # starts a comment) or a comma list.
+
+    os.path.isfile, since pathlib's is_file raises on a comma list longer than a file name can be (over 19 SKUs).
+    """
+    if os.path.isfile(spec):
+        with open(spec) as f:
+            skus = [line.split("#")[0].strip() for line in f]
+    else:
+        skus = [s.strip() for s in spec.split(",")]
+    return [s for s in skus if s]
+
+
 def run(args):
     eval_dir = pathlib.Path(args.eval_dir).resolve()
     if args.skus:
-        p = pathlib.Path(args.skus)
-        skus = [l.split("#")[0].strip() for l in open(p)] if p.is_file() else args.skus.split(",")
-        skus = [s for s in skus if s]
+        skus = sku_list(args.skus)
     else:
         skus = sorted(d.name for d in eval_dir.iterdir() if (d / args.src_run / "cache" / "mv_rgb.png").exists())
     log_path = eval_dir / "photo_front_log.jsonl"
@@ -456,6 +469,10 @@ def run(args):
                 if not args.no_bake:
                     if baker is None:
                         baker = build_baker(args.unitex_root, info["view_res"], args.seed)
+                        if args.one_bake:
+                            bake_steps.one_bake(baker)
+                        if args.fps_height:
+                            bake_steps.fps_height(args.fps_height)
                     elif getattr(baker, "view_res", 512) != info["view_res"]:
                         raise RuntimeError(f"view_res {info['view_res']} differs from the first SKU's, run them separately")
                     import torch
@@ -513,6 +530,12 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=63)
     p.add_argument("--resume", action="store_true", help="skip SKUs with run_info.json")
     p.add_argument("--no-bake", action="store_true", help="write mv_rgb.png and photo_front.png only (CPU)")
+    p.add_argument("--one-bake", action="store_true",
+                   help="skip the bake without LTM (cache/wo_LTM), which only the walkthrough page reads: about 27 s "
+                        "of a 4096 px bake")
+    p.add_argument("--fps-height", type=int, default=None, metavar="H",
+                   help="tree height of the farthest point sampling behind LTM's input points when there are over a "
+                        "million (UniTEX: 5, fpsample's advice for large inputs: 9). 43 s -> 5 s of a 4096 px bake")
     args = p.parse_args(argv)
     if args.run_name == args.src_run:
         p.error("--run-name must differ from --src-run (the source run is read only)")

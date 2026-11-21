@@ -451,3 +451,139 @@ These steps work on a finished run and then only bake again. FLUX is not loaded.
   stays generated and the current pipeline reads more of it. Betty Crocker's photo also shows the top of its
   lid, which lands on the lid's side. Tops and lids keep the generated colour where the front does not show
   it (El Pato's top is yellow and its rim gold). The sides are plain.
+
+## Inference speed (step 9)
+
+- Where the time goes. Medians over the 28 eval products on one RTX 4090 with `run_unitex_lowmem.py`, read from
+  the run logs with `stage_times.py` (UniTEX's own timers and the progress lines of the two FLUX passes):
+
+| stage | 512 px views (glyph tokens) | 1024 px views, delight at 512 (crop layout) |
+|---|---|---|
+| texture pass, 28 steps | 250 s, 8.9 s per step | 979 s, 34.9 s per step |
+| delight pass, 28 steps | 246 s, 8.8 s per step | 252 s, 9.0 s per step |
+| the two bakes | 18 s | 26 s |
+| everything else | 7 s | 17 s |
+| one product | 521 s (8.7 min) | 1273 s (21.2 min) |
+
+- The two FLUX passes are 95 to 97 % of a product. `photo_front.py` after it takes about 90 s, of which its two
+  bakes at 4096 px take 27 s and 53 s.
+- One FLUX step is large. The sequence holds the noisy views, the geometry image at the same size, the
+  reference photo, the glyph or layout tokens and 512 text tokens: about 14 000 tokens at 512 px and about
+  55 000 at 1024 px. An ordinary 1024 px FLUX image has about 4 600.
+- It was also slowed by how the weights reached the GPU. bf16 FLUX (24 GB) does not fit a 24 GB card next to
+  its activations, so `run_unitex_lowmem.py` streams it with `accelerate.cpu_offload`. That copies each weight
+  from ordinary CPU memory with a blocking copy before its layer runs, and calls `torch.cuda.empty_cache()`
+  after every copy, thousands of times per step.
+- `run_unitex_fast.py` keeps the same bf16 weights and LoRAs and changes four things. None changes the views:
+  - Block streaming. The large weights sit in page-locked CPU memory. A block's weights are sent just before
+    it runs and dropped after, and the next block is copied on a second CUDA stream while the current one
+    computes (`Tensor.record_stream` keeps the memory from being reused early). LoRA factors, biases and norm
+    weights (0.26 GB) stay on the GPU.
+  - Exact, private page locking. `Tensor.pin_memory()` rounds every allocation up to a power of two and locked
+    34 GB per process for 22 GB of weights, in shared memory. The buffers are now private anonymous mmaps of
+    exactly the size, locked with `cudaHostRegister`. Private buffers keep other work on the machine from
+    stalling (see the stalls below). `MADV_DONTFORK` keeps them out of forked children, since a fork would
+    copy locked private pages at once.
+  - Adapters with weight 0 are switched off for the pass. UniTEX keeps its three adapters active and picks
+    one with the weights, and PEFT computes every active adapter in all 342 adapted layers.
+  - The CUDA cache is emptied before each VAE decode and after each pass, not after every weight. With no
+    emptying at all the cache grew to 23.3 of 24.0 GB, which leaves nothing for the rasteriser and the bake.
+    With it the process holds about 2.5 GB after a pass.
+- Seconds per FLUX step, 4 steps each on one product (two GPUs busy):
+
+| pass | accelerate | blocks, copied then run | blocks with prefetch | and zero-weight adapters off |
+|---|---|---|---|---|
+| texture, 1024 px | 35.5 | 21.0 | 20.1 | 18.4 |
+| delight, 512 px | 8.2 | 3.5 | 2.7 | 2.3 |
+| texture, 512 px | 9.5 | 4.0 | 3.1 | 2.7 |
+
+- Keeping part of FLUX on the GPU for good (`--resident-gb`) gave nothing more. With the encodes counted, a
+  step took 2.94 s against 2.96 s at 512 px with 12 GB resident, and 19.90 s against 19.89 s at 1024 px with
+  6 GB. The prefetch already hides the copies.
+- Full runs with three GPUs busy at once, medians over four products (cereal box, jar, can, squeeze bottle):
+
+| | `run_unitex_lowmem.py` | `run_unitex_fast.py`, one bake |
+|---|---|---|
+| 512 px views | 521 s (8.7 min) | 165 s (2.8 min): texture 77 s, delight 68 s, bake 13 s |
+| 1024 px views, delight at 512 | 1273 s (21.2 min) | 650 s (10.8 min): texture 551 s, delight 67 s, bake 13 s |
+
+- The views are the same. `mv_rgb.png` is pixel-identical to the stored `run_unitex_lowmem.py` run on all four
+  products at 1024 px, and to a rerun with accelerate on the one product tried at 512 px. A rerun with
+  accelerate also reproduces the stored views exactly, so the two FLUX passes are deterministic.
+- Stalls outside the FLUX loop, and why the buffers are private. Locked pages cannot be moved. Memory
+  compaction on this kernel (5.15) passes over locked private pages at a glance. Locked shared pages it takes
+  off their lists and then fails to move, one by one. A process that faults in a huge page when none is free
+  waits for such a pass, and numpy maps its large arrays as huge pages (`_get_madvise_hugepage()` is True).
+  - With torch's pinned buffers, which are shared, the first full runs lost about 400 s on the first product
+    of each process (geometry render 30 s against 0.7 s, a point cloud export 28 s against 0.02 s).
+  - With exact but still shared buffers the views step ran clean: in the two 28-product runs below no product
+    took over 1.1 times its run's median. The photo front step stalled when it ran while other processes
+    held their buffers. In the 20 + 8 run 5 of its 28 products took 59 to 78 s against 27 s.
+  - One test repeated that with each buffer type. A process holds its 22 GB for one lossless product while
+    two others end their views and run photo front on 9 products each. The kernel's counters
+    (`/proc/vmstat`, `/proc/pressure/memory`) were sampled every 2 s:
+
+| buffers | photo front products over 45 s | failed page moves | stalled on memory |
+|---|---|---|---|
+| shared | 4 of 18, at 81 to 90 s | 33.2 million | 76 s |
+| private | none of 18, all at 25 to 30 s (37 s for each first) | 1.0 million | 4 s |
+
+  - The holding process took 647 s for its product both times, and its views are the stored ones.
+- The bake at 2048 px is not deterministic. Two bakes of identical views differ in 49 % of the texels, because
+  the UV atlas is unwrapped differently each time. Baked models are compared on rendered views (front, right,
+  back, left), where two bakes of the same views agree at 50 to 56 dB.
+- The bake (`bake_steps.py`), three savings:
+  - `--one-bake`. UniTEX's bake step first bakes without LTM into `cache/wo_LTM` and then with LTM into
+    `cache/w_LTM`, and the second result overwrites the first. The first bake costs 7 to 10 s at 2048 px and
+    27 s of a `photo_front.py` bake at 4096 px. Only the walkthrough page reads `cache/wo_LTM`, so a run meant
+    for that page keeps both bakes.
+  - `--no-bake` stops `run_unitex_fast.py` after the views when `photo_front.py` runs next, since that step
+    bakes itself.
+  - `--fps-height 9`. Under cProfile, 43 s of the 58 s LTM bake at 4096 px are one farthest point sampling:
+    UniTEX picks LTM's 32 768 input points from all 11 million texels with `fpsample` at tree height 5.
+    `fpsample` recommends height 9 for large inputs, which takes 5 s. UniTEX starts the sampling at a random
+    point, so the sample differs from run to run either way. For the same start, height 7 picks the points of
+    height 5 (13 s) and height 9 another farthest point sample.
+- `photo_front.py` per product, four products: 86 to 103 s as it was, 61 to 74 s with one bake, 25 to 28 s
+  with one bake and height 9 (38 s for the first product, which loads LTM). Rendered views of the three agree
+  at 70 dB or more.
+- The two GPU steps at 1024 px (`runs/fast_products.sh`: views without a bake, then photo front) take about
+  670 s (11.2 min) per product, against about 1360 s (22.7 min).
+- Lossy options, off by default. They cut the texture pass, which is 85 % of what is left. A first screening
+  on four products: seconds per product without the bake, and what reading the generated views showed against
+  28 steps:
+
+| option | 1024 px | 512 px | by eye |
+|---|---|---|---|
+| none | 637 | 153 | |
+| `--texture-steps 20` | 466 to 493 | 129 | every line that reads at 28 steps reads the same |
+| `--texture-steps 16` | 388 to 411 | 118 | the same. The invented print on the back comes out differently, not worse |
+| `--texture-steps 12` | | 107 | the same on the large text |
+| `--texture-cache 0.08` | 412 to 435 | 103 (both passes) | the same. 11 of 28 steps skipped at 1024 px |
+| `--texture-cache 0.12` | 336 to 367 | 82 to 85 (both passes) | white speckles in the back print of the mustard bottle |
+| `--delight-steps 12` / `8` / `4` | | 112 / 102 / 92 | 12 and 8 the same, 4 leaves a green cast on the can |
+
+- Two settings then ran on all 28 products through both GPU steps. The finished models were read on rendered
+  views (front, right, back, left) against 28 + 28 steps. Seconds are medians per product with three GPUs
+  busy (the 28 + 28 views on four products, everything else on 28):
+
+| setting | views | photo front | one product | by eye, 28 products |
+|---|---|---|---|---|
+| 28 + 28 steps | 645 | 26 | 11.2 min | |
+| `--texture-steps 20 --delight-steps 8` | 430 | 27 | 7.6 min | no front worse, 4 backs or sides lose a detail |
+| `--texture-steps 16 --delight-steps 8` | 351 | 26 | 6.3 min | 2 fronts worse, 8 backs lose a detail |
+
+- At 20 + 8 the photo registers with the same method on every product, and the fronts match. The differences
+  are in the invented print. The candy bag's back loses its nutrition table, the cheese curls' back picture
+  is noisier, and speckle appears next to Jif's barcode and above the cereal box's side logo. Betty Crocker's
+  side panels come out as text lines where 28 steps gave speckle.
+- At 16 + 8 Jif's front is doubled. The homography fits its generated front at 0.84, just over the 0.8 under
+  which the flow is tried. At 28 and 20 steps it fits at 0.79 and 0.76, and the flow reaches 0.96 and 0.94.
+  With `--flow-below 0.9` the 16-step front takes the flow at 0.955. On the 28-step views that cutoff moves
+  three other products to the photo's own layout, so it stays at 0.8. Red Bull's 12 FL OZ corner is ghosted.
+  On the backs two nutrition panels, two barcodes, a neck label and three smaller details are lost.
+- Adding `--texture-cache 0.08` to 16 + 8 saves another 80 s (4 of 16 steps skipped) and shows on four
+  products: the side logo and FAMILY SIZE on the back of the cereal box get small breaks, and speckle appears
+  next to the jar's barcode.
+- `runs/fast_products.sh` runs 28 + 28 steps unless told otherwise. `--texture-steps 20 --delight-steps 8` is
+  the faster setting that kept every front.
