@@ -63,6 +63,9 @@ unitex/setup_unitex.sh, and this repo importable; all off by default, which runs
                              delight pass redraws small letters at its resolution, so everything finer
                              than S comes from the texture pass (4 is the tested setting). The raw
                              delight output is then also saved as cache/mv_rgb_delit_<res>.png
+  --delight-luma             with --delight-shading: one ratio per pixel, on luminance, in place of one per
+                             colour channel (unitex/delight_luma.py). The per-channel ratio carries the
+                             delight pass's colour changes onto the texture pass (a gold lid came out yellow)
   --texture-lora PATH       our texture LoRA (pytorch_lora_weights.safetensors of the patched
                              UniTEX-FLUX trainer). It REPLACES the released texture LoRA in the
                              texture pass, the delight pass keeps the released delight LoRA. A
@@ -448,6 +451,9 @@ def build_pipeline(args):
             if getattr(CustomRGBTextureFullPipeline, "GLYPH_API", 0) < 7:
                 raise SystemExit(f"{root} has an older UniTEX.patch without --delight-shading, re-apply the current one")
             extra["delight_shading"] = args.delight_shading
+            if getattr(args, "delight_luma", False):
+                from unitex import delight_luma
+                delight_luma.install()
     pipe = CustomRGBTextureFullPipeline(
         super_resolutions=False,
         filt_gradient_points=False,
@@ -614,6 +620,8 @@ def run(args):
             rec["delight_res"] = args.delight_res
         if args.delight_shading is not None:
             rec["delight_shading"] = args.delight_shading
+            if getattr(args, "delight_luma", False):
+                rec["delight_luma"] = True
         if args.ref_text_blur:
             rec["ref_text_blur"] = {"max_height": args.ref_text_max_height}
             if getattr(pipe, "ref_text_state", None):
@@ -728,6 +736,9 @@ def main(argv=None):
     g.add_argument("--delight-shading", type=float, default=None, metavar="S",
                    help="take only the shading of the delight pass, a Gaussian of S px per view at 512 (4: the "
                         "tested setting): letters and fine print come from the texture pass")
+    g.add_argument("--delight-luma", action="store_true",
+                   help="with --delight-shading: the shading as brightness only (one ratio per pixel on luminance), "
+                        "so the texture pass keeps its colours")
     g.add_argument("--glyph-json-name", default=None,
                    help="per-SKU text.json, relative to <eval>/<sku>/ or with {eval} {sku}; turns glyphs on")
     g.add_argument("--glyph-mode", choices=("center", "stretch", "warp"), default=None,
@@ -771,6 +782,8 @@ def main(argv=None):
         p.error("--delight-res must be a positive multiple of 16")
     if args.delight_shading is not None and not args.delight_shading > 0:
         p.error("--delight-shading must be > 0")
+    if args.delight_luma and args.delight_shading is None:
+        p.error("--delight-luma needs --delight-shading")
     glyph_opts = [o for o, v in (("--glyph-mode", args.glyph_mode), ("--glyph-kind", args.glyph_kind),
                                  ("--glyph-config", args.glyph_config), ("--glyph-set", args.glyph_set),
                                  ("--glyph-delight", args.glyph_delight),

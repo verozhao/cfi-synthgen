@@ -165,3 +165,21 @@ def test_sku_list_reads_a_file_or_a_comma_list_of_any_length(tmp_path):
     assert P.sku_list("012345678905, 098765432109,") == ["012345678905", "098765432109"]
     many = [f"{i:012d}" for i in range(28)]              # 363 characters: longer than a file name can be
     assert P.sku_list(",".join(many)) == many
+
+
+def test_auto_takes_the_flow_for_a_jar_whichever_side_of_the_cutoff_its_homography_lands():
+    # the same jar's homography against three sets of views (28 steps, the luminance merge, 16 steps), flow 0.94 to 0.96
+    for ncc_h, ncc_f in ((0.7913, 0.9557), (0.8335, 0.95), (0.8439, 0.955)):
+        assert P.flow_tried("auto", ncc_h) and P.flow_taken("auto", ncc_h, ncc_f)
+    # a can, a bottle and a jar whose flow stays under 0.9 keep the homography
+    for ncc_h, ncc_f in ((0.8419, 0.8792), (0.8612, 0.8831), (0.831, 0.8601)):
+        assert P.flow_tried("auto", ncc_h) and not P.flow_taken("auto", ncc_h, ncc_f)
+    assert not P.flow_taken("auto", 0.88, 0.91)          # over 0.9, but no clear gain on a homography that fits
+    assert not P.flow_tried("auto", 0.98)                # a homography that fits is left alone
+    assert not P.flow_taken("auto", 0.742, 0.8522)       # a tub whose generated layout differs: neither is used
+
+
+def test_flow_and_homography_modes_keep_their_own_rules():
+    assert P.flow_tried("flow", 0.98) and P.flow_taken("flow", 0.98, 0.975) and not P.flow_taken("flow", 0.98, 0.9)
+    assert not P.flow_tried("homography", 0.5) and not P.flow_taken("homography", 0.5, 0.99)
+    assert P.flow_tried("auto", 0.85, flow_try=0.9) and not P.flow_tried("auto", 0.85, flow_try=0.8)

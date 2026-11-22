@@ -390,3 +390,110 @@ def test_fps_height_raises_the_tree_height_for_large_point_sets_only(monkeypatch
     assert fake.bucket_fps_kdline_sampling(range(1000), n_samples=8, h=5, start_idx=3) == "idx"
     assert fake.bucket_fps_kdline_sampling(range(5000), 8, 11) == "idx"
     assert calls == [(999, 8, 5, None), (1000, 8, 9, 3), (5000, 8, 11, None)]
+
+
+# ── material of the baked model ─────────────────────────────────────────────
+
+def write_glb(path, doc, binary=bytes(range(16))):
+    import json
+    import struct
+    body = json.dumps(doc).encode()
+    body += b" " * (-len(body) % 4)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<4sII", b"glTF", 2, 28 + len(body) + len(binary)) + struct.pack("<I4s", len(body), b"JSON")
+                + body + struct.pack("<I4s", len(binary), b"BIN\x00") + binary)
+    return binary
+
+
+def read_glb(path):
+    import json
+    import struct
+    raw = open(path, "rb").read()
+    magic, version, total = struct.unpack("<4sII", raw[:12])
+    n, kind = struct.unpack("<I4s", raw[12:20])
+    assert magic == b"glTF" and version == 2 and total == len(raw) and kind == b"JSON" and n % 4 == 0
+    return json.loads(raw[20:20 + n]), raw[20 + n:]
+
+
+UNITEX_DOC = {"asset": {"version": "2.0"},
+              "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}, "metallicFactor": 0.0}}],
+              "meshes": [{"name": "processed_mesh.obj",
+                          "extras": {"file_name": "processed_mesh.obj", "file_path": "/work/someone/run/processed_mesh.obj"},
+                          "primitives": [{"attributes": {"POSITION": 0}}]}]}
+
+
+def test_glb_material_sets_the_roughness_drops_the_path_and_keeps_the_binary_part(tmp_path):
+    p = tmp_path / "m.glb"
+    binary = write_glb(p, UNITEX_DOC)
+    _, rest_before = read_glb(p)
+    assert bake_steps.glb_material(p, 0.6) == {"roughness": 0.6, "paths_dropped": 1}
+    doc, rest = read_glb(p)
+    assert doc["materials"][0]["pbrMetallicRoughness"] == {"baseColorTexture": {"index": 0}, "metallicFactor": 0.0,
+                                                          "roughnessFactor": 0.6}
+    assert doc["meshes"][0]["extras"] == {"file_name": "processed_mesh.obj"}
+    assert rest == rest_before and rest.endswith(binary) and b"someone" not in p.read_bytes()
+    before = p.read_bytes()
+    assert bake_steps.glb_material(p, 0.6) == {} and p.read_bytes() == before        # nothing left to change
+    assert not (tmp_path / "m.glb.tmp").exists()
+
+
+def test_glb_material_leaves_alone_what_it_is_not_asked_to_change(tmp_path):
+    p = tmp_path / "m.glb"
+    doc = {"asset": {"version": "2.0"},
+           "materials": [{"pbrMetallicRoughness": {"metallicRoughnessTexture": {"index": 1}}}, {}],
+           "nodes": [{"extras": {"file_path": "/a/b"}}]}
+    write_glb(p, doc)
+    assert bake_steps.glb_material(p, 0.5, drop_paths=False) == {"roughness": 0.5}
+    out, _ = read_glb(p)
+    assert out["materials"][0] == doc["materials"][0]                 # a roughness texture decides, not the factor
+    assert out["materials"][1] == {"pbrMetallicRoughness": {"roughnessFactor": 0.5}}
+    assert out["nodes"] == [{"extras": {"file_path": "/a/b"}}]
+    assert bake_steps.glb_material(p) == {"paths_dropped": 1}
+    assert read_glb(p)[0]["nodes"] == [{}]                            # an extras that held only the path goes too
+
+
+def test_glb_material_refuses_a_file_that_is_not_a_binary_gltf(tmp_path):
+    p = tmp_path / "mesh.obj"
+    p.write_text("v 0 0 0\n" * 10)
+    with pytest.raises(ValueError, match="binary glTF"):
+        bake_steps.glb_material(p, 0.6)
+
+
+def test_glb_material_keeps_a_real_model_loadable(tmp_path):
+    trimesh = pytest.importorskip("trimesh")
+    import numpy as np
+    from PIL import Image
+    box = trimesh.creation.box()
+    uv = np.random.default_rng(0).random((len(box.vertices), 2))
+    mat = trimesh.visual.material.PBRMaterial(baseColorTexture=Image.new("RGB", (8, 8), (200, 30, 30)),
+                                              metallicFactor=0.0, roughnessFactor=1.0)
+    box.visual = trimesh.visual.TextureVisuals(uv=uv, material=mat)
+    p = tmp_path / "box.glb"
+    box.export(p)
+    assert bake_steps.glb_material(p, 0.6)["roughness"] == 0.6
+    back = list(trimesh.load(p, force="scene", process=False).geometry.values())[0]
+    assert back.visual.material.roughnessFactor == 0.6 and back.visual.material.metallicFactor == 0.0
+    assert np.allclose(back.vertices, box.vertices) and np.array_equal(back.faces, box.faces)
+    assert np.asarray(back.visual.material.baseColorTexture.convert("RGB"))[0, 0].tolist() == [200, 30, 30]
+
+
+def test_material_fixes_every_model_the_bake_step_wrote(tmp_path):
+    cache = tmp_path / "cache"
+    (cache / "w_LTM").mkdir(parents=True)
+    calls = []
+
+    def step(cache_dir, input_image_path, input_mesh_path, clear_cache=False):
+        calls.append((cache_dir, input_image_path, input_mesh_path, clear_cache))
+        for rel in ("w_LTM/textured_mesh.glb", "textured_mesh.glb"):
+            write_glb(os.path.join(cache_dir, rel), UNITEX_DOC)
+        return "done"
+    pipe = types.SimpleNamespace(step_2_ablition=step)
+    bake_steps.material(pipe, 0.6)
+    # UniTEX calls its steps with keywords
+    assert pipe.step_2_ablition(cache_dir=str(cache), input_image_path="ref.png", input_mesh_path="mesh.glb",
+                                clear_cache=False) == "done"
+    assert calls == [(str(cache), "ref.png", "mesh.glb", False)]
+    for rel in ("w_LTM/textured_mesh.glb", "textured_mesh.glb"):
+        doc, _ = read_glb(cache / rel)
+        assert doc["materials"][0]["pbrMetallicRoughness"]["roughnessFactor"] == 0.6
+        assert "file_path" not in doc["meshes"][0]["extras"]

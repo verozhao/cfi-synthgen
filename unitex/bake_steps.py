@@ -1,6 +1,6 @@
 """
-Shorter versions of UniTEX's bake step (CustomRGBTextureFullPipeline.step_2_ablition) for run_unitex_fast.py and
-photo_front.py.
+Shorter versions of UniTEX's bake step (CustomRGBTextureFullPipeline.step_2_ablition) for run_unitex_fast.py,
+photo_front.py and back_panel.py, and the material of the baked model (glb_material, material).
 
 step_2_ablition bakes twice: first without LTM (reprojection only) into cache/wo_LTM, then with LTM inpainting into
 cache/w_LTM, and cache/textured_mesh.glb ends up as the second one. The first bake does not go into the result. It
@@ -65,3 +65,76 @@ def fps_height(height=9, min_points=1_000_000):
         return orig(pc, n_samples, h, start_idx)
     sampling._unwrapped = orig
     fpsample.bucket_fps_kdline_sampling = sampling
+
+
+def glb_material(path, roughness=None, drop_paths=True):
+    """Rewrite the JSON part of a binary glTF in place. Returns what was changed, {} when nothing was.
+
+    UniTEX's exporter writes every model fully matte (roughnessFactor 1.0, TextureTools structure.py) and keeps the
+    absolute path of the mesh it read in the mesh's extras. roughness sets the roughnessFactor of every material
+    without a metallicRoughnessTexture. drop_paths removes file_path from every extras. The binary part (geometry
+    and texture) is kept byte for byte.
+    """
+    import json
+    import struct
+    with open(path, "rb") as f:
+        raw = f.read()
+    if len(raw) < 20:
+        raise ValueError(f"{path} is not a binary glTF file")
+    magic, version, total = struct.unpack("<4sII", raw[:12])
+    n, kind = struct.unpack("<I4s", raw[12:20])
+    if magic != b"glTF" or version != 2 or kind != b"JSON":
+        raise ValueError(f"{path} is not a binary glTF 2 file")
+    doc = json.loads(raw[20:20 + n].decode("utf-8"))
+    rest = raw[20 + n:total]                      # the binary chunk with its header
+    changed = {}
+    if roughness is not None:
+        for m in doc.get("materials", []):
+            pbr = m.setdefault("pbrMetallicRoughness", {})
+            if "metallicRoughnessTexture" not in pbr and pbr.get("roughnessFactor", 1.0) != float(roughness):
+                pbr["roughnessFactor"] = float(roughness)
+                changed["roughness"] = float(roughness)
+    if drop_paths:
+        def walk(node):
+            if isinstance(node, dict):
+                extras = node.get("extras")
+                if isinstance(extras, dict) and "file_path" in extras:
+                    del extras["file_path"]
+                    changed["paths_dropped"] = changed.get("paths_dropped", 0) + 1
+                    if not extras:
+                        del node["extras"]
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+        walk(doc)
+    if not changed:
+        return changed
+    body = json.dumps(doc, separators=(",", ":")).encode("utf-8")
+    body += b" " * (-len(body) % 4)
+    out = (struct.pack("<4sII", b"glTF", 2, 20 + len(body) + len(rest)) + struct.pack("<I4s", len(body), b"JSON")
+           + body + rest)
+    tmp = f"{path}.tmp"
+    with open(tmp, "wb") as f:
+        f.write(out)
+    os.replace(tmp, path)
+    return changed
+
+
+def material(pipe, roughness, drop_paths=True):
+    """The baked models get this roughness and lose the source path (glb_material), right after the bake step.
+
+    UniTEX's __call__ copies cache/textured_mesh.glb to the run folder after the step, so that copy has them too.
+    Call it after one_bake. Not for no_bake, whose placeholder is the input mesh.
+    """
+    step = pipe.step_2_ablition
+
+    def baked(cache_dir, *args, **kwargs):
+        out = step(cache_dir, *args, **kwargs)
+        for rel in ("textured_mesh.glb", "w_LTM/textured_mesh.glb", "wo_LTM/textured_mesh.glb"):
+            p = os.path.join(cache_dir, rel)
+            if os.path.exists(p):
+                glb_material(p, roughness, drop_paths)
+        return out
+    pipe.step_2_ablition = baked

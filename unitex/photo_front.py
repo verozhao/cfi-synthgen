@@ -25,6 +25,7 @@ Usage (GPU server, UniTEX checkout with unitex/patches/UniTEX.patch):
   python unitex/photo_front.py --unitex-root /path/UniTEX --eval-dir EVAL --src-run glyph_trainAB \\
       --run-name glyph_trainAB_photofront [--skus a,b | file] [--mode detail|full|none] [--no-bake]
       [--one-bake] [--fps-height 9]        (the last two shorten the bake, see unitex/bake_steps.py)
+      [--roughness 0.6]                    (material of the baked model, UniTEX writes 1.0)
 """
 
 import argparse
@@ -222,8 +223,22 @@ def _ncc(a, b, mask):
     return float((a * b).sum() / d) if d > 0 else 0.0
 
 
+def flow_tried(method, ncc_h, flow_try=0.9):
+    """--register flow always tries the optical flow after the homography, auto when the homography fits under
+    flow_try."""
+    return method == "flow" or (method == "auto" and ncc_h < flow_try)
+
+
+def flow_taken(method, ncc_h, ncc_f, flow_below=0.8, flow_min=0.9, flow_gain=0.05):
+    """Whether the flow replaces the homography. flow: when it fits about as well. auto: when it reaches flow_min, and
+    for a homography that already fits at flow_below or better only when it also gains flow_gain over it."""
+    if method == "flow":
+        return ncc_f >= ncc_h - 0.01
+    return method == "auto" and ncc_f >= flow_min and (ncc_h < flow_below or ncc_f >= ncc_h + flow_gain)
+
+
 def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", scale=2, ratio=0.75,
-                   min_inliers=12, max_corner_shift=0.5, flow_below=0.8, flow_min=0.9):
+                   min_inliers=12, max_corner_shift=0.5, flow_below=0.8, flow_min=0.9, flow_try=0.9, flow_gain=0.05):
     """Photo -> view-0 pixels. Returns (photo (res, res, 3) uint8, photo mask (res, res) float, info).
 
     affine      the anchors.py fit only: photo foreground bbox onto the view-0 silhouette bbox,
@@ -236,9 +251,15 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
                 need a large move: the bbox fit squeezes the lid in), and the blurred grey images
                 agreeing at least as well as before (NCC). Otherwise the affine is used.
     flow        homography, then a smoothed DIS optical flow (curved labels)
-    auto        flow only when the homography's NCC is under flow_below. The flow fixes a jar or tub
+    auto        the flow is tried when the homography's NCC is under flow_try. It fixes a jar or tub
                 shot from above (Jif 0.79 -> 0.96), but on a photo the homography already fits it shears
-                letters ("Gluten" came out slanted), so it is not used there. A flow that still leaves the
+                letters ("Gluten" came out slanted), so it is not tried there. Under flow_below it is taken
+                when it reaches flow_min. From flow_below up to flow_try it is taken only when it reaches
+                flow_min and also gains flow_gain over the homography: Jif's homography fits its generated
+                front at 0.79, 0.83 or 0.84 depending on the views (28 steps, the luminance merge, 16 steps)
+                and its flow at 0.96 each time, while a can's, a bottle's and a jar's homographies at 0.83
+                to 0.87 have flows under 0.9 and keep the homography. With one cutoff at 0.8, Jif's front
+                came out doubled whenever its homography landed just over it. A flow that still leaves the
                 NCC under flow_min is not used either: the generated layout itself differs from the photo
                 (Betty Crocker's ribbon is tilted and its badge sits lower, 0.74 -> 0.85), and bending the
                 photo onto it mixed two copies of "Cream Cheese". info["layout"] is then "photo": the
@@ -248,6 +269,7 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
     All work at scale * res and the result is area-downsampled, so small print is not aliased.
     """
     import cv2
+    flow_try = max(flow_try, flow_below)       # a homography under flow_below always gets the flow tried
     S = res * scale
     pre = np.ascontiguousarray(warp_into_view(photo, tuple(v * scale for v in aff), S)[..., :3])
     pre_m = warp_into_view(Image.fromarray(pmask.astype(np.uint8) * 255), tuple(v * scale for v in aff), S,
@@ -289,8 +311,7 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
             if shift.max() <= max_corner_shift and ncc_h >= info["ncc_affine"] - 0.01:
                 pre, pre_m, info["method"] = warped, warped_m, "homography"
                 info["homography"] = [[round(float(v), 6) for v in row] for row in H]
-        if info["method"] == "homography" and (method == "flow" or (method == "auto"
-                                                and info["ncc_homography"] < flow_below)):
+        if info["method"] == "homography" and flow_tried(method, info["ncc_homography"], flow_try):
             dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
             a = cv2.GaussianBlur(_gray(g2), (0, 0), 1.5 * scale)
             b = cv2.GaussianBlur(_gray(pre), (0, 0), 1.5 * scale)
@@ -306,7 +327,7 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
             warped_m = cv2.remap(pre_m, mx, my, cv2.INTER_LINEAR, borderValue=0)
             ncc_f = _ncc(blur(g2), blur(warped), m2 & (warped_m >= 0.5))
             info.update(ncc_flow=round(ncc_f, 4), flow_max_px=round(float(mag.max()) / scale, 2))
-            if ncc_f >= info["ncc_homography"] - 0.01 and (method == "flow" or ncc_f >= flow_min):
+            if flow_taken(method, info["ncc_homography"], ncc_f, flow_below, flow_min, flow_gain):
                 pre, pre_m, info["method"] = warped, warped_m, "flow"
     info["ncc_final"] = info[f"ncc_{info['method']}"]
     own = method == "auto" and info["method"] != "flow" and info["ncc_final"] < flow_below
@@ -324,7 +345,7 @@ def register_photo(gen0, mask0, photo, pmask, aff, res, method="homography", sca
 def front_from_photo(sku_dir, src_run_dir, cache_dir, mode="detail", sigma_frac=1 / 32,
                      feather_frac=1 / 128, facing=(0.35, 0.7), register="homography", min_ncc=0.6,
                      trust=(0.5, 0.8), text_json=None, text_pad=0.3, text_min_ncc=0.8, flow_below=0.8,
-                     flow_min=0.9):
+                     flow_min=0.9, flow_try=0.9):
     """Blend the photo into view 0 of cache_dir/mv_rgb.png. Returns (new grid, debug panel, info).
 
     The photo is used only when it registers: blurred grey NCC with the generated front view of at
@@ -350,7 +371,7 @@ def front_from_photo(sku_dir, src_run_dir, cache_dir, mode="detail", sigma_frac=
     pmask, fg_box, mask_src = A.photo_foreground(photo, meta, src_run_dir)
     aff, align = A.fit_photo_to_view0(pmask, fg_box, geo.masks[FRONT])
     ph, pm, reg = register_photo(gen0, geo.masks[FRONT], photo, pmask, aff, res, register, flow_below=flow_below,
-                                 flow_min=flow_min)
+                                 flow_min=flow_min, flow_try=flow_try)
     own_layout = reg["layout"] == "photo"
     w, core = front_weight(geo.masks[FRONT], geo.normals[FRONT], pm, res, facing, feather_frac)
     trust_ramp = tuple(trust)
@@ -454,7 +475,8 @@ def run(args):
                 grid, panel, info = front_from_photo(sku_dir, src, dst / "cache", args.mode, args.sigma_frac,
                                                      args.feather_frac, tuple(args.facing), args.register,
                                                      args.min_ncc, tuple(args.trust), args.text_json, args.text_pad,
-                                                     args.text_min_ncc, args.flow_below, args.flow_min)
+                                                     args.text_min_ncc, args.flow_below, args.flow_min,
+                                                     args.flow_try)
                 rec.update(info)
                 shutil.copy(dst / "cache" / "mv_rgb.png", dst / "cache" / "mv_rgb_generated.png")
                 Image.fromarray(grid).save(dst / "cache" / "mv_rgb.png")
@@ -473,12 +495,17 @@ def run(args):
                             bake_steps.one_bake(baker)
                         if args.fps_height:
                             bake_steps.fps_height(args.fps_height)
+                        if args.roughness is not None:
+                            bake_steps.material(baker, args.roughness)
                     elif getattr(baker, "view_res", 512) != info["view_res"]:
                         raise RuntimeError(f"view_res {info['view_res']} differs from the first SKU's, run them separately")
                     import torch
                     baker.generator = torch.Generator().manual_seed(args.seed)
                     torch.manual_seed(args.seed)
                     baker(str(dst), str(sku_dir / "ref.png"), str(sku_dir / "mesh.glb"))
+                    if args.roughness is not None:
+                        rec["roughness"] = args.roughness
+                rec["baked"] = not args.no_bake
                 rec["status"] = "ok"
             except KeyboardInterrupt:
                 raise
@@ -524,9 +551,14 @@ def main(argv=None):
                         "photo whole")
     p.add_argument("--text-pad", type=float, default=0.3, help="padding of each text line, times its height")
     p.add_argument("--text-min-ncc", type=float, default=0.8, help="registration NCC needed for --text-json")
-    p.add_argument("--flow-below", type=float, default=0.8, help="--register auto: homography NCC under which flow is tried")
+    p.add_argument("--flow-below", type=float, default=0.8,
+                   help="--register auto: homography NCC under which a flow that reaches --flow-min is taken, and "
+                        "under which the photo keeps its own layout when no flow is")
     p.add_argument("--flow-min", type=float, default=0.9,
                    help="--register auto: NCC the flow must reach, else the photo keeps its own layout")
+    p.add_argument("--flow-try", type=float, default=0.9,
+                   help="--register auto: homography NCC under which the flow is tried. From --flow-below up to "
+                        "here it is taken only when it also gains 0.05 over the homography")
     p.add_argument("--seed", type=int, default=63)
     p.add_argument("--resume", action="store_true", help="skip SKUs with run_info.json")
     p.add_argument("--no-bake", action="store_true", help="write mv_rgb.png and photo_front.png only (CPU)")
@@ -536,9 +568,14 @@ def main(argv=None):
     p.add_argument("--fps-height", type=int, default=None, metavar="H",
                    help="tree height of the farthest point sampling behind LTM's input points when there are over a "
                         "million (UniTEX: 5, fpsample's advice for large inputs: 9). 43 s -> 5 s of a 4096 px bake")
+    p.add_argument("--roughness", type=float, default=None, metavar="R",
+                   help="roughness of the baked model's material (UniTEX writes 1.0, fully matte. The current "
+                        "Gemini pipeline's models have 0.6). Also drops the source path from the model")
     args = p.parse_args(argv)
     if args.run_name == args.src_run:
         p.error("--run-name must differ from --src-run (the source run is read only)")
+    if args.roughness is not None and not 0.0 <= args.roughness <= 1.0:
+        p.error("--roughness must be between 0 and 1")
     sys.exit(1 if run(args) else 0)
 
 

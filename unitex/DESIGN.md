@@ -587,3 +587,42 @@ These steps work on a finished run and then only bake again. FLUX is not loaded.
   next to the jar's barcode.
 - `runs/fast_products.sh` runs 28 + 28 steps unless told otherwise. `--texture-steps 20 --delight-steps 8` is
   the faster setting that kept every front.
+
+## One command to the finished model (step 10)
+
+- Which model the pipeline makes. The finishing of step 8 (`back_panel.py`: a typeset back panel, plain
+  sides) reads the most front lines, but that score only covers the front view. In table scenes, where
+  products lie at any angle, its plain sides and blurred back looked worse than the generated ones. So the
+  pipeline's model is the photo front model without that finishing. `back_panel.py` stays a separate tool,
+  and `runs/fast_products.sh` runs it only with `FINISH=1`.
+- `runs/fast_products.sh` now runs the views, photo front with one bake, and a check of every product. Three
+  things changed in the model it makes, and one in how the photo is placed:
+  - The delight pass's shading as brightness only (`delight_luma.py`, `--delight-luma`). Step 6 merges the
+    two FLUX passes with one ratio per colour channel, so the ratio also carries the delight pass's colour
+    changes onto the texture pass: a gold lid came out yellow. The ratio is now one number per pixel, taken
+    on luminance, and the texture pass keeps its colours. `check_products.py` measures the front's coarse
+    colours against the photo's on the 28 eval products: the median difference drops from 8.1 to 6.2 (CIELAB).
+    The largest was El Pato's, which drops from 28.3 to 10.6.
+  - The same merge for a finished run. `delight_luma.py` redoes it from the two passes a `--delight-shading`
+    run saves, with no GPU. With `--check` it first redoes the run's own per-channel merge. That gave back
+    the stored `mv_rgb.png` of all 28 products exactly.
+  - Roughness. UniTEX's exporter writes every model with roughness 1.0, fully matte. The current pipeline's
+    models have 0.6, and `synthgen.py` keeps a model's own roughness. So in every earlier table scene the
+    UniTEX models were rendered matte next to models at 0.6. `bake_steps.material` sets it after the bake
+    (`--roughness`, 0.6 in the script) by rewriting the JSON part of the GLB. The binary part, geometry and
+    texture, stays byte for byte.
+  - The same rewrite drops `extras.file_path`, the absolute path of the mesh the exporter read.
+  - The flow rule of `--register auto`. Step 8 tried the flow only under a homography NCC of 0.8. Jif's
+    homography sits right there. It fits at 0.79 on the views of step 8 and at 0.83 with the luminance merge.
+    At 16 steps it fits at 0.84. Above 0.8 the flow was not tried and the front came out doubled. The flow is
+    now tried under 0.9 (`--flow-try`). From 0.8 up to there it is taken only when it reaches 0.9 and gains
+    0.05 over the homography. Jif's flow reaches 0.95 or more on all three sets of views. El Pato, the shampoo
+    and the olives (homographies at 0.83 to 0.87, flows under 0.9) keep the homography on the 28-step views.
+- `check_products.py` reads what the steps wrote and renders nothing. One row per product: how the photo was
+  placed, its NCC, the outline overlap, the photo's share of the front, the colour difference, the model's
+  roughness and the seconds per step. Flags: `front_generated` (the photo did not register), `outline_differs`,
+  `little_photo`, `colours_off`, `matte`, `no_model`, `no_views`. On the 28 models with the changes above it
+  flags one product, the ramen cup, whose photo is shot from above (NCC 0.11, front generated). On the models
+  of step 9 it also flags all 28 as matte and 5 for their colours.
+- Seconds per product stay as in step 9: 645 for the views and 27 for photo front with its one bake (medians).
+  The check takes seconds for all products.

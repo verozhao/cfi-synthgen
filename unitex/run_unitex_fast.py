@@ -31,6 +31,9 @@ Usage: the arguments of run_unitex.py, plus
   --no-bake             stop after the views (mv_rgb.png): for a photo_front.py run next, which bakes itself
   --fps-height H        tree height of the bake's farthest point sampling on large point sets (bake_steps.fps_height,
                         UniTEX: 5, e.g. 9). The sample differs as it does between two runs.
+  --roughness R         roughness of the baked model's material (bake_steps.material). UniTEX writes 1.0, fully
+                        matte. The current Gemini pipeline's models have 0.6. Also drops the source path from the
+                        model.
   --pass-memory         print each pass's time and peak GPU memory, the transformer's and the VAE decode's apart. The
                         peak in run_info.json then covers the delight pass and the bake only.
 Lossy, off by default (the output changes and has to be looked at):
@@ -419,8 +422,11 @@ def build_pipeline(args):
                 FAST.delight_cache, trim=FAST.stream != "accelerate" and not os.environ.get("UNITEX_FAST_NO_TRIM"))
     if FAST.no_bake:
         bake_steps.no_bake(pipe)
-    elif FAST.one_bake:
-        bake_steps.one_bake(pipe)
+    else:
+        if FAST.one_bake:
+            bake_steps.one_bake(pipe)
+        if FAST.roughness is not None:
+            bake_steps.material(pipe, FAST.roughness)
     if FAST.fps_height:
         bake_steps.fps_height(FAST.fps_height)
     if os.environ.get("UNITEX_FAST_STACKS"):
@@ -445,6 +451,7 @@ def main(argv=None):
     ap.add_argument("--one-bake", action="store_true")
     ap.add_argument("--no-bake", action="store_true")
     ap.add_argument("--fps-height", type=int, default=None)
+    ap.add_argument("--roughness", type=float, default=None)
     ap.add_argument("--pass-memory", action="store_true")
     argv = sys.argv[1:] if argv is None else list(argv)
     if "-h" in argv or "--help" in argv:
