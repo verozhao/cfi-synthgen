@@ -26,6 +26,7 @@ Usage (GPU server, UniTEX checkout with unitex/patches/UniTEX.patch):
       --run-name glyph_trainAB_photofront [--skus a,b | file] [--mode detail|full|none] [--no-bake]
       [--one-bake] [--fps-height 9]        (the last two shorten the bake, see unitex/bake_steps.py)
       [--roughness 0.6]                    (material of the baked model, UniTEX writes 1.0)
+      [--view-res 1024]                    (enlarge smaller views first, so the photo goes on at this size)
 """
 
 import argparse
@@ -426,6 +427,41 @@ def build_baker(unitex_root, view_res=512, seed=63):
     return pipe
 
 
+def new_baker(args, view_res):
+    """build_baker with the bake options of the command line."""
+    baker = build_baker(args.unitex_root, view_res, args.seed)
+    if args.one_bake:
+        bake_steps.one_bake(baker)
+    if args.fps_height:
+        bake_steps.fps_height(args.fps_height)
+    if args.roughness is not None:
+        bake_steps.material(baker, args.roughness)
+    return baker
+
+
+def enlarge_views(cache_dir, mesh_path, view_res, pipe):
+    """Views generated at a smaller size, made ready for work at view_res px per view. Returns the size they had.
+
+    mv_rgb.png is enlarged (bicubic, the generated one is kept as mv_rgb_<size>.png), and UniTEX renders the geometry
+    images and cameras again at view_res (render_geometry_images on the input mesh, as its step 1 does). The photo
+    then goes onto the front at view_res, so its small print does not depend on the size FLUX ran at. Nothing
+    changes when the views already have view_res.
+    """
+    cache_dir = pathlib.Path(cache_dir)
+    grid = Image.open(cache_dir / "mv_rgb.png").convert("RGB")
+    old = grid.size[1] // 2
+    if old == view_res:
+        return old
+    if old > view_res:
+        raise ValueError(f"the views have {old} px, --view-res {view_res} would shrink them")
+    if getattr(pipe, "view_res", 512) != view_res:
+        raise ValueError(f"the UniTEX pipeline works at {getattr(pipe, 'view_res', 512)} px per view, not {view_res}")
+    shutil.copy(cache_dir / "mv_rgb.png", cache_dir / f"mv_rgb_{old}.png")
+    grid.resize((3 * view_res, 2 * view_res), Image.BICUBIC).save(cache_dir / "mv_rgb.png")
+    pipe.render_geometry_images(str(cache_dir), str(mesh_path))
+    return old
+
+
 def copy_cache(src_cache, dst_cache):
     if dst_cache.exists():
         shutil.rmtree(dst_cache)
@@ -472,6 +508,12 @@ def run(args):
                 dst.mkdir(parents=True, exist_ok=True)
                 (dst / "run_info.json").unlink(missing_ok=True)
                 copy_cache(src / "cache", dst / "cache")
+                if args.view_res:
+                    if baker is None:
+                        baker = new_baker(args, args.view_res)
+                    was = enlarge_views(dst / "cache", sku_dir / "mesh.glb", args.view_res, baker)
+                    if was != args.view_res:
+                        rec["enlarged_from"] = was
                 grid, panel, info = front_from_photo(sku_dir, src, dst / "cache", args.mode, args.sigma_frac,
                                                      args.feather_frac, tuple(args.facing), args.register,
                                                      args.min_ncc, tuple(args.trust), args.text_json, args.text_pad,
@@ -490,13 +532,7 @@ def run(args):
                          f"{100 * info['replaced_frac_of_silhouette']:.0f}% of the front silhouette from the photo"))
                 if not args.no_bake:
                     if baker is None:
-                        baker = build_baker(args.unitex_root, info["view_res"], args.seed)
-                        if args.one_bake:
-                            bake_steps.one_bake(baker)
-                        if args.fps_height:
-                            bake_steps.fps_height(args.fps_height)
-                        if args.roughness is not None:
-                            bake_steps.material(baker, args.roughness)
+                        baker = new_baker(args, info["view_res"])
                     elif getattr(baker, "view_res", 512) != info["view_res"]:
                         raise RuntimeError(f"view_res {info['view_res']} differs from the first SKU's, run them separately")
                     import torch
@@ -568,6 +604,10 @@ def main(argv=None):
     p.add_argument("--fps-height", type=int, default=None, metavar="H",
                    help="tree height of the farthest point sampling behind LTM's input points when there are over a "
                         "million (UniTEX: 5, fpsample's advice for large inputs: 9). 43 s -> 5 s of a 4096 px bake")
+    p.add_argument("--view-res", type=int, default=None, metavar="R",
+                   help="work at R px per view: a source run with smaller views is enlarged and its geometry images "
+                        "rendered again at R (enlarge_views), so the photo goes on at R whatever size FLUX ran at. "
+                        "Needs the GPU also with --no-bake")
     p.add_argument("--roughness", type=float, default=None, metavar="R",
                    help="roughness of the baked model's material (UniTEX writes 1.0, fully matte. The current "
                         "Gemini pipeline's models have 0.6). Also drops the source path from the model")
