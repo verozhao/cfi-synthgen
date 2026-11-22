@@ -30,6 +30,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from unitex import anchors as A
+from unitex import bake_steps
 from unitex import common as C
 from unitex import photo_front as PF
 
@@ -686,11 +687,8 @@ def apply_color_map(img, M, detail_sigma=None):
 
 def run(args):
     eval_dir = pathlib.Path(args.eval_dir).resolve()
-    p = pathlib.Path(args.skus) if args.skus else None
-    if p and p.is_file():
-        skus = [l.split("#")[0].strip() for l in open(p) if l.split("#")[0].strip()]
-    elif args.skus:
-        skus = args.skus.split(",")
+    if args.skus:
+        skus = PF.sku_list(args.skus)
     else:
         skus = sorted(d.name for d in eval_dir.iterdir() if (d / args.src_run / "cache" / "mv_rgb.png").exists())
     off = pathlib.Path(args.off_dir)
@@ -775,10 +773,19 @@ def run(args):
             if not args.no_bake:
                 if baker is None:
                     baker = PF.build_baker(args.unitex_root, res, args.seed)
+                    if args.one_bake:
+                        bake_steps.one_bake(baker)
+                    if args.fps_height:
+                        bake_steps.fps_height(args.fps_height)
+                    if args.roughness is not None:
+                        bake_steps.material(baker, args.roughness)
                 import torch
                 baker.generator = torch.Generator().manual_seed(args.seed)
                 torch.manual_seed(args.seed)
                 baker(str(dst), str(sku_dir / "ref.png"), str(sku_dir / "mesh.glb"))
+                if args.roughness is not None:
+                    rec_info["roughness"] = args.roughness
+            rec_info["baked"] = not args.no_bake
             rec_info["status"] = "ok"
         except KeyboardInterrupt:
             raise
@@ -825,7 +832,15 @@ def main(argv=None):
                         "map (bare flag) or a colour lookup (lut)")
     p.add_argument("--seed", type=int, default=63)
     p.add_argument("--no-bake", action="store_true", help="write mv_rgb.png and back_panel.png only (CPU)")
-    return run(p.parse_args(argv))
+    p.add_argument("--one-bake", action="store_true", help="skip the bake without LTM (bake_steps.one_bake)")
+    p.add_argument("--fps-height", type=int, default=None, metavar="H",
+                   help="tree height of the bake's farthest point sampling on large point sets (bake_steps.fps_height)")
+    p.add_argument("--roughness", type=float, default=None, metavar="R",
+                   help="roughness of the baked model's material (bake_steps.material, UniTEX writes 1.0)")
+    args = p.parse_args(argv)
+    if args.roughness is not None and not 0.0 <= args.roughness <= 1.0:
+        p.error("--roughness must be between 0 and 1")
+    return run(args)
 
 
 if __name__ == "__main__":

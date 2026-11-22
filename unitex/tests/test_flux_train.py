@@ -1196,6 +1196,7 @@ def lora_keys_worker(tm, args):
         tr = FluxTransformer2DModel(**FLUX_DEV)
     tr.requires_grad_(False)
     fake = types.SimpleNamespace(args=args, transformer=tr, load_LoRA_from_checkpoint=lambda *a: None)
+    fake.layout_channels = lambda: tm.Trainer.layout_channels(fake)      # add_LORA asks, since the glyph layout
     tm.Trainer.add_LORA(fake, None, None)
     sd = get_peft_model_state_dict(tr)
     return {"keys": {k: list(v.shape) for k, v in sd.items()},
