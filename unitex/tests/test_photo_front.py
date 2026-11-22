@@ -156,3 +156,12 @@ def test_own_layout_fades_into_the_photos_own_colours():
     assert np.abs(u[30, 15] - (200, 40, 50)).max() < 2    # inside the photo: its own colour
     assert np.abs(u[30, 55] - (240, 80, 20)).max() < 2    # beyond it: the generated colour
     assert np.array_equal(u[1, 1], gen[1, 1].astype(np.float32))      # outside the silhouette: untouched
+
+
+def test_sku_list_reads_a_file_or_a_comma_list_of_any_length(tmp_path):
+    f = tmp_path / "skus.txt"
+    f.write_text("012345678905  # cereal\n\n# a comment line\n098765432109\n")
+    assert P.sku_list(str(f)) == ["012345678905", "098765432109"]
+    assert P.sku_list("012345678905, 098765432109,") == ["012345678905", "098765432109"]
+    many = [f"{i:012d}" for i in range(28)]              # 363 characters: longer than a file name can be
+    assert P.sku_list(",".join(many)) == many
