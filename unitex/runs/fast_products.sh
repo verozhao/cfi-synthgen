@@ -15,7 +15,8 @@
 # Env: UNITEX_ROOT (server work folder), LORA (texture LoRA), REPO and UX (this repo and the patched UniTEX checkout
 # there, defaults below). Settings, also env:
 #   VIEW_RES=512  the smaller option (default 1024): FLUX runs at 512 px per view with the same LoRA and inputs, and
-#                 photo_front.py --view-res 1024 enlarges the views, so the photo still goes on at 1024 px
+#                 photo_front.py --view-res 1024 enlarges the views, so the photo still goes on at 1024 px. About 3 min
+#                 per product against 11, with large made-up words on backs and sides (DESIGN.md, step 11)
 #   LUMA=0        the delight shading with one ratio per colour channel, as before --delight-luma (default 1)
 #   ROUGHNESS=R   roughness of the models (default 0.6, the current Gemini pipeline's. UniTEX itself writes 1.0)
 #   FINISH=1      off by default. Also runs back_panel.py on the photo front (a typeset back panel from product

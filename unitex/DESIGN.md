@@ -626,3 +626,38 @@ These steps work on a finished run and then only bake again. FLUX is not loaded.
   of step 9 it also flags all 28 as matte and 5 for their colours.
 - Seconds per product stay as in step 9: 645 for the views and 27 for photo front with its one bake (medians).
   The check takes seconds for all products.
+- With the new flow rule Jif's front at 1024 px and 16 + 8 steps is no longer doubled. Its flow fits at 0.96.
+
+## A smaller option: views at 512 px (step 11)
+
+- `VIEW_RES=512` in `runs/fast_products.sh`. FLUX runs at 512 px per view with the same LoRA and the same crop
+  layout, without the position scaling that 1024 px needs. `photo_front.py --view-res 1024` then enlarges the
+  views and has UniTEX render the geometry images again at 1024, so the photo still goes onto the front at
+  1024 px. On 4 products its files equal, byte for byte, those of a run that took the geometry images of a
+  stored 1024 px run.
+- Seconds per product for the views, medians over the 28 eval products: 153 at 512 px against 645 at 1024 px.
+  With photo front a product takes about 3 min against 11.
+- Read by eye on straight views of all 28 products, next to the current pipeline's models with the real photo:
+  - The fronts are the same at both sizes, since the front is the photo. The ramen cup is the exception, and
+    at 512 px its generated front shows more invented large words. Three fronts get a little made-up print at
+    their edges (the mustard bottle, the peanut butter jar and the sauce can).
+  - The backs and sides differ in kind. At 1024 px most of them are walls of tiny made-up print. At 512 px
+    nearly every back looks like a package, with panels, a nutrition-style table and a barcode, but its words
+    are large and plainly nonsense.
+  - At 512 px FLUX also invents things that do not belong. The ramen cup gets a man's face on its back and
+    side, and the red Tuna Helper box a blue back. Great Value products get misspelled brand logos on their
+    sides.
+  - The current pipeline's backs (Gemini) carry readable nutrition facts and ingredients. They stay clearly
+    ahead of both sizes.
+- `check_products.py` flags the same one product at both sizes, the ramen cup. At 512 px the median colour
+  difference to the photo is 5.1, against 6.2 at 1024 px. Four photos keep their own layout, against two.
+- With 16 texture and 8 delight steps at 512 px the views take 71 s. The tea box's generated front then
+  differs so much from its photo that the photo does not register (NCC 0.04), and the front stays generated
+  with garbled print. The check report flags it. So the option keeps 28 + 28 steps.
+- Table scenes show the same. In close-ups of 10 products in the scatter layout our backs come out as grey
+  walls of print at 1024 px and as busy panels with large words at 512 px. The current pipeline's backs look
+  like the real products. Both sizes give the jerky bag a black back where the real bag is red and yellow. The
+  current pipeline shows its own faults there too: a seam down the lemonade bottle, a printed BOTTOM on the
+  barbecue sauce and a blank back on the ramen cup.
+- 1024 px stays the default. `VIEW_RES=512` trades the tiny made-up print for large made-up words at about a
+  quarter of the time.

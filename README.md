@@ -40,8 +40,11 @@ export UNITEX_ROOT=/path/to/work_folder # the folder that holds env.sh
 export LORA=/path/to/pytorch_lora_weights.safetensors # the texture LoRA
 # full pipeline at 1024 px: about 11 min per product
 bash unitex/runs/fast_products.sh <gpu> <eval dir> <sku list file | a,b,c> <run name>
+# the models go to <eval dir>/<sku>/<run name>_pf/textured_mesh.glb, a check of every product to <eval dir>/check_<run name>_pf.md
 # optional, fewer steps: 7.6 min per product, small losses on some backs
 bash unitex/runs/fast_products.sh <gpu> <eval dir> <sku list file | a,b,c> <run name> --texture-steps 20 --delight-steps 8
+# optional, 512 px views: about 3 min per product, larger made-up words on backs and sides
+VIEW_RES=512 bash unitex/runs/fast_products.sh <gpu> <eval dir> <sku list file | a,b,c> <run name>
 ```
 
 File formats, design and results: `unitex/DESIGN.md`. Training the texture LoRA: `unitex/TRAINING.md`.
