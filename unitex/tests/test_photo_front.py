@@ -1,4 +1,5 @@
 import json
+import types
 
 import numpy as np
 import pytest
@@ -183,3 +184,24 @@ def test_flow_and_homography_modes_keep_their_own_rules():
     assert P.flow_tried("flow", 0.98) and P.flow_taken("flow", 0.98, 0.975) and not P.flow_taken("flow", 0.98, 0.9)
     assert not P.flow_tried("homography", 0.5) and not P.flow_taken("homography", 0.5, 0.99)
     assert P.flow_tried("auto", 0.85, flow_try=0.9) and not P.flow_tried("auto", 0.85, flow_try=0.8)
+
+
+def test_enlarge_views_doubles_the_views_and_has_the_geometry_rendered_again(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    grid = np.zeros((2 * 8, 3 * 8, 3), np.uint8)
+    grid[:8, :8] = (200, 10, 10)                          # the front tile
+    Image.fromarray(grid).save(cache / "mv_rgb.png")
+    calls = []
+    pipe = types.SimpleNamespace(view_res=16, render_geometry_images=lambda d, m: calls.append((d, m)))
+    assert P.enlarge_views(cache, tmp_path / "mesh.glb", 16, pipe) == 8
+    big = np.asarray(Image.open(cache / "mv_rgb.png"))
+    assert big.shape == (32, 48, 3) and big[6, 6].tolist() == [200, 10, 10] and big[24, 40].tolist() == [0, 0, 0]
+    assert np.array_equal(np.asarray(Image.open(cache / "mv_rgb_8.png")), grid)       # the generated views are kept
+    assert calls == [(str(cache), str(tmp_path / "mesh.glb"))]
+    assert P.enlarge_views(cache, tmp_path / "mesh.glb", 16, pipe) == 16 and len(calls) == 1      # already that size
+    with pytest.raises(ValueError, match="shrink"):
+        P.enlarge_views(cache, tmp_path / "mesh.glb", 8, pipe)
+    with pytest.raises(ValueError, match="works at 16"):
+        P.enlarge_views(cache, tmp_path / "mesh.glb", 32, pipe)
+    assert len(calls) == 1 and Image.open(cache / "mv_rgb.png").size == (48, 32)      # the refused calls changed nothing
